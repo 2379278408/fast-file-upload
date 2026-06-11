@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>File Upload Server</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: linear-gradient(135deg, #667eea, #764ba2); min-height: 100vh; padding: 30px 20px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .card { background: #fff; border-radius: 12px; padding: 24px; margin-bottom: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
+        h1 { text-align: center; color: #333; margin-bottom: 4px; }
+        .subtitle { text-align: center; color: #888; font-size: 13px; margin-bottom: 20px; }
+        
+        /* Upload Zone */
+        .upload-area { border: 2px dashed #667eea; border-radius: 8px; padding: 40px 20px; text-align: center; cursor: pointer; transition: all 0.2s; background: #f8fafc; }
+        .upload-area:hover, .upload-area.dragover { border-color: #4c1d95; background: #eef2ff; }
+        .icon { font-size: 40px; margin-bottom: 10px; }
+        .text-main { font-weight: 600; color: #4b5563; }
+        .text-sub { font-size: 12px; color: #9ca3af; }
+        input[type="file"] { display: none; }
+
+        /* Progress */
+        .progress-container { margin-top: 15px; display: none; }
+        .progress-container.active { display: block; }
+        .progress-info { display: flex; justify-content: space-between; margin-bottom: 5px; font-size: 13px; }
+        .progress-bar { height: 6px; background: #e5e7eb; border-radius: 4px; overflow: hidden; }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #667eea, #764ba2); width: 0%; transition: width 0.2s; }
+
+        /* File List */
+        .file-list h2 { font-size: 16px; margin-bottom: 12px; color: #374151; border-bottom: 1px solid #e5e7eb; padding-bottom: 8px; }
+        .file-item { display: flex; align-items: center; padding: 10px 0; border-bottom: 1px solid #f3f4f6; gap: 12px; }
+        .file-item:last-child { border-bottom: none; }
+        .file-info { flex: 1; min-width: 0; }
+        .file-name { font-weight: 500; color: #374151; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .file-meta { display: flex; gap: 12px; margin-top: 4px; font-size: 11px; color: #000000; }
+        .file-actions { display: flex; gap: 8px; flex-shrink: 0; }
+        
+        /* Buttons */
+        .btn { padding: 6px 12px; border-radius: 6px; border: none; font-size: 12px; cursor: pointer; transition: background 0.2s; color: #fff; display: inline-flex; align-items: center; text-decoration: none; }
+        .btn-dl { background: #10b981; }
+        .btn-dl:hover { background: #059669; }
+        .btn-cp { background: #3b82f6; }
+        .btn-cp:hover { background: #2563eb; }
+        .btn-del { background: #ef4444; }
+        .btn-del:hover { background: #dc2626; }
+        
+        /* Toast */
+        .toast { position: fixed; top: 20px; right: 20px; padding: 10px 20px; border-radius: 8px; color: #fff; font-size: 13px; z-index: 100; opacity: 0; transform: translateX(100%); transition: all 0.3s; }
+        .toast.show { opacity: 1; transform: translateX(0); }
+        .toast.success { background: #10b981; }
+        .toast.error { background: #ef4444; }
+        .toast.info { background: #3b82f6; }
+        
+        .empty-text { text-align: center; padding: 20px; color: #9ca3af; font-size: 13px; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="card">
+        <h1>文件上传服务</h1>
+        <p class="subtitle">支持大文件流式上传 | 拖拽或点击上传</p>
+        
+        <div class="upload-area" id="zone">
+            <div class="icon">📁</div>
+            <div class="text-main">点击或拖拽文件至此区域</div>
+            <div class="text-sub">无大小限制，支持所有文件类型</div>
+            <input type="file" id="fileInput" multiple>
+        </div>
+
+        <div class="progress-container" id="progressBox">
+            <div class="progress-info">
+                <span id="fileName">准备中...</span>
+                <span id="progressText">0%</span>
+            </div>
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressBar"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="card file-list">
+        <h2>已上传文件</h2>
+        <div id="fileList">
+            <div class="empty-text">暂无文件</div>
+        </div>
+    </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+    const zone = document.getElementById('zone');
+    const fileInput = document.getElementById('fileInput');
+    const progressBox = document.getElementById('progressBox');
+    const progressBar = document.getElementById('progressBar');
+    const progressText = document.getElementById('progressText');
+    const fileNameText = document.getElementById('fileName');
+    const fileListEl = document.getElementById('fileList');
+    const toastEl = document.getElementById('toast');
+
+    // --- 初始化 ---
+    loadFiles();
+    
+    // --- 上传事件 ---
+    zone.onclick = () => fileInput.click();
+    zone.ondragover = (e) => { e.preventDefault(); zone.classList.add('dragover'); };
+    zone.ondragleave = () => zone.classList.remove('dragover');
+    zone.ondrop = (e) => {
+        e.preventDefault();
+        zone.classList.remove('dragover');
+        Array.from(e.dataTransfer.files).forEach(uploadFile);
+    };
+    fileInput.onchange = (e) => {
+        Array.from(e.target.files).forEach(uploadFile);
+        e.target.value = ''; // Reset input
+    };
+
+    // --- 上传逻辑 ---
+    function uploadFile(file) {
+        progressBox.classList.add('active');
+        fileNameText.textContent = file.name;
+        progressBar.style.width = '0%';
+        progressText.textContent = '0%';
+
+        const fd = new FormData();
+        fd.append('file', file);
+
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/upload');
+
+        xhr.upload.onprogress = (e) => {
+            if (e.lengthComputable) {
+                const pct = Math.round(e.loaded / e.total * 100);
+                progressBar.style.width = pct + '%';
+                progressText.textContent = pct + '%';
+            }
+        };
+
+        xhr.onload = () => {
+            progressBox.classList.remove('active');
+            if (xhr.status === 200) {
+                const res = JSON.parse(xhr.responseText);
+                showToast('上传成功: ' + res.name, 'success');
+                loadFiles();
+            } else {
+                showToast('上传失败', 'error');
+            }
+        };
+
+        xhr.onerror = () => {
+            progressBox.classList.remove('active');
+            showToast('网络错误', 'error');
+        };
+
+        xhr.send(fd);
+    }
+
+    // --- 文件列表 ---
+    async function loadFiles() {
+        try {
+            const res = await fetch('/api/files');
+            const files = await res.json();
+            
+            if (!files || files.length === 0) {
+                fileListEl.innerHTML = '<div class="empty-text">暂无文件</div>';
+                return;
+            }
+
+            fileListEl.innerHTML = files.map(f => `
+                <div class="file-item">
+                    <div class="file-info">
+                        <div class="file-name" title="${esc(f.name)}">${esc(f.name)}</div>
+                        <div class="file-meta">
+                            <span>${f.size}</span>
+                            <span>${f.date}</span>
+                        </div>
+                    </div>
+                    <div class="file-actions">
+                        <button class="btn btn-cp" onclick="copyUrl('${f.id}')">复制链接</button>
+                        <a class="btn btn-dl" href="/download/${f.id}" download>下载</a>
+                        <button class="btn btn-del" onclick="deleteFile('${f.id}', '${esc(f.name)}')">删除</button>
+                    </div>
+                </div>
+            `).join('');
+        } catch (e) {
+            console.error(e);
+        }
+    }
+
+    async function deleteFile(id, name) {
+        if (!confirm(`确定删除 ${name} 吗？`)) return;
+        
+        try {
+            const res = await fetch(`/api/files/${id}`, { method: 'DELETE' });
+            if (res.ok) {
+                showToast('已删除', 'info');
+                loadFiles();
+            } else {
+                showToast('删除失败', 'error');
+            }
+        } catch (e) {
+            showToast('请求失败', 'error');
+        }
+    }
+
+    function copyUrl(id) {
+        const url = location.origin + '/download/' + id;
+        navigator.clipboard.writeText(url).then(() => showToast('链接已复制', 'success'));
+    }
+
+    // --- 工具函数 ---
+    function showToast(msg, type) {
+        toastEl.textContent = msg;
+        toastEl.className = 'toast ' + type + ' show';
+        setTimeout(() => toastEl.classList.remove('show'), 3000);
+    }
+
+    function esc(str) {
+        if (!str) return '';
+        const d = document.createElement('div');
+        d.textContent = str;
+        return d.innerHTML;
+    }
+</script>
+
+</body>
+</html>
