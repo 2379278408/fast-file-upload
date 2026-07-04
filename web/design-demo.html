@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fast File Upload Design Demo</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap');
+
+        :root {
+            --bg: #f4efe7;
+            --ink: #18161a;
+            --muted: #655f68;
+            --line: rgba(24, 22, 26, 0.12);
+            --paper: rgba(255, 255, 255, 0.72);
+            --paper-strong: #fffdf9;
+            --shadow: 0 28px 90px rgba(37, 27, 20, 0.12);
+            --radius-xl: 30px;
+            --radius-lg: 22px;
+            --radius-md: 16px;
+            --accent-a: #bf5a36;
+            --accent-b: #1d6b63;
+            --accent-c: #1f5eff;
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            color: var(--ink);
+            font-family: "Outfit", "Segoe UI", sans-serif;
+            background:
+                radial-gradient(circle at top left, rgba(191, 90, 54, 0.18), transparent 22%),
+                radial-gradient(circle at top right, rgba(31, 94, 255, 0.14), transparent 24%),
+                linear-gradient(180deg, #f8f4ee 0%, #efe7db 100%);
+        }
+
+        .page {
+            width: min(1320px, calc(100vw - 32px));
+            margin: 0 auto;
+            padding: 28px 0 56px;
+        }
+
+        .intro {
+            background: var(--paper);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(255,255,255,0.72);
+            box-shadow: var(--shadow);
+            border-radius: var(--radius-xl);
+            padding: 28px;
+            margin-bottom: 22px;
+        }
+
+        .intro-tag {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 9px 14px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.78);
+            border: 1px solid rgba(24,22,26,0.08);
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .intro-tag::before {
+            content: "";
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #bf5a36, #e9ad7a);
+        }
+
+        h1 {
+            margin: 18px 0 12px;
+            font-family: "Newsreader", serif;
+            font-size: clamp(2.5rem, 5vw, 5rem);
+            line-height: 0.92;
+            letter-spacing: -0.05em;
+        }
+
+        .intro p {
+            max-width: 70ch;
+            margin: 0;
+            color: var(--muted);
+            line-height: 1.7;
+            font-size: 15px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 18px;
+        }
+
+        .concept {
+            background: var(--paper);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(255,255,255,0.72);
+            box-shadow: var(--shadow);
+            border-radius: var(--radius-xl);
+            overflow: hidden;
+        }
+
+        .concept-head {
+            padding: 24px 24px 16px;
+            border-bottom: 1px solid rgba(24,22,26,0.08);
+        }
+
+        .concept-kicker {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--muted);
+        }
+
+        .concept-kicker::before {
+            content: "";
+            width: 28px;
+            height: 1px;
+            background: currentColor;
+            opacity: 0.6;
+        }
+
+        .concept h2 {
+            margin: 14px 0 8px;
+            font-size: 1.5rem;
+            line-height: 1.05;
+        }
+
+        .concept p {
+            margin: 0;
+            color: var(--muted);
+            line-height: 1.65;
+            font-size: 14px;
+        }
+
+        .badges {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 16px;
+        }
+
+        .badge {
+            border-radius: 999px;
+            padding: 8px 10px;
+            font-size: 11px;
+            background: rgba(255,255,255,0.82);
+            border: 1px solid rgba(24,22,26,0.08);
+        }
+
+        .mockup {
+            padding: 20px;
+        }
+
+        .screen {
+            min-height: 720px;
+            border-radius: 26px;
+            overflow: hidden;
+            border: 1px solid rgba(24,22,26,0.08);
+            background: var(--paper-strong);
+        }
+
+        .screen-a {
+            background:
+                radial-gradient(circle at top center, rgba(191, 90, 54, 0.18), transparent 22%),
+                linear-gradient(180deg, #f8efe6 0%, #fffdf9 100%);
+            padding: 22px;
+        }
+
+        .a-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 34px;
+        }
+
+        .brand {
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            font-size: 12px;
+        }
+
+        .mini-pill {
+            border: 1px solid rgba(24,22,26,0.08);
+            border-radius: 999px;
+            padding: 7px 12px;
+            font-size: 12px;
+            background: rgba(255,255,255,0.7);
+        }
+
+        .a-hero {
+            text-align: center;
+            padding: 34px 16px 24px;
+        }
+
+        .a-hero h3,
+        .b-copy h3,
+        .c-copy h3 {
+            margin: 0 0 12px;
+            font-family: "Newsreader", serif;
+            font-size: 2.5rem;
+            line-height: 0.96;
+            letter-spacing: -0.05em;
+        }
+
+        .a-hero p,
+        .b-copy p,
+        .c-copy p {
+            margin: 0 auto;
+            max-width: 34ch;
+            color: var(--muted);
+            line-height: 1.65;
+            font-size: 14px;
+        }
+
+        .drop-single {
+            margin: 28px auto 18px;
+            max-width: 380px;
+            padding: 26px;
+            border-radius: 30px;
+            background: rgba(255,255,255,0.8);
+            border: 1.5px dashed rgba(191,90,54,0.34);
+        }
+
+        .drop-single .cloud {
+            width: 62px;
+            height: 62px;
+            margin: 0 auto 18px;
+            border-radius: 22px;
+            display: grid;
+            place-items: center;
+            background: linear-gradient(135deg, #241c1a, #60443b);
+            color: white;
+            font-size: 28px;
+        }
+
+        .cta {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 48px;
+            padding: 0 18px;
+            border-radius: 999px;
+            font-size: 13px;
+            font-weight: 600;
+            border: 1px solid transparent;
+        }
+
+        .cta-a { background: #221b19; color: #fff; }
+        .cta-b { background: #10594f; color: #fff; }
+        .cta-c { background: #2059eb; color: #fff; }
+
+        .a-files {
+            display: grid;
+            gap: 10px;
+            margin-top: 18px;
+        }
+
+        .file-row,
+        .story-item,
+        .minimal-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 14px;
+            align-items: center;
+            padding: 14px 16px;
+            background: rgba(255,255,255,0.72);
+            border-radius: 18px;
+            border: 1px solid rgba(24,22,26,0.08);
+        }
+
+        .meta {
+            display: block;
+            margin-top: 4px;
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .tag {
+            padding: 8px 10px;
+            border-radius: 999px;
+            font-size: 11px;
+            background: rgba(191,90,54,0.12);
+            color: #8e4024;
+            white-space: nowrap;
+        }
+
+        .screen-b {
+            background: linear-gradient(180deg, #eef4f1 0%, #fcfdfc 100%);
+        }
+
+        .b-hero {
+            padding: 26px;
+            background: linear-gradient(135deg, #124f48, #2c8b80);
+            color: #f4fffd;
+        }
+
+        .b-topline {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 38px;
+            font-size: 12px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            opacity: 0.82;
+        }
+
+        .b-copy p { color: rgba(244,255,253,0.8); }
+
+        .b-rail {
+            display: grid;
+            grid-template-columns: 1.2fr 0.9fr;
+            gap: 14px;
+            margin-top: 26px;
+        }
+
+        .story-card,
+        .insight-card,
+        .b-list,
+        .c-card,
+        .c-list {
+            background: rgba(255,255,255,0.78);
+            border: 1px solid rgba(24,22,26,0.08);
+            border-radius: 22px;
+            padding: 18px;
+        }
+
+        .story-card {
+            min-height: 220px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.2), rgba(255,255,255,0.08));
+            border-color: rgba(255,255,255,0.24);
+        }
+
+        .story-card p,
+        .story-card h4,
+        .insight-card h4,
+        .insight-card p { color: inherit; margin: 0; }
+
+        .story-card h4,
+        .insight-card h4,
+        .c-card h4,
+        .c-list h4 { margin-bottom: 10px; font-size: 1.02rem; }
+
+        .b-body {
+            padding: 18px;
+            display: grid;
+            gap: 14px;
+        }
+
+        .screen-c {
+            background: linear-gradient(180deg, #f2f6ff 0%, #ffffff 100%);
+            padding: 22px;
+        }
+
+        .c-shell {
+            max-width: 430px;
+            margin: 0 auto;
+        }
+
+        .c-nav {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+        }
+
+        .c-copy {
+            text-align: left;
+            margin-bottom: 24px;
+        }
+
+        .c-copy p { margin: 0; }
+
+        .c-drop {
+            padding: 24px;
+            border-radius: 26px;
+            background: white;
+            border: 1px solid rgba(31,94,255,0.14);
+        }
+
+        .bar {
+            height: 10px;
+            border-radius: 999px;
+            background: rgba(31,94,255,0.08);
+            overflow: hidden;
+            margin-top: 10px;
+        }
+
+        .bar > div {
+            width: 68%;
+            height: 100%;
+            background: linear-gradient(90deg, #2059eb, #5e87ff);
+        }
+
+        .footer-note {
+            margin-top: 22px;
+            padding: 18px 20px;
+            border-radius: 20px;
+            background: rgba(255,255,255,0.65);
+            border: 1px solid rgba(24,22,26,0.08);
+            color: var(--muted);
+            line-height: 1.65;
+            font-size: 14px;
+        }
+
+        .pick-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 18px;
+        }
+
+        .pick {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 44px;
+            padding: 0 16px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.88);
+            border: 1px solid rgba(24,22,26,0.08);
+            color: var(--ink);
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 13px;
+        }
+
+        @media (max-width: 1120px) {
+            .grid { grid-template-columns: 1fr; }
+            .screen { min-height: auto; }
+        }
+
+        @media (max-width: 720px) {
+            .page { width: min(100vw - 20px, 1320px); padding: 16px 0 36px; }
+            .intro, .concept-head, .mockup { padding: 18px; }
+            .b-rail { grid-template-columns: 1fr; }
+            .a-hero h3, .b-copy h3, .c-copy h3 { font-size: 2rem; }
+            h1 { font-size: 2.5rem; }
+        }
+    </style>
+</head>
+<body>
+    <main class="page">
+        <section class="intro">
+            <span class="intro-tag">Fast File Upload / front-end redesign study</span>
+            <h1>三个方向，三个气质。<br>这一页专门用来看版式。</h1>
+            <p>我把当前文件传输页拆成三种不同的信息架构。左侧是单列沉浸式，强调上传入口；中间是双段式叙事页，强调说明与交付流程；右侧是极简工具页，强调克制和快速操作。你直接看哪一版最顺眼，再决定我把正式页面往哪个方向收敛。</p>
+            <div class="pick-row">
+                <a class="pick" href="#concept-a">看 A 单列沉浸式</a>
+                <a class="pick" href="#concept-b">看 B 双段式叙事页</a>
+                <a class="pick" href="#concept-c">看 C 极简工具页</a>
+            </div>
+        </section>
+
+        <section class="grid">
+            <article class="concept" id="concept-a">
+                <header class="concept-head">
+                    <span class="concept-kicker">Concept A</span>
+                    <h2>单列沉浸式</h2>
+                    <p>把页面重心压到一个大上传区，文件库变成下方的延伸区域。视线集中，最像一个“交付入口页”。</p>
+                    <div class="badges">
+                        <span class="badge">上传优先</span>
+                        <span class="badge">单焦点</span>
+                        <span class="badge">适合分享链接</span>
+                    </div>
+                </header>
+                <div class="mockup">
+                    <div class="screen screen-a">
+                        <div class="a-top">
+                            <div class="brand">Fast File Upload</div>
+                            <div class="mini-pill">公开访问</div>
+                        </div>
+                        <section class="a-hero">
+                            <h3>把文件放进来，<br>剩下的交给页面。</h3>
+                            <p>没有分栏，没有控制台。这里先给你一个足够大的投递动作，然后再接文件列表和后续分发。</p>
+                            <div class="drop-single">
+                                <div class="cloud">+</div>
+                                <strong>拖拽上传或点击选取</strong>
+                                <p class="meta">支持批量文件，队列逐项上传，失败项会保留在当前视图。</p>
+                                <div style="margin-top:16px;"><span class="cta cta-a">开始上传</span></div>
+                            </div>
+                        </section>
+                        <div class="a-files">
+                            <div class="file-row"><div><strong>campaign-assets.zip</strong><span class="meta">143 MB · 2 分钟前</span></div><span class="tag">复制链接</span></div>
+                            <div class="file-row"><div><strong>press-kit-2026.pdf</strong><span class="meta">18 MB · 刚刚上传</span></div><span class="tag">下载</span></div>
+                            <div class="file-row"><div><strong>screenshots-batch-04</strong><span class="meta">12 files · 队列进行中</span></div><span class="tag">72%</span></div>
+                        </div>
+                    </div>
+                </div>
+            </article>
+
+            <article class="concept" id="concept-b">
+                <header class="concept-head">
+                    <span class="concept-kicker">Concept B</span>
+                    <h2>双段式叙事页</h2>
+                    <p>先把规则和能力说清，再把上传动作放在第二段。更像产品落地页，也更适合给外部访客使用。</p>
+                    <div class="badges">
+                        <span class="badge">更有产品感</span>
+                        <span class="badge">适合对外展示</span>
+                        <span class="badge">说明更完整</span>
+                    </div>
+                </header>
+                <div class="mockup">
+                    <div class="screen screen-b">
+                        <section class="b-hero">
+                            <div class="b-topline"><span>curated transfer desk</span><span>3-step handoff</span></div>
+                            <div class="b-copy">
+                                <h3>先讲清交付逻辑，<br>再开始传文件。</h3>
+                                <p>这一版把“可以做什么、为什么可靠、传完之后怎么分发”放在上半屏，适合把上传页当成品牌化入口。</p>
+                            </div>
+                            <div class="b-rail">
+                                <div class="story-card">
+                                    <h4>上传</h4>
+                                    <p>拖拽、多文件、进度可见。</p>
+                                </div>
+                                <div class="insight-card">
+                                    <h4>治理</h4>
+                                    <p>令牌、类型和大小限制直接说明。</p>
+                                </div>
+                            </div>
+                        </section>
+                        <div class="b-body">
+                            <div class="story-item"><div><strong>01 选择文件</strong><span class="meta">支持批量与失败重试</span></div><span class="cta cta-b">打开上传</span></div>
+                            <div class="story-item"><div><strong>02 获取链接</strong><span class="meta">上传完成立刻复制分享</span></div><span class="tag">Auto copy</span></div>
+                            <div class="b-list">
+                                <h4>最近交付</h4>
+                                <div class="story-item"><div><strong>launch-reel-v6.mp4</strong><span class="meta">214 MB · 可下载</span></div><span class="tag">链接</span></div>
+                                <div class="story-item" style="margin-top:10px;"><div><strong>product-stills-pack.zip</strong><span class="meta">89 MB · 已完成</span></div><span class="tag">删除</span></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </article>
+
+            <article class="concept" id="concept-c">
+                <header class="concept-head">
+                    <span class="concept-kicker">Concept C</span>
+                    <h2>极简工具页</h2>
+                    <p>把一切压缩成更轻的工具感。上半屏是动作，下半屏是结果，适合追求安静和快速的人。</p>
+                    <div class="badges">
+                        <span class="badge">克制</span>
+                        <span class="badge">效率优先</span>
+                        <span class="badge">最轻量</span>
+                    </div>
+                </header>
+                <div class="mockup">
+                    <div class="screen screen-c">
+                        <div class="c-shell">
+                            <div class="c-nav">
+                                <div class="brand" style="letter-spacing:0.02em; text-transform:none;">Fast File Upload</div>
+                                <div class="mini-pill" style="border-color:rgba(31,94,255,0.12); color:#2059eb;">token off</div>
+                            </div>
+                            <div class="c-copy">
+                                <h3>上传一批文件，<br>拿走一个结果。</h3>
+                                <p>没有额外说明区，没有运营化排版。整个页面像一个被精简过的工具面板，气质更安静。</p>
+                            </div>
+                            <div class="c-drop">
+                                <strong>Drop files here</strong>
+                                <p class="meta">Single action area · multiple items queued</p>
+                                <div class="bar"><div></div></div>
+                                <div style="margin-top:16px;"><span class="cta cta-c">上传队列进行中</span></div>
+                            </div>
+                            <div class="c-card" style="margin-top:16px;">
+                                <h4>Quick filters</h4>
+                                <p class="meta">Search · newest · images only</p>
+                            </div>
+                            <div class="c-list" style="margin-top:16px;">
+                                <h4>Recent files</h4>
+                                <div class="minimal-row"><div><strong>deck-v9.key</strong><span class="meta">31 MB</span></div><span class="tag" style="background:rgba(31,94,255,0.1); color:#2059eb;">link</span></div>
+                                <div class="minimal-row" style="margin-top:10px;"><div><strong>logo-lockups.zip</strong><span class="meta">9 MB</span></div><span class="tag" style="background:rgba(31,94,255,0.1); color:#2059eb;">download</span></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </article>
+        </section>
+
+        <section class="footer-note">
+            我建议优先从 A 或 C 里选一个主方向。A 更有“上传入口页”的明确姿态，C 更轻更克制。B 适合你希望这个页面承担一点品牌感和说明职责的情况。
+        </section>
+    </main>
+</body>
+</html>

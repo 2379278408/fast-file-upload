@@ -3,227 +3,1943 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>File Upload Server</title>
+    <title>Fast File Upload</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: linear-gradient(135deg, #667eea, #764ba2); min-height: 100vh; padding: 30px 20px; }
-        .container { max-width: 800px; margin: 0 auto; }
-        .card { background: #fff; border-radius: 12px; padding: 24px; margin-bottom: 20px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); }
-        h1 { text-align: center; color: #333; margin-bottom: 4px; }
-        .subtitle { text-align: center; color: #888; font-size: 13px; margin-bottom: 20px; }
-        
-        /* Upload Zone */
-        .upload-area { border: 2px dashed #667eea; border-radius: 8px; padding: 40px 20px; text-align: center; cursor: pointer; transition: all 0.2s; background: #f8fafc; }
-        .upload-area:hover, .upload-area.dragover { border-color: #4c1d95; background: #eef2ff; }
-        .icon { font-size: 40px; margin-bottom: 10px; }
-        .text-main { font-weight: 600; color: #4b5563; }
-        .text-sub { font-size: 12px; color: #9ca3af; }
-        input[type="file"] { display: none; }
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=Newsreader:opsz,wght@6..72,500;6..72,700&display=swap');
 
-        /* Progress */
-        .progress-container { margin-top: 15px; display: none; }
-        .progress-container.active { display: block; }
-        .progress-info { display: flex; justify-content: space-between; margin-bottom: 5px; font-size: 13px; }
-        .progress-bar { height: 6px; background: #e5e7eb; border-radius: 4px; overflow: hidden; }
-        .progress-fill { height: 100%; background: linear-gradient(90deg, #667eea, #764ba2); width: 0%; transition: width 0.2s; }
+        :root {
+            --bg: #eef2fa;
+            --bg-soft: #f7f9fd;
+            --surface: rgba(255, 255, 255, 0.82);
+            --surface-strong: #ffffff;
+            --surface-tint: #f1f6ff;
+            --ink: #172033;
+            --muted: #667085;
+            --line: rgba(23, 32, 51, 0.1);
+            --line-strong: rgba(23, 32, 51, 0.16);
+            --accent: #2059eb;
+            --accent-soft: rgba(32, 89, 235, 0.1);
+            --accent-deep: #153cb0;
+            --success: #117a65;
+            --danger: #bd3e36;
+            --shadow: 0 20px 54px rgba(26, 38, 67, 0.1);
+            --radius-xl: 24px;
+            --radius-lg: 16px;
+            --radius-md: 16px;
+        }
 
-        /* File List */
-        .file-list h2 { font-size: 16px; margin-bottom: 12px; color: #374151; border-bottom: 1px solid #e5e7eb; padding-bottom: 8px; }
-        .file-item { display: flex; align-items: center; padding: 10px 0; border-bottom: 1px solid #f3f4f6; gap: 12px; }
-        .file-item:last-child { border-bottom: none; }
-        .file-info { flex: 1; min-width: 0; }
-        .file-name { font-weight: 500; color: #374151; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .file-meta { display: flex; gap: 12px; margin-top: 4px; font-size: 11px; color: #000000; }
-        .file-actions { display: flex; gap: 8px; flex-shrink: 0; }
-        
-        /* Buttons */
-        .btn { padding: 6px 12px; border-radius: 6px; border: none; font-size: 12px; cursor: pointer; transition: background 0.2s; color: #fff; display: inline-flex; align-items: center; text-decoration: none; }
-        .btn-dl { background: #10b981; }
-        .btn-dl:hover { background: #059669; }
-        .btn-cp { background: #3b82f6; }
-        .btn-cp:hover { background: #2563eb; }
-        .btn-del { background: #ef4444; }
-        .btn-del:hover { background: #dc2626; }
-        
-        /* Toast */
-        .toast { position: fixed; top: 20px; right: 20px; padding: 10px 20px; border-radius: 8px; color: #fff; font-size: 13px; z-index: 100; opacity: 0; transform: translateX(100%); transition: all 0.3s; }
-        .toast.show { opacity: 1; transform: translateX(0); }
-        .toast.success { background: #10b981; }
-        .toast.error { background: #ef4444; }
-        .toast.info { background: #3b82f6; }
-        
-        .empty-text { text-align: center; padding: 20px; color: #9ca3af; font-size: 13px; }
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            font-family: "Outfit", "Segoe UI", sans-serif;
+            color: var(--ink);
+            background:
+                radial-gradient(circle at top left, rgba(32, 89, 235, 0.08), transparent 20%),
+                linear-gradient(180deg, #f7f9fd 0%, #edf2fb 55%, #edf1f7 100%);
+        }
+
+        button,
+        input,
+        select {
+            font: inherit;
+        }
+
+        .app {
+            width: min(1180px, calc(100vw - 32px));
+            margin: 0 auto;
+            padding: 24px 0 48px;
+        }
+
+        .stack {
+            display: grid;
+            gap: 16px;
+        }
+
+        .panel {
+            background: var(--surface);
+            border: 1px solid rgba(255, 255, 255, 0.76);
+            backdrop-filter: blur(16px);
+            box-shadow: var(--shadow);
+            border-radius: var(--radius-xl);
+        }
+
+        .masthead {
+            padding: 18px 20px;
+        }
+
+        .topbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 14px;
+        }
+
+        .brand {
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--muted);
+        }
+
+        .status-row,
+        .quick-stats,
+        .header-actions,
+        .control-row,
+        .library-actions,
+        .file-actions,
+        .bulk-actions,
+        .view-switch {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .pill,
+        .view-chip,
+        .file-tag,
+        .preview-meta {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            min-height: 36px;
+            padding: 0 12px;
+            border-radius: 999px;
+            border: 1px solid var(--line);
+            background: rgba(255, 255, 255, 0.76);
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .pill strong,
+        .preview-meta strong {
+            color: var(--ink);
+            font-weight: 600;
+        }
+
+        .hero {
+            display: grid;
+            grid-template-columns: 1.3fr 0.9fr;
+            gap: 18px;
+            align-items: end;
+        }
+
+        .hero h1 {
+            margin: 0 0 10px;
+            font-family: "Outfit", "Segoe UI", sans-serif;
+            font-size: clamp(2.7rem, 5vw, 4.25rem);
+            line-height: 0.98;
+            letter-spacing: 0;
+        }
+
+        .hero p {
+            margin: 0;
+            max-width: 34ch;
+            color: var(--muted);
+            line-height: 1.65;
+        }
+
+        .quick-stats {
+            justify-content: end;
+            align-items: stretch;
+        }
+
+        .stat-card {
+            min-width: 124px;
+            padding: 12px 14px;
+            border-radius: var(--radius-lg);
+            border: 1px solid var(--line);
+            background: rgba(255, 255, 255, 0.72);
+        }
+
+        .stat-card span {
+            display: block;
+            font-size: 12px;
+            color: var(--muted);
+            margin-bottom: 8px;
+        }
+
+        .stat-card strong {
+            font-size: 1.4rem;
+            line-height: 1;
+        }
+
+        .workspace {
+            display: grid;
+            grid-template-columns: 1.2fr 0.9fr;
+            gap: 18px;
+        }
+
+        .upload-panel,
+        .side-panel,
+        .library-panel,
+        .operations-panel {
+            padding: 20px;
+        }
+
+        .section-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 14px;
+            margin-bottom: 18px;
+        }
+
+        .section-head h2,
+        .library-heading h2 {
+            margin: 0;
+            font-size: 1.2rem;
+        }
+
+        .section-head p,
+        .library-heading p,
+        .field label,
+        .hint,
+        .queue-meta,
+        .file-sub,
+        .empty,
+        .preview-copy p,
+        .preview-caption {
+            color: var(--muted);
+            font-size: 13px;
+            line-height: 1.55;
+        }
+
+        .dropzone {
+            position: relative;
+            overflow: hidden;
+            border-radius: 22px;
+            background:
+                radial-gradient(circle at 16% 16%, rgba(32, 89, 235, 0.13), transparent 28%),
+                linear-gradient(135deg, #fbfdff 0%, #f3f7ff 58%, #eef4ff 100%);
+            border: 1px solid rgba(32, 89, 235, 0.18);
+            padding: 24px;
+            min-height: 236px;
+            cursor: pointer;
+            transition: transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
+        }
+
+        .dropzone::before {
+            content: "";
+            position: absolute;
+            inset: 12px;
+            border: 1px dashed rgba(32, 89, 235, 0.22);
+            border-radius: 18px;
+            pointer-events: none;
+        }
+
+        .dropzone.dragover {
+            transform: translateY(-2px);
+            border-color: rgba(32, 89, 235, 0.5);
+            box-shadow: inset 0 0 0 1px rgba(32, 89, 235, 0.12);
+        }
+
+        .dropzone input { display: none; }
+
+        .drop-inner {
+            display: grid;
+            align-content: center;
+            justify-items: start;
+            min-height: 180px;
+            gap: 14px;
+        }
+
+        .drop-icon {
+            width: 60px;
+            height: 60px;
+            border-radius: 18px;
+            display: grid;
+            place-items: center;
+            background: linear-gradient(135deg, #172033, #2059eb);
+            color: white;
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.16);
+        }
+
+        .drop-icon svg { width: 30px; height: 30px; }
+
+        .drop-copy h3 {
+            margin: 0 0 8px;
+            font-family: "Outfit", "Segoe UI", sans-serif;
+            font-size: clamp(1.45rem, 2.5vw, 2rem);
+            line-height: 1.05;
+            letter-spacing: 0;
+        }
+
+        .drop-copy p {
+            margin: 0;
+            max-width: 38ch;
+            color: var(--muted);
+            line-height: 1.6;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 46px;
+            padding: 0 16px;
+            border-radius: 999px;
+            border: 1px solid transparent;
+            cursor: pointer;
+            transition: transform 160ms ease, background 160ms ease, color 160ms ease, border-color 160ms ease;
+            text-decoration: none;
+            font-size: 13px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        .btn:hover,
+        .view-chip:hover {
+            transform: translateY(-1px);
+        }
+
+        .btn-primary { background: var(--accent); color: white; }
+        .btn-soft { background: rgba(255,255,255,0.84); border-color: var(--line); color: var(--ink); }
+        .btn-danger { background: rgba(189, 62, 54, 0.1); color: var(--danger); }
+        .btn-plain { background: transparent; color: var(--muted); border-color: var(--line); }
+
+        .drop-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .upload-note {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .queue {
+            display: grid;
+            gap: 10px;
+            margin-top: 16px;
+        }
+
+        .queue:empty { display: none; }
+
+        .queue-item {
+            padding: 14px 16px;
+            border-radius: 18px;
+            background: rgba(255,255,255,0.72);
+            border: 1px solid var(--line);
+        }
+
+        .queue-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 10px;
+        }
+
+        .queue-status {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .queue-name {
+            font-weight: 600;
+            word-break: break-word;
+        }
+
+        .queue-error {
+            margin-top: 10px;
+            padding: 10px 12px;
+            border-radius: 14px;
+            background: rgba(189, 62, 54, 0.08);
+            color: var(--danger);
+            font-size: 12px;
+            line-height: 1.5;
+        }
+
+        .progress {
+            height: 8px;
+            border-radius: 999px;
+            overflow: hidden;
+            background: rgba(23, 32, 51, 0.08);
+        }
+
+        .progress > div {
+            height: 100%;
+            width: 0;
+            background: linear-gradient(90deg, #2059eb, #5b86f7);
+            transition: width 160ms linear;
+        }
+
+        .side-panel {
+            display: grid;
+            gap: 16px;
+            align-content: start;
+        }
+
+        .control-card,
+        .mode-card,
+        .note-card,
+        .library-toolbar,
+        .ops-list,
+        .file-card,
+        .preview-shell,
+        .preview-image-frame,
+        .preview-side,
+        .empty,
+        .count-chip,
+        .mini-kpi {
+            border-radius: var(--radius-lg);
+            border: 1px solid var(--line);
+            background: rgba(255, 255, 255, 0.74);
+        }
+
+        .control-card,
+        .mode-card,
+        .note-card,
+        .library-toolbar,
+        .preview-side {
+            padding: 16px;
+        }
+
+        .control-grid {
+            display: grid;
+            gap: 12px;
+        }
+
+        .field {
+            display: grid;
+            gap: 8px;
+        }
+
+        .field label {
+            font-weight: 600;
+        }
+
+        .input,
+        .select {
+            width: 100%;
+            min-height: 48px;
+            border-radius: 14px;
+            border: 1px solid var(--line-strong);
+            background: rgba(255,255,255,0.92);
+            color: var(--ink);
+            padding: 12px 14px;
+            outline: none;
+        }
+
+        .input:focus,
+        .select:focus {
+            border-color: rgba(32, 89, 235, 0.45);
+            box-shadow: 0 0 0 4px rgba(32, 89, 235, 0.1);
+        }
+
+        .mode-card,
+        .note-card {
+            display: grid;
+            gap: 10px;
+        }
+
+        .panel-label {
+            color: var(--muted);
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .mode-card strong,
+        .note-card strong,
+        .preview-side strong {
+            font-size: 14px;
+        }
+
+        .mini-kpi {
+            padding: 14px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.84), rgba(241,246,255,0.72));
+        }
+
+        .mini-kpi span {
+            display: block;
+            margin-bottom: 8px;
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .mini-kpi strong {
+            font-size: 1.15rem;
+        }
+
+        .library-panel {
+            display: grid;
+            gap: 18px;
+        }
+
+        .operations-panel {
+            display: grid;
+            gap: 14px;
+            box-shadow: 0 14px 38px rgba(26, 38, 67, 0.08);
+        }
+
+        .ops-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+        }
+
+        .ops-list {
+            display: grid;
+            gap: 10px;
+            padding: 14px;
+        }
+
+        .ops-list h3 {
+            margin: 0;
+            font-size: 0.95rem;
+        }
+
+        .ops-row {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 12px;
+            align-items: center;
+            padding: 12px 0;
+            border-top: 1px solid var(--line);
+        }
+
+        .ops-row:first-of-type {
+            border-top: 0;
+        }
+
+        .ops-main {
+            display: grid;
+            gap: 4px;
+            min-width: 0;
+        }
+
+        .ops-main strong {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .ops-meta {
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .ops-columns {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        .library-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 16px;
+        }
+
+        .library-heading {
+            display: grid;
+            gap: 6px;
+        }
+
+        .count-chip {
+            padding: 10px 14px;
+            min-width: 120px;
+            text-align: center;
+        }
+
+        .count-chip strong {
+            display: block;
+            font-size: 1.25rem;
+        }
+
+        .count-chip span {
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .library-toolbar {
+            display: grid;
+            gap: 14px;
+        }
+
+        .control-row {
+            justify-content: space-between;
+        }
+
+        .toolbar-grid {
+            display: grid;
+            grid-template-columns: 1.2fr repeat(2, minmax(0, 180px)) auto;
+            gap: 10px;
+        }
+
+        .view-chip {
+            min-height: 38px;
+            cursor: pointer;
+        }
+
+        .view-chip.active {
+            color: white;
+            background: var(--accent);
+            border-color: var(--accent);
+        }
+
+        .file-list {
+            display: grid;
+            gap: 14px;
+        }
+
+        .file-list.grid-mode {
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        }
+
+        .file-list.list-mode {
+            grid-template-columns: 1fr;
+        }
+
+        .file-card {
+            overflow: hidden;
+            transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+        }
+
+        .file-card:hover {
+            transform: translateY(-2px);
+            border-color: rgba(32, 89, 235, 0.22);
+            box-shadow: 0 22px 52px rgba(26, 38, 67, 0.12);
+        }
+
+        .file-card.grid-card {
+            display: grid;
+            grid-template-rows: auto 1fr;
+        }
+
+        .file-card.list-card {
+            display: grid;
+            grid-template-columns: 116px 1fr auto;
+            align-items: stretch;
+        }
+
+        .media {
+            position: relative;
+            overflow: hidden;
+            background: linear-gradient(180deg, #f4f7ff 0%, #ebf1ff 100%);
+            border: 0;
+            border-radius: 0;
+            cursor: pointer;
+            min-height: 100%;
+            padding: 0;
+            width: 100%;
+            aspect-ratio: 4 / 3;
+        }
+
+        .media::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background: linear-gradient(180deg, rgba(255,255,255,0) 55%, rgba(23,32,51,0.08) 100%);
+            opacity: 0;
+            transition: opacity 160ms ease;
+        }
+
+        .file-card:hover .media::after { opacity: 1; }
+
+        .media img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+
+        .media.fallback {
+            display: grid;
+            place-items: center;
+            background:
+                radial-gradient(circle at 30% 20%, rgba(32, 89, 235, 0.12), transparent 28%),
+                linear-gradient(180deg, #f7f9ff 0%, #e9efff 100%);
+        }
+
+        .doc-badge {
+            display: grid;
+            gap: 10px;
+            justify-items: center;
+            text-align: center;
+            color: var(--accent-deep);
+        }
+
+        .doc-badge svg {
+            width: 44px;
+            height: 44px;
+        }
+
+        .doc-badge span {
+            max-width: 10ch;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            color: var(--muted);
+        }
+
+        .card-body {
+            display: grid;
+            gap: 12px;
+            padding: 16px;
+            align-content: space-between;
+        }
+
+        .card-top {
+            display: grid;
+            gap: 8px;
+        }
+
+        .file-name {
+            font-weight: 600;
+            line-height: 1.45;
+            word-break: break-word;
+            min-height: 2.9em;
+        }
+
+        .file-sub {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px 12px;
+        }
+
+        .file-tag {
+            min-height: 30px;
+            background: var(--accent-soft);
+            color: var(--accent-deep);
+            border-color: transparent;
+        }
+
+        .file-card.selected {
+            border-color: rgba(32, 89, 235, 0.46);
+            box-shadow: 0 18px 48px rgba(32, 89, 235, 0.14);
+        }
+
+        .select-line {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--muted);
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .select-line input {
+            width: 16px;
+            height: 16px;
+            accent-color: var(--accent);
+        }
+
+        .bulk-actions {
+            justify-content: space-between;
+            padding-top: 12px;
+            border-top: 1px solid var(--line);
+        }
+
+        .file-actions {
+            justify-content: flex-start;
+            gap: 8px;
+        }
+
+        .file-actions .btn {
+            min-height: 40px;
+            padding: 0 13px;
+        }
+
+        .list-card .file-actions {
+            justify-content: end;
+            padding: 16px;
+            align-content: center;
+        }
+
+        .list-card .card-body {
+            padding-right: 0;
+        }
+
+        .empty {
+            min-height: 220px;
+            padding: 34px 24px;
+            text-align: center;
+            display: grid;
+            place-items: center;
+            gap: 14px;
+            color: var(--muted);
+            background:
+                radial-gradient(circle at 50% 0%, rgba(32, 89, 235, 0.1), transparent 32%),
+                rgba(255, 255, 255, 0.72);
+        }
+
+        .empty strong {
+            display: block;
+            margin-bottom: 6px;
+            color: var(--ink);
+            font-size: 1.05rem;
+        }
+
+        .empty p {
+            margin: 0;
+            max-width: 34ch;
+            line-height: 1.6;
+        }
+
+        .empty-mark {
+            width: 52px;
+            height: 52px;
+            border-radius: 18px;
+            display: grid;
+            place-items: center;
+            color: var(--accent);
+            background: var(--accent-soft);
+        }
+
+        .empty-mark svg {
+            width: 26px;
+            height: 26px;
+        }
+
+        .toast {
+            position: fixed;
+            top: 18px;
+            right: 18px;
+            min-width: 240px;
+            max-width: min(360px, calc(100vw - 36px));
+            padding: 14px 16px;
+            border-radius: 16px;
+            color: white;
+            box-shadow: 0 18px 40px rgba(0,0,0,0.16);
+            opacity: 0;
+            pointer-events: none;
+            transform: translateY(-8px);
+            transition: opacity 160ms ease, transform 160ms ease;
+            z-index: 40;
+        }
+
+        .toast.show { opacity: 1; transform: translateY(0); }
+        .toast.success { background: var(--success); }
+        .toast.error { background: var(--danger); }
+        .toast.info { background: #2d5cb7; }
+
+        .preview-modal {
+            position: fixed;
+            inset: 0;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            background: rgba(15, 23, 42, 0.64);
+            backdrop-filter: blur(12px);
+            z-index: 30;
+        }
+
+        .preview-modal.open { display: flex; }
+
+        .preview-shell {
+            width: min(1120px, 100%);
+            max-height: min(820px, calc(100vh - 40px));
+            display: grid;
+            grid-template-columns: minmax(0, 1.24fr) 330px;
+            gap: 16px;
+            padding: 18px;
+            background: rgba(246, 249, 255, 0.96);
+            box-shadow: 0 40px 100px rgba(15, 23, 42, 0.26);
+            overflow: auto;
+        }
+
+        .preview-image-frame {
+            min-height: min(540px, calc(100vh - 96px));
+            padding: 18px;
+            display: grid;
+            place-items: center;
+            background:
+                linear-gradient(45deg, rgba(32, 89, 235, 0.05) 25%, transparent 25%),
+                linear-gradient(-45deg, rgba(32, 89, 235, 0.05) 25%, transparent 25%),
+                linear-gradient(180deg, #f8fbff 0%, #edf2ff 100%);
+            background-size: 26px 26px, 26px 26px, auto;
+        }
+
+        .preview-image-frame img {
+            max-width: 100%;
+            max-height: 72vh;
+            border-radius: 18px;
+            display: block;
+            object-fit: contain;
+            box-shadow: 0 18px 46px rgba(35, 56, 108, 0.12);
+        }
+
+        .preview-side {
+            display: grid;
+            gap: 12px;
+            align-content: start;
+            position: sticky;
+            top: 0;
+        }
+
+        .preview-kicker {
+            color: var(--muted);
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .preview-copy h3 {
+            margin: 0 0 10px;
+            font-size: 1.35rem;
+            line-height: 1.35;
+            word-break: break-word;
+        }
+
+        .preview-actions {
+            display: grid;
+            gap: 10px;
+        }
+
+        .visually-hidden {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            border: 0;
+        }
+
+        @media (max-width: 1024px) {
+            .hero,
+            .workspace,
+            .preview-shell,
+            .toolbar-grid,
+            .ops-grid,
+            .ops-columns {
+                grid-template-columns: 1fr;
+            }
+
+            .quick-stats,
+            .library-head {
+                justify-content: start;
+            }
+
+            .preview-shell {
+                max-height: calc(100vh - 28px);
+            }
+
+            .preview-image-frame {
+                min-height: 360px;
+            }
+
+            .preview-side {
+                position: static;
+            }
+
+            .count-chip {
+                min-width: 0;
+            }
+        }
+
+        @media (max-width: 720px) {
+            .app {
+                width: min(100vw - 20px, 100%);
+                padding-top: 16px;
+            }
+
+            .masthead,
+            .upload-panel,
+            .side-panel,
+            .library-panel,
+            .operations-panel,
+            .preview-shell {
+                padding: 18px;
+            }
+
+            .panel { border-radius: 24px; }
+            .topbar,
+            .library-head,
+            .control-row {
+                align-items: flex-start;
+                flex-direction: column;
+            }
+            .status-row,
+            .quick-stats,
+            .library-actions,
+            .bulk-actions,
+            .file-actions {
+                width: 100%;
+            }
+            .quick-stats {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+            }
+            .stat-card {
+                min-width: 0;
+            }
+            .dropzone { padding: 20px; min-height: auto; }
+            .drop-copy h3 { font-size: 1.9rem; }
+            .hero h1 { font-size: 2.4rem; }
+            .file-list.grid-mode { grid-template-columns: 1fr; }
+            .file-card.list-card { grid-template-columns: 1fr; }
+            .list-card .file-actions { padding: 0 16px 16px; justify-content: flex-start; }
+            .list-card .card-body { padding-right: 16px; }
+            .media { min-height: 180px; }
+            .file-name { min-height: auto; }
+            .preview-modal { padding: 10px; align-items: stretch; }
+            .preview-shell {
+                max-height: calc(100vh - 20px);
+                border-radius: 20px;
+                gap: 12px;
+            }
+            .preview-image-frame {
+                min-height: 280px;
+                padding: 12px;
+            }
+            .preview-image-frame img {
+                max-height: 46vh;
+                border-radius: 14px;
+            }
+            .preview-actions {
+                grid-template-columns: 1fr;
+            }
+            .ops-row {
+                grid-template-columns: 1fr;
+            }
+        }
     </style>
 </head>
 <body>
-
-<div class="container">
-    <div class="card">
-        <h1>文件上传服务</h1>
-        <p class="subtitle">支持大文件流式上传 | 拖拽或点击上传</p>
-        
-        <div class="upload-area" id="zone">
-            <div class="icon">📁</div>
-            <div class="text-main">点击或拖拽文件至此区域</div>
-            <div class="text-sub">无大小限制，支持所有文件类型</div>
-            <input type="file" id="fileInput" multiple>
-        </div>
-
-        <div class="progress-container" id="progressBox">
-            <div class="progress-info">
-                <span id="fileName">准备中...</span>
-                <span id="progressText">0%</span>
+    <main class="app stack">
+        <section class="panel masthead">
+            <div class="topbar">
+                <div class="brand">File Transfer Workspace</div>
+                <div class="status-row">
+                    <span class="pill"><strong id="metricMode">公开</strong> 访问</span>
+                    <span class="pill"><strong id="metricLimit">-</strong> 单文件</span>
+                    <button class="btn btn-soft" id="refreshHealthBtn" type="button">刷新状态</button>
+                </div>
             </div>
-            <div class="progress-bar">
-                <div class="progress-fill" id="progressBar"></div>
+            <div class="hero">
+                <div>
+                    <h1>Fast File Upload</h1>
+                    <p>轻量文件工作台，上传后即可预览、校验与分发。</p>
+                </div>
+                <div class="quick-stats">
+                    <div class="stat-card"><span>文件数量</span><strong id="metricCount">0</strong></div>
+                    <div class="stat-card"><span>总容量</span><strong id="metricSize">0 B</strong></div>
+                </div>
             </div>
+        </section>
+
+        <section class="workspace">
+            <div class="panel upload-panel">
+                <div class="section-head">
+                    <div>
+                        <h2>Upload</h2>
+                        <p>拖入文件，立即生成链接。</p>
+                    </div>
+                </div>
+
+                <div class="dropzone" id="dropzone" role="button" tabindex="0" aria-label="打开文件选择器">
+                    <input type="file" id="fileInput" multiple>
+                    <div class="drop-inner">
+                        <div class="drop-icon" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M12 3v11"></path>
+                                <path d="m8 8 4-5 4 5"></path>
+                                <path d="M20 16.5a4.5 4.5 0 0 1-4.5 4.5h-7A4.5 4.5 0 0 1 4 16.5"></path>
+                            </svg>
+                        </div>
+                        <div class="drop-copy">
+                            <h3>Drop files here</h3>
+                            <p>支持批量、进度、失败重试。</p>
+                        </div>
+                        <div class="drop-actions">
+                            <span class="btn btn-primary">选择文件</span>
+                            <span class="upload-note">拖拽到此处也可以</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="queue" id="queue"></div>
+            </div>
+
+            <aside class="panel side-panel">
+                <div class="control-card">
+                    <div class="section-head">
+                        <div>
+                            <span class="panel-label">Access</span>
+                            <h2>访问控制</h2>
+                            <p>令牌、搜索与类型筛选。</p>
+                        </div>
+                    </div>
+                    <div class="control-grid">
+                        <div class="field">
+                            <label for="tokenInput">访问令牌</label>
+                            <input class="input" id="tokenInput" type="password" placeholder="启用 UPLOAD_TOKEN 后填写">
+                        </div>
+                        <div class="field">
+                            <label for="searchInput">搜索</label>
+                            <input class="input" id="searchInput" type="search" placeholder="按文件名过滤">
+                        </div>
+                        <div class="field">
+                            <label for="extensionSelect">类型</label>
+                            <select class="select" id="extensionSelect">
+                                <option value="all">全部类型</option>
+                            </select>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="mode-card">
+                    <span class="panel-label">Rules</span>
+                    <strong>分发规则</strong>
+                    <div class="header-actions">
+                        <div class="mini-kpi"><span>状态</span><strong id="modeState">公开访问</strong></div>
+                        <div class="mini-kpi"><span>图片预览</span><strong>已启用</strong></div>
+                    </div>
+                </div>
+
+                <div class="note-card">
+                    <span class="panel-label">Sync</span>
+                    <strong>同步</strong>
+                    <div class="hint">启用令牌后，预览、下载和删除都会带上当前令牌。</div>
+                    <button class="btn btn-soft" id="reloadBtn" type="button">同步文件列表</button>
+                </div>
+            </aside>
+        </section>
+
+        <section class="panel library-panel">
+            <div class="library-head">
+                <div class="library-heading">
+                    <h2>Library</h2>
+                    <p>筛选、复制、下载与预览。</p>
+                </div>
+                <div class="count-chip">
+                    <strong id="libraryCount">0</strong>
+                    <span>当前结果</span>
+                </div>
+            </div>
+
+            <div class="library-toolbar">
+                <div class="control-row">
+                    <div class="view-switch" role="tablist" aria-label="文件视图切换">
+                        <button class="view-chip active" id="gridViewBtn" data-view="grid" type="button">卡片视图</button>
+                        <button class="view-chip" id="listViewBtn" data-view="list" type="button">列表视图</button>
+                    </div>
+                    <div class="library-actions">
+                        <span class="pill"><strong id="imageCount">0</strong> 张图片</span>
+                        <span class="pill"><strong id="otherCount">0</strong> 个其他文件</span>
+                    </div>
+                </div>
+                <div class="toolbar-grid">
+                    <div class="field">
+                        <label for="searchInputClone" class="visually-hidden">搜索文件</label>
+                        <input class="input" id="searchInputClone" type="search" placeholder="搜索文件名，同步上方筛选">
+                    </div>
+                    <div class="field">
+                        <label for="sortSelectClone" class="visually-hidden">排序方式</label>
+                        <select class="select" id="sortSelectClone">
+                            <option value="newest">最新优先</option>
+                            <option value="oldest">最早优先</option>
+                            <option value="largest">体积优先</option>
+                            <option value="name">名称 A-Z</option>
+                        </select>
+                    </div>
+                    <div class="field">
+                        <label for="extensionSelectClone" class="visually-hidden">扩展名筛选</label>
+                        <select class="select" id="extensionSelectClone">
+                            <option value="all">全部类型</option>
+                        </select>
+                    </div>
+                    <button class="btn btn-soft" id="clearFiltersBtn" type="button">清空筛选</button>
+                </div>
+                <div class="bulk-actions" aria-label="批量文件操作">
+                    <span class="pill"><strong id="selectedCount">0</strong> 已选择</span>
+                    <div class="file-actions">
+                        <button class="btn btn-soft" id="selectVisibleBtn" type="button">选择当前结果</button>
+                        <button class="btn btn-soft" id="copySelectedBtn" type="button">复制所选链接</button>
+                        <button class="btn btn-plain" id="clearSelectionBtn" type="button">清空选择</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="file-list grid-mode" id="fileList"></div>
+        </section>
+
+        <section class="panel operations-panel" aria-labelledby="operationsTitle">
+            <div class="library-head">
+                <div class="library-heading">
+                    <h2 id="operationsTitle">Operations</h2>
+                    <p>存储占用、旧文件与审计事件。</p>
+                </div>
+                <button class="btn btn-soft" id="refreshOpsBtn" type="button">刷新运营视图</button>
+            </div>
+
+            <div class="ops-grid" id="opsSummary">
+                <div class="mini-kpi"><span>总占用</span><strong>-</strong></div>
+                <div class="mini-kpi"><span>文件数</span><strong>-</strong></div>
+                <div class="mini-kpi"><span>旧文件</span><strong>-</strong></div>
+                <div class="mini-kpi"><span>大文件</span><strong>-</strong></div>
+            </div>
+
+            <div class="ops-columns">
+                <div class="ops-list">
+                    <h3>Largest Files</h3>
+                    <div id="largestFilesList" class="ops-meta">随文件列表同步。</div>
+                </div>
+                <div class="ops-list">
+                    <h3>Audit Trail</h3>
+                    <div id="auditEventsList" class="ops-meta">随文件列表同步。</div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <div class="preview-modal" id="previewModal" role="dialog" aria-modal="true" aria-labelledby="previewTitle" hidden>
+        <div class="preview-shell">
+            <div class="preview-image-frame">
+                <img id="previewImage" alt="图片预览">
+            </div>
+            <aside class="preview-side">
+                <div class="preview-copy">
+                    <span class="preview-kicker">Image Preview</span>
+                    <h3 id="previewTitle"></h3>
+                    <p class="preview-caption">预览链接会沿用当前访问令牌。</p>
+                </div>
+                <div class="preview-meta"><strong id="previewSize">-</strong> 文件大小</div>
+                <div class="preview-meta"><strong id="previewDate">-</strong> 更新时间</div>
+                <div class="preview-meta"><strong id="previewType">-</strong> 文件类型</div>
+                <div class="preview-actions">
+                    <button class="btn btn-soft" id="previewCopyBtn" type="button">复制链接</button>
+                    <a class="btn btn-primary" id="previewDownloadBtn" href="#">下载文件</a>
+                    <button class="btn btn-plain" id="closePreviewBtn" type="button">关闭预览</button>
+                </div>
+            </aside>
         </div>
     </div>
 
-    <div class="card file-list">
-        <h2>已上传文件</h2>
-        <div id="fileList">
-            <div class="empty-text">暂无文件</div>
-        </div>
-    </div>
-</div>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
-<div class="toast" id="toast"></div>
+    <script>
+        const dropzone = document.getElementById('dropzone');
+        const fileInput = document.getElementById('fileInput');
+        const queueEl = document.getElementById('queue');
+        const fileListEl = document.getElementById('fileList');
+        const tokenInput = document.getElementById('tokenInput');
+        const searchInput = document.getElementById('searchInput');
+        const searchInputClone = document.getElementById('searchInputClone');
+        const sortSelectClone = document.getElementById('sortSelectClone');
+        const extensionSelect = document.getElementById('extensionSelect');
+        const extensionSelectClone = document.getElementById('extensionSelectClone');
+        const toastEl = document.getElementById('toast');
+        const previewModal = document.getElementById('previewModal');
+        const previewImage = document.getElementById('previewImage');
+        const previewTitle = document.getElementById('previewTitle');
+        const previewSize = document.getElementById('previewSize');
+        const previewDate = document.getElementById('previewDate');
+        const previewType = document.getElementById('previewType');
+        const previewCopyBtn = document.getElementById('previewCopyBtn');
+        const previewDownloadBtn = document.getElementById('previewDownloadBtn');
+        const closePreviewBtn = document.getElementById('closePreviewBtn');
+        const metricCount = document.getElementById('metricCount');
+        const metricSize = document.getElementById('metricSize');
+        const metricLimit = document.getElementById('metricLimit');
+        const metricMode = document.getElementById('metricMode');
+        const modeState = document.getElementById('modeState');
+        const libraryCount = document.getElementById('libraryCount');
+        const imageCount = document.getElementById('imageCount');
+        const otherCount = document.getElementById('otherCount');
+        const gridViewBtn = document.getElementById('gridViewBtn');
+        const listViewBtn = document.getElementById('listViewBtn');
+        const selectedCount = document.getElementById('selectedCount');
+        const opsSummary = document.getElementById('opsSummary');
+        const largestFilesList = document.getElementById('largestFilesList');
+        const auditEventsList = document.getElementById('auditEventsList');
 
-<script>
-    const zone = document.getElementById('zone');
-    const fileInput = document.getElementById('fileInput');
-    const progressBox = document.getElementById('progressBox');
-    const progressBar = document.getElementById('progressBar');
-    const progressText = document.getElementById('progressText');
-    const fileNameText = document.getElementById('fileName');
-    const fileListEl = document.getElementById('fileList');
-    const toastEl = document.getElementById('toast');
+        const queueState = [];
+        let filesState = [];
+        let healthState = null;
+        let viewMode = 'grid';
+        let currentPreview = null;
+        let lastPreviewTrigger = null;
+        const selectedIds = new Set();
 
-    // --- 初始化 ---
-    loadFiles();
-    
-    // --- 上传事件 ---
-    zone.onclick = () => fileInput.click();
-    zone.ondragover = (e) => { e.preventDefault(); zone.classList.add('dragover'); };
-    zone.ondragleave = () => zone.classList.remove('dragover');
-    zone.ondrop = (e) => {
-        e.preventDefault();
-        zone.classList.remove('dragover');
-        Array.from(e.dataTransfer.files).forEach(uploadFile);
-    };
-    fileInput.onchange = (e) => {
-        Array.from(e.target.files).forEach(uploadFile);
-        e.target.value = ''; // Reset input
-    };
+        const storedToken = sessionStorage.getItem('upload-token');
+        if (storedToken) tokenInput.value = storedToken;
 
-    // --- 上传逻辑 ---
-    function uploadFile(file) {
-        progressBox.classList.add('active');
-        fileNameText.textContent = file.name;
-        progressBar.style.width = '0%';
-        progressText.textContent = '0%';
+        const saveToken = () => {
+            sessionStorage.setItem('upload-token', tokenInput.value.trim());
+        };
 
-        const fd = new FormData();
-        fd.append('file', file);
+        function syncField(source, target) {
+            target.value = source.value;
+        }
 
-        const xhr = new XMLHttpRequest();
-        xhr.open('POST', '/api/upload');
+        function syncBoth(source, target, callback) {
+            source.addEventListener('input', () => {
+                syncField(source, target);
+                callback();
+            });
+            target.addEventListener('input', () => {
+                syncField(target, source);
+                callback();
+            });
+        }
 
-        xhr.upload.onprogress = (e) => {
-            if (e.lengthComputable) {
-                const pct = Math.round(e.loaded / e.total * 100);
-                progressBar.style.width = pct + '%';
-                progressText.textContent = pct + '%';
+        function syncBothChange(source, target, callback) {
+            source.addEventListener('change', () => {
+                syncField(source, target);
+                callback();
+            });
+            target.addEventListener('change', () => {
+                syncField(target, source);
+                callback();
+            });
+        }
+
+        syncBoth(searchInput, searchInputClone, renderFiles);
+        sortSelectClone.addEventListener('change', renderFiles);
+        syncBothChange(extensionSelect, extensionSelectClone, renderFiles);
+
+        tokenInput.addEventListener('change', () => {
+            saveToken();
+            refreshAll();
+        });
+
+        document.getElementById('reloadBtn').onclick = () => refreshAll();
+        document.getElementById('refreshHealthBtn').onclick = () => loadHealth();
+        document.getElementById('refreshOpsBtn').onclick = () => loadOperations();
+        document.getElementById('selectVisibleBtn').onclick = () => selectVisibleFiles();
+        document.getElementById('copySelectedBtn').onclick = () => copySelectedLinks();
+        document.getElementById('clearSelectionBtn').onclick = () => clearSelection();
+        document.getElementById('clearFiltersBtn').onclick = () => {
+            searchInput.value = '';
+            searchInputClone.value = '';
+            sortSelectClone.value = 'newest';
+            extensionSelect.value = 'all';
+            extensionSelectClone.value = 'all';
+            renderFiles();
+        };
+
+        gridViewBtn.onclick = () => setViewMode('grid');
+        listViewBtn.onclick = () => setViewMode('list');
+
+        dropzone.onclick = () => fileInput.click();
+        dropzone.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                fileInput.click();
             }
+        });
+
+        fileInput.onchange = (event) => {
+            enqueueFiles(Array.from(event.target.files));
+            event.target.value = '';
         };
 
-        xhr.onload = () => {
-            progressBox.classList.remove('active');
-            if (xhr.status === 200) {
-                const res = JSON.parse(xhr.responseText);
-                showToast('上传成功: ' + res.name, 'success');
-                loadFiles();
-            } else {
-                showToast('上传失败', 'error');
+        ['dragenter', 'dragover'].forEach((name) => {
+            dropzone.addEventListener(name, (event) => {
+                event.preventDefault();
+                dropzone.classList.add('dragover');
+            });
+        });
+
+        ['dragleave', 'drop'].forEach((name) => {
+            dropzone.addEventListener(name, (event) => {
+                event.preventDefault();
+                dropzone.classList.remove('dragover');
+            });
+        });
+
+        dropzone.addEventListener('drop', (event) => {
+            enqueueFiles(Array.from(event.dataTransfer.files));
+        });
+
+        previewModal.addEventListener('click', (event) => {
+            if (event.target === previewModal) {
+                closePreview();
             }
-        };
+        });
+        closePreviewBtn.onclick = closePreview;
+        document.addEventListener('keydown', (event) => {
+            if (!previewModal.classList.contains('open')) return;
+            if (event.key === 'Escape') {
+                closePreview();
+                return;
+            }
+            if (event.key === 'Tab') {
+                trapPreviewFocus(event);
+            }
+        });
 
-        xhr.onerror = () => {
-            progressBox.classList.remove('active');
-            showToast('网络错误', 'error');
-        };
+        function getToken() {
+            return tokenInput.value.trim();
+        }
 
-        xhr.send(fd);
-    }
+        function createHeaders() {
+            const headers = {};
+            const token = getToken();
+            if (token) headers['X-Upload-Token'] = token;
+            return headers;
+        }
 
-    // --- 文件列表 ---
-    async function loadFiles() {
-        try {
-            const res = await fetch('/api/files');
-            const files = await res.json();
-            
-            if (!files || files.length === 0) {
-                fileListEl.innerHTML = '<div class="empty-text">暂无文件</div>';
+        function withToken(url) {
+            const token = getToken();
+            if (!token) return url;
+            const joiner = url.includes('?') ? '&' : '?';
+            return `${url}${joiner}token=${encodeURIComponent(token)}`;
+        }
+
+        function setViewMode(mode) {
+            viewMode = mode;
+            gridViewBtn.classList.toggle('active', mode === 'grid');
+            listViewBtn.classList.toggle('active', mode === 'list');
+            renderFiles();
+        }
+
+        function enqueueFiles(files) {
+            const accepted = files.filter((file) => {
+                if (file.size > 0) return true;
+                showToast(`空文件已跳过：${file.name || '未命名文件'}`, 'error');
+                return false;
+            });
+            accepted.forEach((file) => {
+                queueState.push({
+                    id: crypto.randomUUID(),
+                    file,
+                    progress: 0,
+                    status: '等待中',
+                    error: '',
+                    attempts: 0
+                });
+            });
+            if (!accepted.length) return;
+            renderQueue();
+            processQueue();
+        }
+
+        let processing = false;
+        function processQueue() {
+            if (processing) return;
+            const next = queueState.find((item) => item.progress < 100 && item.status !== '完成' && item.status !== '失败');
+            if (!next) return;
+            processing = true;
+            uploadItem(next).finally(() => {
+                processing = false;
+                renderQueue();
+                processQueue();
+            });
+        }
+
+        function uploadItem(item) {
+            item.status = '上传中';
+            item.error = '';
+            item.attempts += 1;
+            renderQueue();
+            return new Promise((resolve) => {
+                const formData = new FormData();
+                formData.append('file', item.file);
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', '/api/upload');
+                Object.entries(createHeaders()).forEach(([key, value]) => xhr.setRequestHeader(key, value));
+
+                xhr.upload.onprogress = (event) => {
+                    if (!event.lengthComputable) return;
+                    item.progress = Math.round((event.loaded / event.total) * 100);
+                    renderQueue();
+                };
+
+                xhr.onload = () => {
+                    if (xhr.status === 200) {
+                        item.progress = 100;
+                        item.status = '完成';
+                        showToast(`上传完成：${item.file.name}`, 'success');
+                        refreshAll();
+                    } else {
+                        item.status = '失败';
+                        item.progress = 0;
+                        item.error = parseError(xhr.responseText, '上传失败');
+                        showToast(item.error, 'error');
+                    }
+                    resolve();
+                };
+
+                xhr.onerror = () => {
+                    item.status = '失败';
+                    item.progress = 0;
+                    item.error = '网络错误';
+                    showToast(`${item.file.name} 上传失败：网络错误`, 'error');
+                    resolve();
+                };
+
+                xhr.send(formData);
+            });
+        }
+
+        function renderQueue() {
+            queueEl.innerHTML = queueState.map((item) => `
+                <div class="queue-item">
+                    <div class="queue-row">
+                        <div>
+                            <div class="queue-name">${escapeHtml(item.file.name)}</div>
+                            <div class="queue-meta">${formatBytes(item.file.size)} · ${item.status} · ${item.attempts || 0} 次尝试</div>
+                        </div>
+                        <div class="queue-status">
+                            ${item.status === '失败' ? `<button class="btn btn-soft" type="button" onclick="retryUpload('${item.id}')">重试</button>` : ''}
+                            <strong>${item.progress}%</strong>
+                        </div>
+                    </div>
+                    <div class="progress"><div style="width:${item.progress}%"></div></div>
+                    ${item.error ? `<div class="queue-error">${escapeHtml(item.error)}</div>` : ''}
+                </div>
+            `).join('');
+        }
+
+        function retryUpload(id) {
+            const item = queueState.find((entry) => entry.id === id);
+            if (!item || item.status !== '失败') return;
+            item.status = '等待中';
+            item.progress = 0;
+            item.error = '';
+            renderQueue();
+            processQueue();
+        }
+
+        async function loadHealth() {
+            try {
+                const response = await fetch('/api/health');
+                healthState = await response.json();
+                metricCount.textContent = healthState.file_count ?? 0;
+                metricSize.textContent = healthState.total_size ?? '0 B';
+                metricLimit.textContent = healthState.max_upload_size ?? '-';
+                metricMode.textContent = healthState.protected ? '受控' : '公开';
+                modeState.textContent = healthState.protected ? '令牌访问' : '公开访问';
+            } catch (error) {
+                showToast('健康信息读取失败', 'error');
+            }
+        }
+
+        async function loadFiles() {
+            try {
+                const response = await fetch('/api/files', { headers: createHeaders() });
+                if (!response.ok) {
+                    filesState = [];
+                    const message = parseError(await response.text(), '文件列表读取失败');
+                    fileListEl.className = 'file-list grid-mode';
+                    fileListEl.innerHTML = `<div class="empty">${escapeHtml(message)}</div>`;
+                    updateLibraryStats([]);
+                    return;
+                }
+                const payload = await response.json();
+                filesState = payload.items || [];
+                pruneSelection();
+                hydrateExtensionFilter(filesState);
+                renderFiles();
+            } catch (error) {
+                fileListEl.className = 'file-list grid-mode';
+                fileListEl.innerHTML = '<div class="empty">文件列表读取失败，请检查服务状态。</div>';
+                updateLibraryStats([]);
+            }
+        }
+
+        async function loadOperations() {
+            opsSummary.innerHTML = renderOpsLoading();
+            largestFilesList.textContent = '同步中...';
+            auditEventsList.textContent = '同步中...';
+            try {
+                const [summaryResponse, auditResponse] = await Promise.all([
+                    fetch('/api/admin/summary', { headers: createHeaders() }),
+                    fetch('/api/audit', { headers: createHeaders() })
+                ]);
+                if (!summaryResponse.ok) {
+                    const message = parseError(await summaryResponse.text(), '运营摘要读取失败');
+                    renderOpsError(message);
+                    return;
+                }
+                if (!auditResponse.ok) {
+                    const message = parseError(await auditResponse.text(), '审计日志读取失败');
+                    renderOpsError(message);
+                    return;
+                }
+                const summary = await summaryResponse.json();
+                const audit = await auditResponse.json();
+                renderOperations(summary, audit.events || []);
+            } catch (error) {
+                renderOpsError('运营视图读取失败，请检查服务状态。');
+            }
+        }
+
+        function renderOpsLoading() {
+            return ['总占用', '文件数', '旧文件', '大文件'].map((label) => (
+                `<div class="mini-kpi"><span>${label}</span><strong>-</strong></div>`
+            )).join('');
+        }
+
+        function renderOpsError(message) {
+            opsSummary.innerHTML = `<div class="mini-kpi"><span>状态</span><strong>读取失败</strong></div>`;
+            largestFilesList.innerHTML = `<span class="ops-meta">${escapeHtml(message)}</span>`;
+            auditEventsList.innerHTML = `<span class="ops-meta">${escapeHtml(message)}</span>`;
+        }
+
+        function renderOperations(summary, events) {
+            opsSummary.innerHTML = `
+                <div class="mini-kpi"><span>总占用</span><strong>${escapeHtml(summary.total_size || '0 B')}</strong></div>
+                <div class="mini-kpi"><span>文件数</span><strong>${Number(summary.file_count || 0)}</strong></div>
+                <div class="mini-kpi"><span>旧文件</span><strong>${Number(summary.stale_file_count || 0)}</strong></div>
+                <div class="mini-kpi"><span>大文件</span><strong>${Number(summary.large_file_count || 0)}</strong></div>
+            `;
+            largestFilesList.innerHTML = renderLargestFiles(summary.largest_files || []);
+            auditEventsList.innerHTML = renderAuditEvents(events.slice(-6).reverse());
+        }
+
+        function renderLargestFiles(items) {
+            if (!items.length) return '<div class="ops-meta">暂无文件。</div>';
+            return items.map((file) => `
+                <div class="ops-row">
+                    <div class="ops-main">
+                        <strong title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</strong>
+                        <span class="ops-meta">sha256 ${escapeHtml(shortHash(file.sha256))}</span>
+                    </div>
+                    <span class="pill"><strong>${escapeHtml(file.size || formatBytes(file.size_bytes || 0))}</strong></span>
+                </div>
+            `).join('');
+        }
+
+        function renderAuditEvents(events) {
+            if (!events.length) return '<div class="ops-meta">暂无审计事件。</div>';
+            return events.map((event) => `
+                <div class="ops-row">
+                    <div class="ops-main">
+                        <strong>${escapeHtml(event.action || 'event')} · ${escapeHtml(event.name || '-')}</strong>
+                        <span class="ops-meta">${escapeHtml(formatAuditTime(event.time))}</span>
+                    </div>
+                    <span class="pill"><strong>${escapeHtml(formatBytes(Number(event.size_bytes || 0)))}</strong></span>
+                </div>
+            `).join('');
+        }
+
+        function hydrateExtensionFilter(items) {
+            const options = ['<option value="all">全部类型</option>'];
+            const extensions = Array.from(new Set(items.map((item) => item.extension || ''))).filter(Boolean).sort();
+            extensions.forEach((extension) => {
+                options.push(`<option value="${extension}">${extension}</option>`);
+            });
+            const current = extensionSelect.value;
+            extensionSelect.innerHTML = options.join('');
+            extensionSelectClone.innerHTML = options.join('');
+            const nextValue = extensions.includes(current) ? current : 'all';
+            extensionSelect.value = nextValue;
+            extensionSelectClone.value = nextValue;
+        }
+
+        function getFilteredItems() {
+            const keyword = searchInput.value.trim().toLowerCase();
+            const extension = extensionSelect.value;
+            let items = filesState.filter((item) => {
+                const matchKeyword = !keyword || item.name.toLowerCase().includes(keyword);
+                const matchExtension = extension === 'all' || item.extension === extension;
+                return matchKeyword && matchExtension;
+            });
+
+            items = items.sort((left, right) => {
+                switch (sortSelectClone.value) {
+                    case 'oldest': return left.modified_at - right.modified_at;
+                    case 'largest': return right.size_bytes - left.size_bytes;
+                    case 'name': return left.name.localeCompare(right.name, 'zh-CN');
+                    default: return right.modified_at - left.modified_at;
+                }
+            });
+
+            return items;
+        }
+
+        function updateLibraryStats(items) {
+            const previewable = items.filter((item) => item.is_previewable);
+            libraryCount.textContent = String(items.length);
+            imageCount.textContent = String(previewable.length);
+            otherCount.textContent = String(items.length - previewable.length);
+            selectedCount.textContent = String(selectedIds.size);
+        }
+
+        function renderFiles() {
+            const items = getFilteredItems();
+            updateLibraryStats(items);
+
+            if (!items.length) {
+                fileListEl.className = `file-list ${viewMode}-mode`;
+                const hasFilters = Boolean(searchInput.value.trim()) || extensionSelect.value !== 'all';
+                fileListEl.innerHTML = renderEmptyState(hasFilters);
                 return;
             }
 
-            fileListEl.innerHTML = files.map(f => `
-                <div class="file-item">
-                    <div class="file-info">
-                        <div class="file-name" title="${esc(f.name)}">${esc(f.name)}</div>
-                        <div class="file-meta">
-                            <span>${f.size}</span>
-                            <span>${f.date}</span>
-                        </div>
+            fileListEl.className = `file-list ${viewMode}-mode`;
+            fileListEl.innerHTML = items.map((file) => renderFileCard(file)).join('');
+        }
+
+        function renderEmptyState(hasFilters) {
+            const title = hasFilters ? '没有匹配文件' : '还没有文件';
+            const copy = hasFilters ? '清空筛选或换个关键词。' : '把文件拖进上传区，完成后会显示在这里。';
+            return `
+                <div class="empty">
+                    <div class="empty-mark" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 3v10"></path>
+                            <path d="m8 7 4-4 4 4"></path>
+                            <path d="M20 15v3a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3v-3"></path>
+                        </svg>
                     </div>
-                    <div class="file-actions">
-                        <button class="btn btn-cp" onclick="copyUrl('${f.id}')">复制链接</button>
-                        <a class="btn btn-dl" href="/download/${f.id}" download>下载</a>
-                        <button class="btn btn-del" onclick="deleteFile('${f.id}', '${esc(f.name)}')">删除</button>
+                    <div>
+                        <strong>${title}</strong>
+                        <p>${copy}</p>
                     </div>
                 </div>
-            `).join('');
-        } catch (e) {
-            console.error(e);
+            `;
         }
-    }
 
-    async function deleteFile(id, name) {
-        if (!confirm(`确定删除 ${name} 吗？`)) return;
-        
-        try {
-            const res = await fetch(`/api/files/${id}`, { method: 'DELETE' });
-            if (res.ok) {
-                showToast('已删除', 'info');
-                loadFiles();
-            } else {
-                showToast('删除失败', 'error');
+        function renderFileCard(file) {
+            const classes = `${viewMode === 'grid' ? 'file-card grid-card' : 'file-card list-card'}${selectedIds.has(file.id) ? ' selected' : ''}`;
+            const media = file.is_previewable
+                ? `<button class="media btn-plain" type="button" onclick="openPreview('${file.id}', this)" aria-label="预览 ${escapeHtml(file.name)}"><img src="${withToken(file.download_url)}" alt="${escapeHtml(file.name)}"></button>`
+                : `<div class="media fallback">${documentBadge(file.extension)}</div>`;
+
+            return `
+                <article class="${classes}">
+                    ${media}
+                    <div class="card-body">
+                        <div class="card-top">
+                            <label class="select-line">
+                                <input type="checkbox" ${selectedIds.has(file.id) ? 'checked' : ''} onchange="toggleFileSelection('${file.id}', this.checked)">
+                                选择文件
+                            </label>
+                            <div class="file-tag">${escapeHtml(file.is_previewable ? 'image' : (file.extension || 'file').replace('.', '') || 'file')}</div>
+                            <div class="file-name" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</div>
+                            <div class="file-sub">
+                                <span>${escapeHtml(file.size)}</span>
+                                <span>${escapeHtml(file.date)}</span>
+                            </div>
+                            <div class="file-sub" title="SHA-256: ${escapeHtml(file.sha256 || '-')}">
+                                <span>sha256 ${escapeHtml(shortHash(file.sha256))}</span>
+                            </div>
+                        </div>
+                        ${viewMode === 'grid' ? renderFileActions(file) : ''}
+                    </div>
+                    ${viewMode === 'list' ? `<div class="file-actions">${renderFileActionButtons(file)}</div>` : ''}
+                </article>
+            `;
+        }
+
+        function renderFileActions(file) {
+            return `<div class="file-actions">${renderFileActionButtons(file)}</div>`;
+        }
+
+        function renderFileActionButtons(file) {
+            const previewButton = file.is_previewable
+                ? `<button class="btn btn-soft" type="button" onclick="openPreview('${file.id}', this)">预览</button>`
+                : '';
+            return `
+                <button class="btn btn-soft" type="button" onclick="copyLink('${file.id}')">复制链接</button>
+                <a class="btn btn-primary" href="${withToken(file.download_url)}">下载</a>
+                ${previewButton}
+                <button class="btn btn-danger" type="button" onclick="deleteFile('${file.id}', ${jsString(file.name)})">删除</button>
+            `;
+        }
+
+        function documentBadge(extension) {
+            return `
+                <div class="doc-badge" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                        <path d="M14 2v6h6"></path>
+                        <path d="M8 13h8"></path>
+                        <path d="M8 17h6"></path>
+                    </svg>
+                    <span>${escapeHtml((extension || 'file').replace('.', '') || 'file')}</span>
+                </div>
+            `;
+        }
+
+        function openPreview(id, trigger) {
+            const file = filesState.find((item) => item.id === id && item.is_previewable);
+            if (!file) return;
+            lastPreviewTrigger = trigger || document.activeElement;
+            currentPreview = file;
+            previewTitle.textContent = file.name;
+            previewSize.textContent = file.size;
+            previewDate.textContent = file.date;
+            previewType.textContent = file.extension || 'image';
+            previewImage.src = withToken(file.download_url);
+            previewImage.alt = file.name;
+            previewDownloadBtn.href = withToken(file.download_url);
+            previewCopyBtn.onclick = () => copyLink(file.id);
+            previewModal.hidden = false;
+            previewModal.classList.add('open');
+            closePreviewBtn.focus({ preventScroll: true });
+        }
+
+        function closePreview() {
+            previewModal.classList.remove('open');
+            previewModal.hidden = true;
+            previewImage.removeAttribute('src');
+            currentPreview = null;
+            if (lastPreviewTrigger && typeof lastPreviewTrigger.focus === 'function') {
+                lastPreviewTrigger.focus({ preventScroll: true });
             }
-        } catch (e) {
-            showToast('请求失败', 'error');
+            lastPreviewTrigger = null;
         }
-    }
 
-    function copyUrl(id) {
-        const url = location.origin + '/download/' + id;
-        navigator.clipboard.writeText(url).then(() => showToast('链接已复制', 'success'));
-    }
+        function trapPreviewFocus(event) {
+            const focusable = Array.from(previewModal.querySelectorAll('a[href], button:not([disabled])'));
+            if (!focusable.length) return;
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+            }
+        }
 
-    // --- 工具函数 ---
-    function showToast(msg, type) {
-        toastEl.textContent = msg;
-        toastEl.className = 'toast ' + type + ' show';
-        setTimeout(() => toastEl.classList.remove('show'), 3000);
-    }
+        async function deleteFile(id, name) {
+            if (!confirm(`确定删除 ${name} 吗？`)) return;
+            const response = await fetch(`/api/files/${id}`, { method: 'DELETE', headers: createHeaders() });
+            if (response.ok) {
+                if (currentPreview && currentPreview.id === id) {
+                    closePreview();
+                }
+                showToast(`已删除：${name}`, 'info');
+                refreshAll();
+                return;
+            }
+            showToast(parseError(await response.text(), '删除失败'), 'error');
+        }
 
-    function esc(str) {
-        if (!str) return '';
-        const d = document.createElement('div');
-        d.textContent = str;
-        return d.innerHTML;
-    }
-</script>
+        async function copyLink(id) {
+            const file = filesState.find((item) => item.id === id);
+            const url = location.origin + withToken(`/download/${id}`);
+            const text = file && file.sha256 ? `${url}\nsha256: ${file.sha256}` : url;
+            try {
+                await navigator.clipboard.writeText(text);
+                showToast('链接已复制', 'success');
+            } catch (error) {
+                showToast(text, 'info');
+            }
+        }
 
+        function toggleFileSelection(id, checked) {
+            if (checked) {
+                selectedIds.add(id);
+            } else {
+                selectedIds.delete(id);
+            }
+            renderFiles();
+        }
+
+        function selectVisibleFiles() {
+            getFilteredItems().forEach((file) => selectedIds.add(file.id));
+            renderFiles();
+        }
+
+        function clearSelection() {
+            selectedIds.clear();
+            renderFiles();
+        }
+
+        async function copySelectedLinks() {
+            const selectedFiles = filesState.filter((file) => selectedIds.has(file.id));
+            if (!selectedFiles.length) {
+                showToast('先选择文件', 'info');
+                return;
+            }
+            const text = selectedFiles.map((file) => {
+                const url = location.origin + withToken(`/download/${file.id}`);
+                return file.sha256 ? `${file.name}\n${url}\nsha256: ${file.sha256}` : `${file.name}\n${url}`;
+            }).join('\n\n');
+            try {
+                await navigator.clipboard.writeText(text);
+                showToast(`已复制 ${selectedFiles.length} 个链接`, 'success');
+            } catch (error) {
+                showToast(text, 'info');
+            }
+        }
+
+        function pruneSelection() {
+            const fileIds = new Set(filesState.map((file) => file.id));
+            Array.from(selectedIds).forEach((id) => {
+                if (!fileIds.has(id)) selectedIds.delete(id);
+            });
+        }
+
+        function shortHash(value) {
+            return value ? `${value.slice(0, 10)}...` : '-';
+        }
+
+        function parseError(text, fallback) {
+            try {
+                const payload = JSON.parse(text);
+                return payload.detail || fallback;
+            } catch (error) {
+                return fallback;
+            }
+        }
+
+        function showToast(message, type) {
+            toastEl.textContent = message;
+            toastEl.className = `toast ${type} show`;
+            window.clearTimeout(showToast.timer);
+            showToast.timer = window.setTimeout(() => toastEl.classList.remove('show'), 2600);
+        }
+
+        function formatBytes(size) {
+            const units = ['B', 'KB', 'MB', 'GB'];
+            let value = size;
+            let unit = 0;
+            while (value >= 1024 && unit < units.length - 1) {
+                value /= 1024;
+                unit += 1;
+            }
+            return `${value.toFixed(1)} ${units[unit]}`;
+        }
+
+        function formatAuditTime(value) {
+            if (!value) return '-';
+            const date = new Date(value);
+            if (Number.isNaN(date.getTime())) return value;
+            return date.toLocaleString('zh-CN', { hour12: false });
+        }
+
+        function escapeHtml(value) {
+            const div = document.createElement('div');
+            div.textContent = value || '';
+            return div.innerHTML;
+        }
+
+        function jsString(value) {
+            return JSON.stringify(value || '').replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026');
+        }
+
+        async function refreshAll() {
+            saveToken();
+            await Promise.all([loadHealth(), loadFiles(), loadOperations()]);
+        }
+
+        window.openPreview = openPreview;
+        window.deleteFile = deleteFile;
+        window.copyLink = copyLink;
+        window.toggleFileSelection = toggleFileSelection;
+        window.retryUpload = retryUpload;
+
+        setViewMode('grid');
+        refreshAll();
+    </script>
 </body>
 </html>
