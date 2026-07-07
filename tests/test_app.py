@@ -204,9 +204,8 @@ def test_previewable_images_and_static_assets(tmp_path: Path) -> None:
     assert listing.status_code == 200
     assert listing.json()["items"][0]["media_kind"] == "image"
 
-    demo = client.get("/design-demo.html")
-    assert demo.status_code == 200
-    assert "front-end redesign study" in demo.text
+    missing_asset = client.get("/design-demo.html")
+    assert missing_asset.status_code == 404
 
     health = client.get("/api/health")
     assert health.status_code == 200
