@@ -1236,6 +1236,67 @@ def test_navigation_focus_preserves_restored_scroll_position() -> None:
     }
 
 
+def test_navigation_focuses_user_navigation_and_preserves_focus_on_history() -> None:
+    context = create_js_context()
+    load_js_module(context, "./navigation.js", read_web("js/navigation.js"))
+    result = json.loads(context.eval(r"""
+      const focusCalls = [];
+      const windowListeners = {};
+      const stableControl = { id: 'stable-control' };
+      const headings = Object.fromEntries(['transfer', 'files'].map(route => [route, {
+        id: `${route}-heading`,
+        focus(options) {
+          focusCalls.push({ route, options: options || null });
+          documentObject.activeElement = this;
+        },
+      }]));
+      const title = { textContent: '' };
+      const windowObject = {
+        scrollY: 0,
+        location: { hash: '#transfer' },
+        history: { replaceState(_state, _title, hash) { windowObject.location.hash = hash; } },
+        addEventListener(type, listener) { windowListeners[type] = listener; },
+        removeEventListener() {},
+        scrollTo() {},
+      };
+      const documentObject = {
+        activeElement: stableControl,
+        title: '',
+        querySelectorAll() { return []; },
+        querySelector(selector) {
+          if (selector === '[data-route-title]') return title;
+          const match = selector.match(/^\[data-route-heading="(.+)"\]$/);
+          return match ? headings[match[1]] : null;
+        },
+      };
+      const navigation = __modules['./navigation.js'].createNavigation({ windowObject, documentObject });
+      navigation.start();
+      navigation.navigate('files');
+      windowListeners.hashchange();
+      const clickFocus = documentObject.activeElement.id;
+
+      documentObject.activeElement = stableControl;
+      windowObject.location.hash = '#transfer';
+      windowListeners.hashchange();
+      JSON.stringify({
+        clickFocus,
+        historyFocus: documentObject.activeElement.id,
+        focusCalls,
+        title: documentObject.title,
+        breadcrumb: title.textContent,
+      });
+    """))
+    assert result == {
+        "clickFocus": "files-heading",
+        "historyFocus": "stable-control",
+        "focusCalls": [
+            {"route": "files", "options": {"preventScroll": True}},
+        ],
+        "title": "传输工作台 · MonkeyCode",
+        "breadcrumb": "传输工作台",
+    }
+
+
 def create_navigation_lifecycle_context() -> quickjs.Context:
     context = create_js_context()
     load_js_module(context, "./navigation.js", read_web("js/navigation.js"))

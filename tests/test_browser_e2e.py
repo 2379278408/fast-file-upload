@@ -11,7 +11,14 @@ from pathlib import Path
 from urllib.request import urlopen
 
 import pytest
-from playwright.sync_api import Browser, BrowserContext, Page, expect, sync_playwright
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    Locator,
+    Page,
+    expect,
+    sync_playwright,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -313,7 +320,9 @@ def _create_seed_session(session: BrowserSession, device_id: str) -> None:
     assert response.ok
 
 
-def _assert_route_state(page: Page, route: str, visible_nav: str) -> None:
+def _assert_route_state(
+    page: Page, route: str, visible_nav: str, *, expect_heading_focus: bool = True
+) -> None:
     title = ROUTE_TITLES[route]
     assert page.evaluate("location.hash") == f"#{route}"
     expect(page.locator(f'#{route}Page')).to_be_visible()
@@ -321,7 +330,8 @@ def _assert_route_state(page: Page, route: str, visible_nav: str) -> None:
         expect(page.locator(f'#{other_route}Page')).to_be_hidden()
     expect(page).to_have_title(f"{title} · MonkeyCode")
     expect(page.locator("[data-route-title]")).to_have_text(title)
-    expect(page.locator(f'[data-route-heading="{route}"]')).to_be_focused()
+    if expect_heading_focus:
+        expect(page.locator(f'[data-route-heading="{route}"]')).to_be_focused()
 
     hidden_nav = ".mobile-nav" if visible_nav == ".sidebar" else ".sidebar"
     expect(page.locator(f'{visible_nav} [data-route="{route}"]')).to_be_visible()
@@ -343,6 +353,23 @@ def _assert_route_state(page: Page, route: str, visible_nav: str) -> None:
                 "active": candidate_route == route,
                 "ariaCurrent": "page" if candidate_route == route else None,
             }
+
+
+def _assert_batch_toolbar_state(toolbar: Locator, *, visible: bool) -> None:
+    state = toolbar.evaluate(
+        """
+        element => ({
+          visibleClass: element.classList.contains('visible'),
+          visibility: getComputedStyle(element).visibility,
+          pointerEvents: getComputedStyle(element).pointerEvents,
+        })
+        """
+    )
+    assert state == {
+        "visibleClass": visible,
+        "visibility": "visible" if visible else "hidden",
+        "pointerEvents": "auto" if visible else "none",
+    }
 
 
 def test_live_server_retries_an_occupied_first_port(tmp_path: Path) -> None:
@@ -589,10 +616,20 @@ def test_three_route_navigation_history_focus_and_viewport_safety(
     _assert_route_state(page, "manage", nav_selector)
     _assert_no_horizontal_overflow(page)
 
+    stable_control = page.locator("#themeToggle")
+    expect(stable_control).to_be_visible()
+    stable_control.focus()
+    expect(stable_control).to_be_focused()
     page.go_back()
-    _assert_route_state(page, "files", nav_selector)
+    _assert_route_state(
+        page, "files", nav_selector, expect_heading_focus=False
+    )
+    expect(stable_control).to_be_focused()
     page.go_forward()
-    _assert_route_state(page, "manage", nav_selector)
+    _assert_route_state(
+        page, "manage", nav_selector, expect_heading_focus=False
+    )
+    expect(stable_control).to_be_focused()
 
     page.locator(f'{nav_selector} [data-route="transfer"]').click()
     _assert_route_state(page, "transfer", nav_selector)
@@ -692,23 +729,22 @@ def test_mobile_batch_toolbar_selection_clear_and_route_exit(
     checkbox.check()
 
     toolbar = page.locator("#batchToolbar")
-    expect(toolbar).to_have_class("batch-toolbar visible")
-    assert toolbar.evaluate("element => getComputedStyle(element).visibility") == "visible"
-    assert toolbar.evaluate("element => getComputedStyle(element).pointerEvents") == "auto"
+    _assert_batch_toolbar_state(toolbar, visible=True)
 
     page.locator("#batchToolbarClear").click()
     expect(checkbox).not_to_be_checked()
-    expect(toolbar).to_have_class("batch-toolbar")
-    assert toolbar.evaluate("element => getComputedStyle(element).visibility") == "hidden"
-    assert toolbar.evaluate("element => getComputedStyle(element).pointerEvents") == "none"
+    _assert_batch_toolbar_state(toolbar, visible=False)
 
     checkbox.check()
-    expect(toolbar).to_have_class("batch-toolbar visible")
+    _assert_batch_toolbar_state(toolbar, visible=True)
     page.locator('.mobile-nav [data-route="manage"]').click()
     _assert_route_state(page, "manage", ".mobile-nav")
-    expect(toolbar).to_have_class("batch-toolbar")
-    assert toolbar.evaluate("element => getComputedStyle(element).visibility") == "hidden"
-    assert toolbar.evaluate("element => getComputedStyle(element).pointerEvents") == "none"
+    _assert_batch_toolbar_state(toolbar, visible=False)
+
+    page.locator('.mobile-nav [data-route="files"]').click()
+    _assert_route_state(page, "files", ".mobile-nav")
+    expect(checkbox).not_to_be_checked()
+    _assert_batch_toolbar_state(toolbar, visible=False)
     _assert_browser_clean(browser_session)
 
 

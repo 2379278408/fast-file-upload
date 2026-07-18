@@ -42,7 +42,6 @@ export function createNavigation({ windowObject, documentObject, onRouteChange =
   }
 
   function handleHashChange() {
-    focusNextRoute = true;
     applyRoute(normalizeRoute(windowObject.location.hash));
   }
 
