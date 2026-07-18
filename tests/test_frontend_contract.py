@@ -463,6 +463,21 @@ def drain_jobs(context: quickjs.Context) -> None:
         pass
 
 
+def test_navigation_normalizes_supported_hashes_and_defaults() -> None:
+    context = create_js_context()
+    load_js_module(context, "./navigation.js", read_web("js/navigation.js"))
+    assert context.eval("__modules['./navigation.js'].normalizeRoute('#files')") == "files"
+    assert context.eval("__modules['./navigation.js'].normalizeRoute('#manage')") == "manage"
+    assert context.eval("__modules['./navigation.js'].normalizeRoute('#unknown')") == "transfer"
+    assert context.eval("__modules['./navigation.js'].normalizeRoute('')") == "transfer"
+
+
+def test_navigation_module_exports_controller_contract() -> None:
+    source = read_web("js/navigation.js")
+    for token in ("ROUTES", "normalizeRoute", "createNavigation", "hashchange", "aria-current"):
+        assert token in source
+
+
 def test_frontend_is_split_and_has_unlock_contract(client: TestClient) -> None:
     html = client.get("/").text
     assert '<link rel="stylesheet" href="/styles.css">' in html
