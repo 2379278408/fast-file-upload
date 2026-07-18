@@ -895,6 +895,165 @@ def test_library_empty_attach_listener_lifecycle_is_scoped_to_controller() -> No
     }
 
 
+def test_library_destroy_clears_toast_timer_and_stale_callback_is_inert() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.timerCallbacks = Object.create(null);
+      globalThis.activeTimers = new Set();
+      globalThis.nextTimerId = 0;
+      window.setTimeout = callback => {
+        const id = ++nextTimerId;
+        timerCallbacks[id] = callback;
+        activeTimers.add(id);
+        return id;
+      };
+      window.clearTimeout = id => { activeTimers.delete(id); };
+    """)
+    load_js_module(context, "./library.js", read_web("js/library.js"))
+
+    result = json.loads(context.eval(r"""
+      const root = document.getElementById('libraryView');
+      const batchDownload = document.getElementById('batchDownload');
+      const toast = document.getElementById('toast');
+      const api = () => Promise.resolve({});
+      const first = __modules['./library.js'].createLibrary({ root, api, timeline: null });
+      batchDownload.listeners.click[0]();
+      const firstTimer = nextTimerId;
+      first.destroy();
+      const firstTimerCleared = !activeTimers.has(firstTimer);
+
+      const second = __modules['./library.js'].createLibrary({ root, api, timeline: null });
+      batchDownload.listeners.click[0]();
+      const secondTimer = nextTimerId;
+      timerCallbacks[firstTimer]();
+      const staleTimerKeptNewToast = toast.classList.contains('show');
+      timerCallbacks[secondTimer]();
+      const currentTimerHidToast = !toast.classList.contains('show');
+      second.destroy();
+      JSON.stringify({ firstTimerCleared, staleTimerKeptNewToast, currentTimerHidToast });
+    """))
+
+    assert result == {
+        "firstTimerCleared": True,
+        "staleTimerKeptNewToast": True,
+        "currentTimerHidToast": True,
+    }
+
+
+def test_library_destroy_prevents_inflight_load_from_mutating_dom() -> None:
+    context = create_js_context()
+    load_js_module(context, "./library.js", read_web("js/library.js"))
+    context.eval(r"""
+      globalThis.resolveFiles = null;
+      const filesGate = new Promise(resolve => { resolveFiles = resolve; });
+      const fileList = document.getElementById('fileList');
+      fileList.innerHTML = 'sentinel';
+      const controller = __modules['./library.js'].createLibrary({
+        root: document.getElementById('libraryView'),
+        api: path => path.startsWith('/api/files?') ? filesGate : Promise.resolve({}),
+        timeline: null,
+      });
+      controller.load({});
+      controller.destroy();
+      resolveFiles({ items: [], next_cursor: null });
+    """)
+    drain_jobs(context)
+
+    assert context.eval("document.getElementById('fileList').innerHTML") == "sentinel"
+
+
+def test_library_one_time_preview_and_undo_listeners_release_immediately() -> None:
+    context = create_js_context()
+    load_js_module(context, "./library.js", read_web("js/library.js"))
+    context.eval(r"""
+      const message = {
+        id: 'message-1',
+        created_at: '2026-07-18T00:00:00Z',
+        file: {
+          name: 'preview.png', size: '1 B', created_at: '2026-07-18T00:00:00Z',
+          extension: '.png', media_kind: 'image', is_previewable: true,
+          download_url: '/api/files/file-1/download', sha256: 'abc',
+        },
+      };
+      const api = (path, options = {}) => Promise.resolve(
+        path.startsWith('/api/files?') ? { items: [message], next_cursor: null }
+          : options.method === 'DELETE' ? { deleted_at: '2026-07-18T00:00:00Z' }
+          : { file_count: 1, total_size: '1 B', largest_files: [] }
+      );
+      globalThis.keydownRemovals = 0;
+      const originalDocumentRemove = document.removeEventListener.bind(document);
+      document.removeEventListener = (type, listener) => {
+        if (type === 'keydown') keydownRemovals += 1;
+        originalDocumentRemove(type, listener);
+      };
+      globalThis.controller = __modules['./library.js'].createLibrary({
+        root: document.getElementById('libraryView'), api, timeline: null,
+      });
+      controller.load({});
+    """)
+    drain_jobs(context)
+
+    result = json.loads(context.eval(r"""
+      const fileList = document.getElementById('fileList');
+      const previewAction = {
+        dataset: { fileAction: 'preview', messageId: 'message-1' },
+        focus() {},
+      };
+      fileList.listeners.click[0]({ target: { closest: () => previewAction } });
+      document.getElementById('closePreviewBtn').listeners.click[0]();
+      const removalsAfterClose = keydownRemovals;
+      controller.destroy();
+      const removalsAfterDestroy = keydownRemovals;
+      JSON.stringify({ removalsAfterClose, removalsAfterDestroy });
+    """))
+    assert result == {"removalsAfterClose": 1, "removalsAfterDestroy": 2}
+
+    context = create_js_context()
+    load_js_module(context, "./library.js", read_web("js/library.js"))
+    context.eval(r"""
+      const message = {
+        id: 'message-1', created_at: '2026-07-18T00:00:00Z',
+        file: {
+          name: 'file.txt', size: '1 B', created_at: '2026-07-18T00:00:00Z',
+          extension: '.txt', media_kind: 'document', is_previewable: false,
+          download_url: '/api/files/file-1/download', sha256: 'abc',
+        },
+      };
+      const api = (path, options = {}) => Promise.resolve(
+        path.startsWith('/api/files?') ? { items: [message], next_cursor: null }
+          : options.method === 'DELETE' ? { deleted_at: '2026-07-18T00:00:00Z' }
+          : { file_count: 1, total_size: '1 B', largest_files: [] }
+      );
+      globalThis.controller = __modules['./library.js'].createLibrary({
+        root: document.getElementById('libraryView'), api, timeline: null,
+      });
+      controller.load({});
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      const deleteAction = { dataset: { fileAction: 'delete', messageId: 'message-1' } };
+      document.getElementById('fileList').listeners.click[0]({
+        target: { closest: () => deleteAction },
+      });
+    """)
+    drain_jobs(context)
+
+    result = json.loads(context.eval(r"""
+      const undoButton = document.getElementById('toast').children[0];
+      globalThis.undoRemovals = 0;
+      const originalUndoRemove = undoButton.removeEventListener.bind(undoButton);
+      undoButton.removeEventListener = (type, listener) => {
+        undoRemovals += 1;
+        originalUndoRemove(type, listener);
+      };
+      document.getElementById('batchDownload').listeners.click[0]();
+      const removalsAfterReplace = undoRemovals;
+      controller.destroy();
+      JSON.stringify({ removalsAfterReplace, removalsAfterDestroy: undoRemovals });
+    """))
+    assert result == {"removalsAfterReplace": 1, "removalsAfterDestroy": 1}
+
+
 def test_app_empty_attach_navigation_and_picker_click_are_synchronous() -> None:
     context = create_js_context()
     context.eval(r"""

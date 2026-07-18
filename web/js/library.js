@@ -42,7 +42,10 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
   let currentPreview = null;
   let lastPreviewTrigger = null;
   let destroyed = false;
-  const listenerCleanups = [];
+  let toastTimer = null;
+  let previewFocusCleanup = null;
+  let undoListenerCleanup = null;
+  const listenerCleanups = new Set();
   const pendingTimers = new Set();
 
   listen(batchDownloadBtn, 'click', batchDownload);
@@ -83,18 +86,60 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
   listen(dateToInput, 'change', reloadFromStart);
 
   function listen(target, type, handler) {
-    if (!target || destroyed) return;
+    if (!target || destroyed) return () => {};
+    let active = true;
+    const cleanup = () => {
+      if (!active) return;
+      active = false;
+      target.removeEventListener(type, handler);
+      listenerCleanups.delete(cleanup);
+    };
     target.addEventListener(type, handler);
-    listenerCleanups.push(() => target.removeEventListener(type, handler));
+    listenerCleanups.add(cleanup);
+    return cleanup;
   }
 
   function destroy() {
     if (destroyed) return;
     destroyed = true;
-    while (listenerCleanups.length) listenerCleanups.pop()();
+    clearToastTimer();
+    clearPreviewFocusListener();
+    clearUndoListener();
+    for (const cleanup of [...listenerCleanups]) cleanup();
     for (const timer of pendingTimers) clearTimeout(timer);
     pendingTimers.clear();
     reloadPending = false;
+  }
+
+  function clearToastTimer() {
+    if (toastTimer === null) return;
+    window.clearTimeout(toastTimer);
+    toastTimer = null;
+  }
+
+  function clearPreviewFocusListener() {
+    if (!previewFocusCleanup) return;
+    const cleanup = previewFocusCleanup;
+    previewFocusCleanup = null;
+    cleanup();
+  }
+
+  function clearUndoListener() {
+    if (!undoListenerCleanup) return;
+    const cleanup = undoListenerCleanup;
+    undoListenerCleanup = null;
+    cleanup();
+  }
+
+  function scheduleToastHide(toastEl, duration) {
+    clearToastTimer();
+    const timer = window.setTimeout(() => {
+      if (toastTimer !== timer || destroyed) return;
+      toastTimer = null;
+      toastEl.classList.remove('show');
+      clearUndoListener();
+    }, duration);
+    toastTimer = timer;
   }
 
   function debounce(fn, ms) {
@@ -170,6 +215,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
   }
 
   function toggleFileSelection(id, checked) {
+    if (destroyed) return;
     if (checked) {
       selectedIds.add(id);
     } else {
@@ -184,6 +230,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
   }
 
   function clearSelection() {
+    if (destroyed) return;
     selectedIds.clear();
     if (fileListEl) {
       fileListEl.querySelectorAll('input[type="checkbox"]').forEach((cb) => { cb.checked = false; });
@@ -199,17 +246,20 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
   }
 
   async function openMessage(messageId) {
-    if (!timeline) return;
+    if (destroyed || !timeline) return;
     if (typeof timeline.focusMessage === 'function') {
       const found = timeline.focusMessage(messageId);
       if (!found && typeof timeline.ensureMessageLoaded === 'function') {
         await timeline.ensureMessageLoaded(messageId);
+        if (destroyed) return;
         timeline.focusMessage(messageId);
       } else if (!found && typeof timeline.loadUntil === 'function') {
         await timeline.loadUntil(messageId, { focus: false });
+        if (destroyed) return;
         timeline.focusMessage(messageId);
       }
     }
+    if (destroyed) return;
     location.hash = `message-${encodeURIComponent(messageId)}`;
   }
 
@@ -218,6 +268,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
   }
 
   async function handleFileAction(event) {
+    if (destroyed) return;
     const action = event.target.closest('[data-file-action]');
     if (!action) return;
     if (action.dataset.fileAction === 'empty-attach') {
@@ -234,6 +285,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
   }
 
   function openPreview(message, trigger) {
+    if (destroyed) return;
     const file = message.file;
     if (!file || !file.is_previewable || !previewModal) return;
     currentPreview = message;
@@ -268,7 +320,8 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
     previewModal.hidden = false;
     previewModal.classList.add('open');
     if (closePreviewBtn) closePreviewBtn.focus();
-    listen(document, 'keydown', trapPreviewFocus);
+    clearPreviewFocusListener();
+    previewFocusCleanup = listen(document, 'keydown', trapPreviewFocus);
   }
 
   function trapPreviewFocus(event) {
@@ -292,7 +345,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
     previewModal.classList.remove('open');
     if (previewImage) previewImage.removeAttribute('src');
     currentPreview = null;
-    document.removeEventListener('keydown', trapPreviewFocus);
+    clearPreviewFocusListener();
     if (lastPreviewTrigger) lastPreviewTrigger.focus();
     lastPreviewTrigger = null;
   }
@@ -314,6 +367,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
     if (!file || !confirm(`确定删除 ${file.name || '这个文件'} 吗？`)) return;
     try {
       const deleted = await api(`/api/messages/${encodeURIComponent(message.id)}`, { method: 'DELETE' });
+      if (destroyed) return;
       filesState = filesState.filter((item) => item.id !== message.id);
       selectedIds.delete(message.id);
       closePreview();
@@ -326,34 +380,41 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
 
   function showUndoToast(messageId, deleted) {
     const toastEl = document.getElementById('toast');
-    if (!toastEl) return;
+    if (destroyed || !toastEl) return;
     const deletedAt = deleted && deleted.deleted_at ? Date.parse(deleted.deleted_at) : Date.now();
     const remaining = Math.max(0, deletedAt + UNDO_WINDOW_MS - Date.now());
 
+    clearUndoListener();
     toastEl.textContent = '文件已删除';
     const undoBtn = document.createElement('button');
     undoBtn.className = 'btn btn-soft';
     undoBtn.type = 'button';
     undoBtn.textContent = ' · 撤销';
-    listen(undoBtn, 'click', async () => {
+    let cleanup = () => {};
+    cleanup = listen(undoBtn, 'click', async () => {
+      cleanup();
+      if (undoListenerCleanup === cleanup) undoListenerCleanup = null;
+      clearToastTimer();
       undoBtn.disabled = true;
       try {
         await api(`/api/messages/${encodeURIComponent(messageId)}/restore`, { method: 'POST' });
+        if (destroyed) return;
         toastEl.classList.remove('show');
         reloadFromStart();
       } catch {
+        if (destroyed) return;
         undoBtn.disabled = false;
         showToast('撤销失败', 'error');
       }
     });
+    undoListenerCleanup = cleanup;
     toastEl.append(undoBtn);
     toastEl.className = 'toast info show';
-    window.clearTimeout(showToast.timer);
-    showToast.timer = window.setTimeout(() => toastEl.classList.remove('show'), remaining);
+    scheduleToastHide(toastEl, remaining);
   }
 
   async function load(opts) {
-    if (loading) return;
+    if (destroyed || loading) return;
     loading = true;
     updateLoadMoreState();
     try {
@@ -366,7 +427,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
         if (v !== undefined && v !== null && v !== '') qs.set(k, v);
       }
       const data = await api(`/api/files?${qs.toString()}`);
-      if (!data) return;
+      if (destroyed || !data) return;
       const items = data.items || [];
       if (opts && opts.cursor) {
         filesState = filesState.concat(items);
@@ -380,6 +441,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
       renderFiles();
       loadStorage();
     } catch (err) {
+      if (destroyed) return;
       if (fileListEl) {
         fileListEl.className = 'file-list grid-mode';
         fileListEl.innerHTML = '<div class="empty">文件列表读取失败，请检查服务状态。</div>';
@@ -387,6 +449,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
       updateStats();
     } finally {
       loading = false;
+      if (destroyed) return;
       updateLoadMoreState();
       if (reloadPending) {
         reloadPending = false;
@@ -396,6 +459,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
   }
 
   function reloadFromStart() {
+    if (destroyed) return Promise.resolve(false);
     cursor = null;
     hasMore = false;
     updateLoadMoreState();
@@ -407,7 +471,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
   }
 
   function loadMore() {
-    if (!hasMore || !cursor) return Promise.resolve(false);
+    if (destroyed || !hasMore || !cursor) return Promise.resolve(false);
     return load({ cursor });
   }
 
@@ -419,10 +483,10 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
   }
 
   async function loadStorage() {
-    if (!storageSummaryEl) return;
+    if (destroyed || !storageSummaryEl) return;
     try {
       const data = await api('/api/storage');
-      if (!data) return;
+      if (destroyed || !data) return;
       const parts = [];
       if (data.file_count !== undefined) parts.push(`文件: ${data.file_count}`);
       if (data.total_size !== undefined) parts.push(`总大小: ${data.total_size}`);
@@ -432,12 +496,13 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
       }
       storageSummaryEl.textContent = parts.join(' | ') || '-';
     } catch {
+      if (destroyed) return;
       storageSummaryEl.textContent = '-';
     }
   }
 
   function applyEvent(event) {
-    if (!event) return;
+    if (destroyed || !event) return;
     switch (event.event_type) {
       case 'message.created':
       case 'message.restored': {
@@ -503,6 +568,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
         body: JSON.stringify({ message_ids: selected.map((message) => message.id) }),
         responseType: 'blob',
       });
+      if (destroyed) return;
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -528,6 +594,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message_ids: selected.map((message) => message.id) }),
       });
+      if (destroyed) return;
       const deleted = Number(result.deleted) || 0;
       const deletedIds = result.deleted_ids || [];
       selectedIds.clear();
@@ -540,7 +607,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
 
   function showBatchUndoToast(deletedIds, count) {
     const toastEl = document.getElementById('toast');
-    if (!toastEl) return;
+    if (destroyed || !toastEl) return;
     const remaining = UNDO_WINDOW_MS;
 
     if (!deletedIds.length) {
@@ -548,31 +615,39 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
       return;
     }
 
+    clearUndoListener();
     toastEl.textContent = `已删除 ${count} 个文件`;
     const undoBtn = document.createElement('button');
     undoBtn.className = 'btn btn-soft';
     undoBtn.type = 'button';
     undoBtn.textContent = ' · 撤销';
-    listen(undoBtn, 'click', async () => {
+    let cleanup = () => {};
+    cleanup = listen(undoBtn, 'click', async () => {
+      cleanup();
+      if (undoListenerCleanup === cleanup) undoListenerCleanup = null;
+      clearToastTimer();
       undoBtn.disabled = true;
       let restored = 0;
       for (const id of deletedIds) {
         try {
           await api(`/api/messages/${encodeURIComponent(id)}/restore`, { method: 'POST' });
+          if (destroyed) return;
           restored++;
         } catch {
+          if (destroyed) return;
           // continue restoring others
         }
       }
+      if (destroyed) return;
       toastEl.classList.remove('show');
       showToast(`已恢复 ${restored} 个文件`, restored > 0 ? 'success' : 'error');
       reloadFromStart();
     });
+    undoListenerCleanup = cleanup;
     toastEl.append(undoBtn);
 
     toastEl.className = 'toast info show';
-    window.clearTimeout(showToast.timer);
-    showToast.timer = window.setTimeout(() => toastEl.classList.remove('show'), remaining);
+    scheduleToastHide(toastEl, remaining);
   }
 
   async function copySelected() {
@@ -765,11 +840,11 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
 
   function showToast(message, type) {
     const toastEl = document.getElementById('toast');
-    if (!toastEl) return;
+    if (destroyed || !toastEl) return;
+    clearUndoListener();
     toastEl.textContent = message;
     toastEl.className = `toast ${type} show`;
-    window.clearTimeout(showToast.timer);
-    showToast.timer = window.setTimeout(() => toastEl.classList.remove('show'), TOAST_DURATION_MS);
+    scheduleToastHide(toastEl, TOAST_DURATION_MS);
   }
 
   return {
