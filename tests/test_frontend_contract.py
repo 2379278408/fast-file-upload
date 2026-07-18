@@ -566,10 +566,65 @@ def test_transfer_timeline_has_bounded_internal_scroll_at_all_viewports() -> Non
     assert "min-height: 0" in timeline_container
     assert "max-height: clamp(" in timeline_container
     assert "overflow-y: auto" in timeline_container
-    assert "height: clamp(" in mobile
+    assert "height: auto" in mobile
+    assert "min-height: max(" in mobile
+    assert "max-height: none" in mobile
     assert "var(--mobile-fixed-offset)" in mobile
     assert ".transfer-workspace .timeline-container" in mobile
     assert ".composer-dock .panel-head" in mobile
+
+
+def test_mobile_transfer_layout_budget_for_short_and_tall_viewports() -> None:
+    css = read_web("styles.css")
+    root = css[css.index(":root {"):css.index(".dark {")]
+    mobile = css[css.index("@media (max-width: 720px)"):css.index("@media (max-width: 430px)")]
+    compact = css[css.index("@media (max-width: 430px)"):]
+
+    def px(source: str, name: str) -> int:
+        match = re.search(rf"{re.escape(name)}:\s*(?:calc\()?\s*(\d+)px", source)
+        assert match, f"missing pixel value for {name}"
+        return int(match.group(1))
+
+    topbar_height = px(compact, "--topbar-height")
+    nav_offset = px(root, "--mobile-fixed-offset")
+    page_offset = px(mobile, "--transfer-page-offset")
+    workspace_floor = px(mobile, "--mobile-workspace-min-height")
+    timeline_shell_min = px(mobile, "--mobile-timeline-shell-min-height")
+    timeline_inner_min = px(mobile, "--mobile-timeline-min-height")
+    mobile_nav_start = mobile.index(".mobile-nav {")
+    mobile_nav = mobile[mobile_nav_start:mobile.index(".mobile-nav button", mobile_nav_start)]
+    mobile_body = mobile[mobile.index("body {"):mobile.index(".app-shell {")]
+    nav_height = px(mobile_nav, "height")
+    body_clearance = px(mobile_body, "padding-bottom")
+
+    def layout(viewport_height: int) -> dict[str, int]:
+        viewport_budget = viewport_height - topbar_height - nav_offset - page_offset
+        workspace_height = max(workspace_floor, viewport_budget)
+        return {
+            "workspace": workspace_height,
+            "page_scroll": max(0, workspace_height - viewport_budget),
+            "timeline_shell_min": timeline_shell_min,
+            "timeline_inner_min": timeline_inner_min,
+            "nav_clearance": body_clearance - nav_height,
+        }
+
+    assert layout(568) == {
+        "workspace": 520,
+        "page_scroll": 220,
+        "timeline_shell_min": 220,
+        "timeline_inner_min": 120,
+        "nav_clearance": 4,
+    }
+    assert layout(844) == {
+        "workspace": 576,
+        "page_scroll": 0,
+        "timeline_shell_min": 220,
+        "timeline_inner_min": 120,
+        "nav_clearance": 4,
+    }
+    assert timeline_shell_min > timeline_inner_min
+    assert "position: relative" in mobile and "bottom: auto" in mobile
+    assert "height: var(--topbar-height)" in compact
 
 
 def test_transfer_route_dead_styles_are_removed() -> None:
