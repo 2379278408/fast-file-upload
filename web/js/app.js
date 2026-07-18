@@ -74,7 +74,7 @@ const accessTokenInput = document.getElementById('accessToken');
 const deviceNameInput = document.getElementById('deviceName');
 const unlockError = document.querySelector('.unlock-error');
 const unlockSubmit = document.getElementById('unlockSubmit');
-const timelineView = document.getElementById('timelineView');
+const mainContent = document.getElementById('mainContent');
 const libraryView = document.getElementById('libraryView');
 const skipLink = document.getElementById('skipLink');
 
@@ -149,8 +149,8 @@ function restorePreviousFocus() {
       return;
     }
   }
-  if (timelineView && typeof timelineView.focus === 'function') {
-    timelineView.focus();
+  if (mainContent && typeof mainContent.focus === 'function') {
+    mainContent.focus();
   }
   previouslyFocusedElement = null;
   previousFocusTarget = null;
@@ -220,11 +220,11 @@ if (sessionExpiredOverlay) {
   });
 }
 
-if (skipLink && timelineView) {
+if (skipLink && mainContent) {
   skipLink.addEventListener('click', event => {
     event.preventDefault();
-    location.hash = 'timelineView';
-    timelineView.focus();
+    location.hash = 'mainContent';
+    mainContent.focus();
   });
 }
 

@@ -167,8 +167,8 @@ globalThis.__elementDefinitions = {
   gridViewBtn: { tagName: 'button' },
   listViewBtn: { tagName: 'button' },
   closePreviewBtn: { tagName: 'button' },
-  skipLink: { tagName: 'a', href: '#timelineView' },
-  timelineView: { tagName: 'main', tabindex: '-1' },
+  skipLink: { tagName: 'a', href: '#mainContent' },
+  mainContent: { tagName: 'main', tabindex: '-1' },
   timelineContainer: { tagName: 'div', tabindex: '-1' },
   libraryView: { tagName: 'section', tabindex: '-1' },
 };
@@ -468,7 +468,7 @@ def test_frontend_is_split_and_has_unlock_contract(client: TestClient) -> None:
     assert '<link rel="stylesheet" href="/styles.css">' in html
     assert '<script type="module" src="/js/app.js"></script>' in html
     assert '<script>' not in html and '<style>' not in html
-    for element_id in ("unlockForm", "accessToken", "deviceName", "sessionExpired", "timelineView", "libraryView"):
+    for element_id in ("unlockForm", "accessToken", "deviceName", "sessionExpired", "mainContent", "libraryView"):
         assert f'id="{element_id}"' in html
     assert re.search(r'<section[^>]*id="libraryView"[^>]*tabindex="-1"', html)
     assert re.search(r'<div[^>]*id="timelineContainer"[^>]*tabindex="-1"', html)
@@ -538,7 +538,7 @@ def test_unlock_dialog_traps_focus_inerts_background_and_restores_focus() -> Non
       const previous = document.getElementById('composerTextarea');
       const skip = document.getElementById('skipLink');
       const header = document.getElementById('headerRegion');
-      const main = document.getElementById('timelineView');
+      const main = document.getElementById('mainContent');
       const footer = document.getElementById('footerRegion');
       const originallyInert = document.getElementById('originallyInert');
       originallyInert.inert = true;
@@ -555,7 +555,7 @@ def test_unlock_dialog_traps_focus_inerts_background_and_restores_focus() -> Non
       JSON.stringify({
         skip: document.getElementById('skipLink').inert,
         header: document.getElementById('headerRegion').inert,
-        main: document.getElementById('timelineView').inert,
+        main: document.getElementById('mainContent').inert,
         footer: document.getElementById('footerRegion').inert,
         originallyInert: document.getElementById('originallyInert').inert,
         overlay: document.getElementById('sessionExpired').inert,
@@ -597,7 +597,7 @@ def test_unlock_dialog_traps_focus_inerts_background_and_restores_focus() -> Non
       JSON.stringify({
         skip: document.getElementById('skipLink').inert,
         header: document.getElementById('headerRegion').inert,
-        main: document.getElementById('timelineView').inert,
+        main: document.getElementById('mainContent').inert,
         footer: document.getElementById('footerRegion').inert,
         originallyInert: document.getElementById('originallyInert').inert,
         focus: document.activeElement.id,
@@ -664,7 +664,7 @@ def test_skip_link_focuses_main_content() -> None:
     context.eval(r"""
       document.getElementById('skipLink').listeners.click[0]({ preventDefault() {} });
     """)
-    assert context.eval("document.activeElement.id") == "timelineView"
+    assert context.eval("document.activeElement.id") == "mainContent"
     css = read_web("styles.css")
     assert ".skip-link:focus," in css
     assert ".skip-link:focus-visible" in css
@@ -862,7 +862,7 @@ def test_real_app_unlock_loads_old_anchor_page_before_restoring_position() -> No
       overlay.classList.add('is-hidden');
       document.body.append(
         document.getElementById('skipLink'),
-        document.getElementById('timelineView'),
+        document.getElementById('mainContent'),
         overlay,
       );
     """)
@@ -946,7 +946,7 @@ def test_unlock_waits_for_reload_and_restores_equivalent_rebuilt_action() -> Non
 
       const overlay = document.getElementById('sessionExpired');
       overlay.classList.add('is-hidden');
-      const main = document.getElementById('timelineView');
+      const main = document.getElementById('mainContent');
       main.append(document.getElementById('timelineContainer'));
       document.body.append(document.getElementById('skipLink'), main, overlay);
     """)
@@ -974,7 +974,7 @@ def test_unlock_waits_for_reload_and_restores_equivalent_rebuilt_action() -> Non
     pending = json.loads(context.eval(r"""
       JSON.stringify({
         overlayVisible: !document.getElementById('sessionExpired').classList.contains('is-hidden'),
-        backgroundInert: document.getElementById('timelineView').inert,
+        backgroundInert: document.getElementById('mainContent').inert,
         focused: document.activeElement.id,
       })
     """))
@@ -992,7 +992,7 @@ def test_unlock_waits_for_reload_and_restores_equivalent_rebuilt_action() -> Non
         .querySelector('[data-timeline-action="copy"]');
       JSON.stringify({
         overlayHidden: document.getElementById('sessionExpired').classList.contains('is-hidden'),
-        backgroundInert: document.getElementById('timelineView').inert,
+        backgroundInert: document.getElementById('mainContent').inert,
         focusedEquivalent: document.activeElement === replacement,
         focusedDetachedOriginal: document.activeElement === originalAction,
       });
@@ -1107,7 +1107,7 @@ def test_composer_html_elements_exist(client: TestClient) -> None:
     for element_id in ("composerForm", "composerTextarea", "composerFileInput",
                        "composerDropTarget", "composerQueue"):
         assert f'id="{element_id}"' in html
-    assert 'class="panel composer-panel"' in html
+    assert 'class="panel transfer-panel"' in html
     assert 'Enter 发送，Shift+Enter 换行' in html
 
 
@@ -1144,7 +1144,7 @@ def test_reconnect_and_responsive_contracts() -> None:
     assert "RECONNECT_DELAYS = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000]" in config
     assert "transfer-last-sequence" in api and "event.sequence" in api
     assert "reconnecting" in api and "after=" in api
-    assert "@media (max-width: 480px)" in css
+    assert "@media (max-width: 360px)" in css
     assert "@media (prefers-reduced-motion: reduce)" in css
     assert ":focus-visible" in css and "min-height: 44px" in css
     assert 'id="connectionStatus"' in html and 'aria-live="polite"' in html

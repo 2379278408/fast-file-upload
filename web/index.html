@@ -3,11 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Fast File Upload</title>
+    <title>MonkeyCode 传输工作台</title>
     <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-    <a href="#timelineView" id="skipLink" class="visually-hidden skip-link">跳转到内容</a>
+    <a href="#mainContent" id="skipLink" class="visually-hidden skip-link">跳转到内容</a>
 
     <!-- Session: unlock overlay (shown when token expires) -->
     <div id="sessionExpired" class="session-overlay is-hidden" role="dialog" aria-modal="true" aria-labelledby="unlockTitle">
@@ -27,217 +27,273 @@
         </form>
     </div>
 
-    <!-- Main: timeline view (single-page layout) -->
-    <main id="timelineView" class="app stack" tabindex="-1">
-        <!-- Masthead: topbar + hero stats -->
-        <section class="panel masthead">
-            <div class="topbar">
-                <div class="brand">File Transfer Workspace</div>
-                <div class="status-row">
+    <div class="app-shell">
+        <!-- Sidebar -->
+        <aside class="sidebar" id="sidebar">
+            <div class="brand">
+                <span class="brand-mark" aria-hidden="true">
+                    <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="15" r="3.5"/><circle cx="25" cy="15" r="3.5"/><path d="M10 11.5c1.1-3 3.2-4.5 6-4.5s4.9 1.5 6 4.5v7c0 4.2-2.7 6.5-6 6.5s-6-2.3-6-6.5Z"/><path d="M12.5 18.5c.7-2.1 1.9-3.1 3.5-3.1s2.8 1 3.5 3.1c.3 1.5-1.2 3-3.5 3s-3.8-1.5-3.5-3Z"/><path d="M13 12.5h.01M19 12.5h.01M14.5 18.5h3"/></svg>
+                </span>
+                <span class="brand-copy"><strong>MonkeyCode</strong><span>传输工作台</span></span>
+            </div>
+            <p class="side-label">工作区</p>
+            <nav class="nav-list" aria-label="主导航">
+                <button class="nav-item active" type="button" aria-current="page" data-section="workspace">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18M9 21V9"/></svg>
+                    <span>传输工作台</span>
+                </button>
+                <button class="nav-item" type="button" data-section="files">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7h6l2 2h10v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M3 7V5a2 2 0 0 1 2-2h4l2 2h6"/></svg>
+                    <span>全部文件</span>
+                    <b class="nav-badge" id="navCount">0</b>
+                </button>
+                <button class="nav-item" type="button" data-section="activity">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 8v4l3 2"/><circle cx="12" cy="12" r="9"/></svg>
+                    <span>活动记录</span>
+                </button>
+            </nav>
+            <p class="side-label">管理</p>
+            <nav class="nav-list" aria-label="管理导航">
+                <button class="nav-item" type="button" data-section="devices">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="3" width="16" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+                    <span>连接设备</span>
+                </button>
+                <button class="nav-item" type="button" data-section="settings">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21H9.6v-.09A1.7 1.7 0 0 0 8.6 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3V9.6h.09A1.7 1.7 0 0 0 4.6 8.6a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3h4v.09A1.7 1.7 0 0 0 15.4 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.12.36.33.7.6 1 .3.28.7.42 1.1.4h.09v4h-.09a1.7 1.7 0 0 0-1.7.6Z"/></svg>
+                    <span>设置</span>
+                </button>
+            </nav>
+            <div class="sidebar-foot">
+                <div class="storage-compact">
+                    <div class="storage-head"><span>本地存储</span><strong id="sidebarStorage">-</strong></div>
+                    <div class="storage-bar"><span id="sidebarStorageBar" class="storage-bar-fill"></span></div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main workspace -->
+        <main class="workspace" id="mainContent" tabindex="-1">
+            <header class="topbar">
+                <div class="mobile-brand">
+                    <span class="brand-mark" aria-hidden="true">
+                        <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="15" r="3.5"/><circle cx="25" cy="15" r="3.5"/><path d="M10 11.5c1.1-3 3.2-4.5 6-4.5s4.9 1.5 6 4.5v7c0 4.2-2.7 6.5-6 6.5s-6-2.3-6-6.5Z"/><path d="M12.5 18.5c.7-2.1 1.9-3.1 3.5-3.1s2.8 1 3.5 3.1c.3 1.5-1.2 3-3.5 3s-3.8-1.5-3.5-3Z"/><path d="M13 12.5h.01M19 12.5h.01M14.5 18.5h3"/></svg>
+                    </span>
+                    MonkeyCode
+                </div>
+                <div class="breadcrumb">
+                    <span class="status-dot" id="connectionDot"></span>
+                    <strong>个人工作区</strong>
+                    <span>/</span>
+                    <span>传输工作台</span>
+                </div>
+                <div class="top-actions">
                     <span class="pill"><strong id="metricMode">公开</strong> 访问</span>
                     <span class="pill"><strong id="metricLimit">-</strong> 单文件</span>
                     <span id="connectionStatus" class="pill" aria-live="polite">未连接</span>
-                    <button class="btn btn-soft" id="refreshHealthBtn" type="button">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M21 21v-5h-5"/></svg>
+                    <button class="button quiet" id="refreshHealthBtn" type="button">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 6v5h-5M4 18v-5h5"/><path d="M18.5 9A7 7 0 0 0 6 6.5L4 11M5.5 15A7 7 0 0 0 18 17.5l2-4.5"/></svg>
                         刷新状态
                     </button>
-                    <button class="theme-toggle" id="themeToggle" type="button" aria-label="切换深色模式">
-                        <svg id="themeIconLight" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
-                        <svg id="themeIconDark" class="is-hidden" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+                    <button class="icon-button" id="themeToggle" type="button" aria-label="切换深色模式">
+                        <svg id="themeIconLight" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3a7.5 7.5 0 1 0 9 9 6 6 0 0 1-9-9Z"/></svg>
+                        <svg id="themeIconDark" class="is-hidden" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
                     </button>
                 </div>
-            </div>
-            <div class="hero">
-                <div>
-                    <h1>Fast File Upload</h1>
-                    <p>轻量文件工作台，上传后即可预览、校验与分发。</p>
-                </div>
-                <div class="quick-stats">
-                    <div class="stat-card"><span>文件数量</span><strong id="metricCount">0</strong></div>
-                    <div class="stat-card"><span>总容量</span><strong id="metricSize">0 B</strong></div>
-                </div>
-            </div>
-        </section>
+            </header>
 
-        <!-- Library: file list with filters and batch actions -->
-        <section id="libraryView" class="panel library-panel" tabindex="-1">
-            <div class="library-head">
-                <div class="library-heading">
-                    <h2>Library</h2>
-                    <p>筛选、复制、下载与预览。</p>
+            <div class="page">
+                <!-- Health bar -->
+                <div class="health" aria-label="工作区状态">
+                    <div class="health-item"><span>连接</span><strong id="healthConnection">-</strong></div>
+                    <div class="health-item"><span>文件数量</span><strong id="metricCount">0</strong></div>
+                    <div class="health-item"><span>总容量</span><strong id="metricSize">0 B</strong></div>
                 </div>
-                <div class="count-chip">
-                    <strong id="libraryCount">0</strong>
-                    <span>当前结果</span>
-                </div>
-            </div>
 
-            <form class="library-toolbar" id="libraryFilterForm">
-                <div class="library-filter-row">
-                    <div class="field field-grow">
-                        <label for="librarySearch">搜索</label>
-                        <input class="input" id="librarySearch" type="search" placeholder="按文件名搜索">
-                    </div>
-                    <button class="btn btn-soft btn-icon" id="filterToggleBtn" type="button" aria-expanded="false" aria-controls="filterGrid">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
-                        筛选
-                    </button>
-                    <button class="btn btn-soft btn-icon" id="clearFiltersBtn" type="button" hidden>
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
-                        清空
-                    </button>
-                </div>
-                <div class="filter-grid collapsed" id="filterGrid">
-                    <div class="field">
-                        <label for="fileTypeFilter">类型</label>
-                        <select class="select" id="fileTypeFilter">
-                            <option value="all">全部类型</option>
-                            <option value="image">图片</option>
-                            <option value="document">文档</option>
-                        </select>
-                    </div>
-                    <div class="field">
-                        <label for="deviceFilter">设备</label>
-                        <input class="input" id="deviceFilter" type="text" placeholder="按设备筛选">
-                    </div>
-                    <div class="field">
-                        <label for="dateFrom">起始日期</label>
-                        <input class="input" id="dateFrom" type="date">
-                    </div>
-                    <div class="field">
-                        <label for="dateTo">截止日期</label>
-                        <input class="input" id="dateTo" type="date">
-                    </div>
-                </div>
-                <div class="control-row">
-                    <div class="view-switch" role="tablist" aria-label="文件视图切换">
-                        <button class="view-chip active" id="gridViewBtn" data-view="grid" type="button" role="tab" aria-selected="true" aria-controls="fileList" tabindex="0">卡片视图</button>
-                        <button class="view-chip" id="listViewBtn" data-view="list" type="button" role="tab" aria-selected="false" aria-controls="fileList" tabindex="-1">列表视图</button>
-                    </div>
-                    <div class="library-actions">
-                        <span class="pill"><strong id="imageCount">0</strong> 张图片</span>
-                        <span class="pill"><strong id="otherCount">0</strong> 个其他文件</span>
-                    </div>
-                </div>
-                <div class="bulk-actions" aria-label="批量文件操作">
-                    <span class="pill"><strong id="selectedCount">0</strong> 已选择</span>
-                    <div class="file-actions">
-                        <button class="btn btn-soft btn-icon" id="selectVisibleBtn" type="button">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg>
-                            选择当前结果
-                        </button>
-                        <button class="btn btn-soft btn-icon" id="batchDownload" type="button">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
-                            批量下载
-                        </button>
-                        <button class="btn btn-soft btn-icon" id="batchCopy" type="button">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                            批量复制链接
-                        </button>
-                        <button class="btn btn-danger btn-icon" id="batchDelete" type="button">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
-                            批量删除
-                        </button>
-                        <button class="btn btn-plain btn-icon" id="clearSelectionBtn" type="button">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
-                            清空选择
-                        </button>
-                    </div>
-                </div>
-            </form>
+                <div class="dashboard-grid">
+                    <!-- Main column -->
+                    <div class="main-column">
+                        <!-- Composer: text input + file upload -->
+                        <section class="panel transfer-panel" id="composerPanel">
+                            <div class="panel-head">
+                                <div><h2>快速传输</h2><p>拖放文件，或从设备中选择。</p></div>
+                                <span class="mono-text">端到端校验</span>
+                            </div>
+                            <form class="composer-form" id="composerForm">
+                                <div class="composer-drop-target" id="composerDropTarget">
+                                    <div class="composer-drop-overlay" id="composerDropOverlay">
+                                        <div class="composer-drop-overlay-content">
+                                            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg>
+                                            <span>释放以上传文件</span>
+                                        </div>
+                                    </div>
+                                    <span id="dropzone" class="visually-hidden">文件拖放区</span>
+                                    <textarea class="composer-textarea" id="composerTextarea" placeholder="输入消息… (Enter 发送，Shift+Enter 换行)" rows="3" maxlength="10000"></textarea>
+                                    <input type="file" id="composerFileInput" multiple hidden>
+                                    <div class="composer-actions">
+                                        <button class="btn btn-soft btn-icon" type="button" id="composerAttachBtn">
+                                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+                                            添加文件
+                                        </button>
+                                        <button class="btn btn-primary btn-icon" type="submit">
+                                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 2-7 20-4-9-9-4Z"/><path d="m22 2-11 11"/></svg>
+                                            发送
+                                        </button>
+                                    </div>
+                                </div>
+                                <div class="composer-drop-hint" id="composerDropHint" hidden>拖放文件到此处</div>
+                            </form>
+                            <div class="composer-queue" id="composerQueue"></div>
+                        </section>
 
-            <div class="file-list grid-mode" id="fileList" role="tabpanel" aria-label="文件结果"></div>
-            <div class="library-pagination">
-                <button class="btn btn-soft" id="libraryLoadMore" type="button" hidden>加载更多</button>
-            </div>
+                        <!-- Library: file list with filters and batch actions -->
+                        <section id="libraryView" class="panel library-panel" tabindex="-1">
+                            <div class="panel-head">
+                                <div><h2>最近文件</h2><p><span id="libraryCount">0</span> 个结果</p></div>
+                                <div class="library-tools">
+                                    <div class="search-wrap">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+                                        <input class="control" id="librarySearch" type="search" placeholder="搜索文件名">
+                                    </div>
+                                    <button class="icon-button" id="filterToggleBtn" type="button" aria-expanded="false" aria-controls="filterGrid" aria-label="展开筛选">
+                                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h16M7 12h10M10 18h4"/></svg>
+                                    </button>
+                                    <button class="btn btn-soft btn-icon" id="clearFiltersBtn" type="button" hidden>
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                                        清空
+                                    </button>
+                                </div>
+                            </div>
 
-            <div class="storage-card" id="storageSummary">-</div>
-        </section>
+                            <div class="filter-grid collapsed" id="filterGrid">
+                                <div class="field">
+                                    <label for="fileTypeFilter">类型</label>
+                                    <select class="select" id="fileTypeFilter">
+                                        <option value="all">全部类型</option>
+                                        <option value="image">图片</option>
+                                        <option value="document">文档</option>
+                                    </select>
+                                </div>
+                                <div class="field">
+                                    <label for="deviceFilter">设备</label>
+                                    <input class="input" id="deviceFilter" type="text" placeholder="按设备筛选">
+                                </div>
+                                <div class="field">
+                                    <label for="dateFrom">起始日期</label>
+                                    <input class="input" id="dateFrom" type="date">
+                                </div>
+                                <div class="field">
+                                    <label for="dateTo">截止日期</label>
+                                    <input class="input" id="dateTo" type="date">
+                                </div>
+                            </div>
 
-        <!-- Composer: text input + file upload -->
-        <section class="panel composer-panel" id="composerPanel">
-            <form class="composer-form" id="composerForm">
-                <div class="composer-drop-target" id="composerDropTarget">
-                    <div class="composer-drop-overlay" id="composerDropOverlay">
-                        <div class="composer-drop-overlay-content">
-                            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg>
-                            <span>释放以上传文件</span>
-                        </div>
+                            <div class="control-row">
+                                <div class="view-switch" role="tablist" aria-label="文件视图切换">
+                                    <button class="view-chip active" id="gridViewBtn" data-view="grid" type="button" role="tab" aria-selected="true" aria-controls="fileList" tabindex="0">卡片</button>
+                                    <button class="view-chip" id="listViewBtn" data-view="list" type="button" role="tab" aria-selected="false" aria-controls="fileList" tabindex="-1">列表</button>
+                                </div>
+                                <div class="library-actions">
+                                    <span class="pill"><strong id="imageCount">0</strong> 图片</span>
+                                    <span class="pill"><strong id="otherCount">0</strong> 其他</span>
+                                </div>
+                            </div>
+
+                            <div class="bulk-actions" aria-label="批量文件操作">
+                                <span class="pill"><strong id="selectedCount">0</strong> 已选择</span>
+                                <div class="file-actions">
+                                    <button class="btn btn-soft btn-icon" id="selectVisibleBtn" type="button">
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/></svg>
+                                        全选
+                                    </button>
+                                    <button class="btn btn-soft btn-icon" id="batchDownload" type="button">
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
+                                        下载
+                                    </button>
+                                    <button class="btn btn-soft btn-icon" id="batchCopy" type="button">
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                                        复制
+                                    </button>
+                                    <button class="btn btn-danger btn-icon" id="batchDelete" type="button">
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+                                        删除
+                                    </button>
+                                    <button class="btn btn-plain btn-icon" id="clearSelectionBtn" type="button">
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                                        取消
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div class="file-list grid-mode" id="fileList" role="tabpanel" aria-label="文件结果"></div>
+                            <div class="library-pagination">
+                                <button class="btn btn-soft" id="libraryLoadMore" type="button" hidden>加载更多</button>
+                            </div>
+                        </section>
                     </div>
-                    <span id="dropzone" class="visually-hidden">文件拖放区</span>
-                    <textarea class="composer-textarea" id="composerTextarea" placeholder="输入消息… (Enter 发送，Shift+Enter 换行)" rows="3" maxlength="10000"></textarea>
-                    <input type="file" id="composerFileInput" multiple hidden>
-                    <div class="composer-actions">
-                        <button class="btn btn-soft btn-icon" type="button" id="composerAttachBtn">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
-                            添加文件
-                        </button>
-                        <button class="btn btn-primary btn-icon" type="submit">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 2-7 20-4-9-9-4Z"/><path d="m22 2-11 11"/></svg>
-                            发送
-                        </button>
-                    </div>
-                </div>
-                <div class="composer-drop-hint" id="composerDropHint" hidden>拖放文件到此处</div>
-            </form>
-            <div class="composer-queue" id="composerQueue"></div>
-        </section>
 
-        <!-- Timeline: message stream with undo -->
-        <section class="panel timeline-panel" id="timelinePanel">
-            <div class="timeline-head">
-                <div>
-                    <h2>Timeline</h2>
-                    <p>消息与文件时间线。</p>
-                </div>
-            </div>
-            <div class="timeline-container" id="timelineContainer" tabindex="-1">
-                <div class="timeline-empty" id="timelineEmpty">
-                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-                    <strong>暂无消息</strong>
-                    <p>在上方输入文字或上传文件开始传输</p>
-                </div>
-            </div>
-            <button class="btn btn-primary timeline-new-btn" id="newMessageButton" type="button" hidden>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
-                新消息
-            </button>
-        </section>
+                    <!-- Context rail -->
+                    <aside class="rail">
+                        <!-- Timeline: recent activity -->
+                        <section class="panel timeline-panel" id="timelinePanel">
+                            <div class="panel-head">
+                                <div><h2>最近活动</h2><p>消息与文件时间线</p></div>
+                            </div>
+                            <div class="timeline-container" id="timelineContainer" tabindex="-1">
+                                <div class="timeline-empty" id="timelineEmpty">
+                                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                                    <strong>暂无消息</strong>
+                                    <p>在上方输入文字或上传文件开始传输</p>
+                                </div>
+                            </div>
+                            <button class="btn btn-primary timeline-new-btn" id="newMessageButton" type="button" hidden>
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
+                                新消息
+                            </button>
+                        </section>
 
-        <!-- Operations: storage stats + audit trail -->
-        <section class="panel operations-panel" aria-labelledby="operationsTitle">
-            <div class="library-head">
-                <div class="library-heading">
-                    <h2 id="operationsTitle">Operations</h2>
-                    <p>存储占用、旧文件与审计事件。</p>
-                </div>
-                <button class="btn btn-soft btn-icon" id="refreshOpsBtn" type="button">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M21 21v-5h-5"/></svg>
-                    刷新运营视图
-                </button>
-            </div>
-
-            <div class="ops-grid" id="opsSummary">
-                <div class="mini-kpi"><span>总占用</span><strong>-</strong></div>
-                <div class="mini-kpi"><span>文件数</span><strong>-</strong></div>
-                <div class="mini-kpi"><span>旧文件</span><strong>-</strong></div>
-                <div class="mini-kpi"><span>大文件</span><strong>-</strong></div>
-            </div>
-
-            <div class="ops-columns">
-                <div class="ops-list">
-                    <h3>Largest Files</h3>
-                    <div id="largestFilesList" class="ops-meta">随文件列表同步。</div>
-                </div>
-                <div class="ops-list">
-                    <h3>Audit Trail</h3>
-                    <div id="auditEventsList" class="ops-meta">随文件列表同步。</div>
+                        <!-- Operations: storage stats (summary only) -->
+                        <section class="panel operations-panel" aria-labelledby="operationsTitle">
+                            <div class="panel-head">
+                                <div><h2 id="operationsTitle">存储状态</h2></div>
+                                <button class="icon-button" id="refreshOpsBtn" type="button" aria-label="刷新运营视图">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 6v5h-5M4 18v-5h5"/><path d="M18.5 9A7 7 0 0 0 6 6.5L4 11M5.5 15A7 7 0 0 0 18 17.5l2-4.5"/></svg>
+                                </button>
+                            </div>
+                            <div class="ops-grid" id="opsSummary">
+                                <div class="mini-kpi"><span>总占用</span><strong>-</strong></div>
+                                <div class="mini-kpi"><span>文件数</span><strong>-</strong></div>
+                                <div class="mini-kpi"><span>旧文件</span><strong>-</strong></div>
+                                <div class="mini-kpi"><span>大文件</span><strong>-</strong></div>
+                            </div>
+                            <div class="storage-card" id="storageSummary">-</div>
+                        </section>
+                    </aside>
                 </div>
             </div>
-        </section>
-    </main>
+        </main>
+    </div>
 
-    <!-- Preview modal: image preview + metadata + actions -->
+    <!-- Mobile bottom nav -->
+    <nav class="mobile-nav" aria-label="移动端主导航">
+        <button class="active" type="button" data-section="workspace" aria-current="page">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18M9 21V9"/></svg>
+            工作台
+        </button>
+        <button type="button" data-section="files">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7h6l2 2h10v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>
+            文件
+        </button>
+        <button type="button" data-section="activity">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 8v4l3 2"/><circle cx="12" cy="12" r="9"/></svg>
+            活动
+        </button>
+        <button type="button" data-section="settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M4 12a8 8 0 1 0 16 0 8 8 0 0 0-16 0Z"/></svg>
+            设置
+        </button>
+    </nav>
+
+    <!-- Preview modal -->
     <div class="preview-modal" id="previewModal" role="dialog" aria-modal="true" aria-labelledby="previewTitle" hidden>
         <div class="preview-shell">
             <div class="preview-image-frame">
@@ -245,7 +301,7 @@
             </div>
             <aside class="preview-side">
                 <div class="preview-copy">
-                    <span class="preview-kicker">Image Preview</span>
+                    <span class="preview-kicker">文件预览</span>
                     <h3 id="previewTitle"></h3>
                     <p class="preview-caption">预览链接会沿用当前会话。</p>
                 </div>
@@ -254,42 +310,42 @@
                 <div class="preview-meta"><strong id="previewType">-</strong> 文件类型</div>
                 <div class="preview-actions">
                     <button class="btn btn-soft btn-icon" id="previewCopyBtn" type="button">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
                         复制链接
                     </button>
                     <a class="btn btn-primary btn-icon" id="previewDownloadBtn" href="#">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
                         下载文件
                     </a>
                     <button class="btn btn-plain btn-icon" id="closePreviewBtn" type="button">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
-                        关闭预览
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                        关闭
                     </button>
                 </div>
             </aside>
         </div>
     </div>
 
-    <!-- Toast: global notification (undo + status) -->
+    <!-- Toast -->
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
-    <!-- Batch toolbar: fixed bottom bar for selected files -->
+    <!-- Batch toolbar -->
     <div class="batch-toolbar" id="batchToolbar" aria-label="批量操作">
         <span class="pill"><strong id="batchToolbarCount">0</strong> 已选择</span>
         <button class="btn btn-soft btn-icon" id="batchToolbarDownload" type="button">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
             下载
         </button>
         <button class="btn btn-soft btn-icon" id="batchToolbarCopy" type="button">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-            复制链接
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+            复制
         </button>
         <button class="btn btn-danger btn-icon" id="batchToolbarDelete" type="button">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
             删除
         </button>
         <button class="btn btn-plain btn-icon" id="batchToolbarClear" type="button">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
             取消
         </button>
     </div>

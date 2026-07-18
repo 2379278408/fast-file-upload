@@ -277,7 +277,7 @@ def _unlock(page: Page) -> None:
     except AssertionError as error:
         detail = page.locator(".unlock-error").text_content()
         raise AssertionError(f"unlock did not finish; dialog error: {detail!r}") from error
-    expect(page.locator("#timelineView")).to_be_visible()
+    expect(page.locator("#mainContent")).to_be_visible()
 
 
 def _assert_browser_clean(session: BrowserSession) -> None:
@@ -349,7 +349,7 @@ def test_unlock_dialog_native_focus_and_inert_lifecycle(
     assert page.evaluate(
         "() => Array.from(document.body.children).every(element => !element.inert)"
     )
-    expect(page.locator("#timelineView")).to_be_focused()
+    expect(page.locator("#mainContent")).to_be_focused()
     _assert_browser_clean(browser_session)
 
 
@@ -432,7 +432,7 @@ def test_tabs_skip_link_and_mobile_touch_targets(
     page.evaluate(
         """
         () => {
-          const timeline = document.getElementById('timelineView');
+          const timeline = document.getElementById('mainContent');
           const nativeFocus = timeline.focus.bind(timeline);
           window.__skipLinkFocusCalls = 0;
           timeline.focus = (...args) => {
@@ -448,15 +448,15 @@ def test_tabs_skip_link_and_mobile_touch_targets(
     skip_box = skip_link.bounding_box()
     assert skip_box is not None and skip_box["width"] > 1 and skip_box["height"] > 1
     page.keyboard.press("Enter")
-    expect(page.locator("#timelineView")).to_be_focused()
-    assert page.evaluate("location.hash") == "#timelineView"
+    expect(page.locator("#mainContent")).to_be_focused()
+    assert page.evaluate("location.hash") == "#mainContent"
     assert page.evaluate("window.__skipLinkFocusCalls") == 1
 
     page.evaluate("history.replaceState(null, '', location.pathname + location.search)")
     skip_link.focus()
     skip_link.click()
-    expect(page.locator("#timelineView")).to_be_focused()
-    assert page.evaluate("location.hash") == "#timelineView"
+    expect(page.locator("#mainContent")).to_be_focused()
+    assert page.evaluate("location.hash") == "#mainContent"
     assert page.evaluate("window.__skipLinkFocusCalls") == 2
 
     assert page.evaluate(

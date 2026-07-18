@@ -190,7 +190,7 @@ def test_index_serves_html(client: TestClient) -> None:
     assert response.status_code == 200
     html = response.text
     assert "<!DOCTYPE html>" in html
-    assert "Fast File Upload" in html
+    assert "MonkeyCode" in html
     assert 'id="dropzone"' in html
     assert 'id="fileList"' in html
     assert 'id="previewModal"' in html
