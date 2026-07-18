@@ -342,6 +342,10 @@ const library = createLibrary({
     navigation.navigate('transfer');
     composerFileInput?.click();
   },
+  async onLocate(messageId) {
+    await navigation.navigate('transfer', { focus: false });
+    timeline.focusMessage(messageId);
+  },
 });
 
 if (composerAttachBtn && composerFileInput) {

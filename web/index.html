@@ -90,13 +90,6 @@
             </header>
 
             <div class="page">
-                <!-- Health bar -->
-                <div class="health" aria-label="工作区状态">
-                    <div class="health-item"><span>连接</span><strong id="healthConnection">-</strong></div>
-                    <div class="health-item"><span>文件数量</span><strong id="metricCount">0</strong></div>
-                    <div class="health-item"><span>总容量</span><strong id="metricSize">0 B</strong></div>
-                </div>
-
                 <section class="route-page transfer-page" id="transferPage" data-route-page="transfer">
                     <h1 class="route-heading visually-hidden" data-route-heading="transfer" tabindex="-1">传输工作台</h1>
                     <div class="transfer-workspace">
@@ -252,6 +245,11 @@
 
                 <section class="route-page manage-page" id="managePage" data-route-page="manage" hidden>
                     <h1 class="route-heading" data-route-heading="manage" tabindex="-1">管理与设置</h1>
+                    <div class="health" aria-label="工作区状态">
+                        <div class="health-item"><span>连接</span><strong id="healthConnection">-</strong></div>
+                        <div class="health-item"><span>文件数量</span><strong id="metricCount">0</strong></div>
+                        <div class="health-item"><span>总容量</span><strong id="metricSize">0 B</strong></div>
+                    </div>
                     <div class="manage-grid">
                         <!-- Connection: status and latency -->
                         <section class="panel manage-panel connection-panel" id="connectionPanel" aria-live="polite">

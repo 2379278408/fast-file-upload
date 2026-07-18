@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import socket
 import subprocess
 import time
@@ -545,7 +546,7 @@ def test_tabs_skip_link_and_mobile_touch_targets(
     _assert_no_horizontal_overflow(page)
     major_button_boxes = page.locator(
         "button.btn-primary:visible, #gridViewBtn:visible, #listViewBtn:visible, "
-        "#composerAttachBtn:visible"
+        "#composerAttachBtn:visible, .mobile-nav button:visible"
     ).evaluate_all(
         """
         elements => elements.map(element => {
@@ -638,43 +639,33 @@ def test_three_route_navigation_history_focus_and_viewport_safety(
     if nav_selector == ".mobile-nav":
         composer = page.locator("#composerPanel")
         mobile_nav = page.locator(".mobile-nav")
-        if viewport["height"] == 568:
-            timeline = page.locator("#timelineContainer")
-            timeline.evaluate("element => element.scrollIntoView({ block: 'start' })")
-            expect(timeline).to_be_visible()
-            timeline_metrics = timeline.evaluate(
-                """
-                element => {
-                  const rect = element.getBoundingClientRect();
-                  const style = getComputedStyle(element);
-                  return {
-                    top: rect.top,
-                    bottom: rect.bottom,
-                    height: rect.height,
-                    clientHeight: element.clientHeight,
-                    scrollHeight: element.scrollHeight,
-                    overflowY: style.overflowY,
-                  };
-                }
-                """
-            )
-            composer_top = composer.evaluate(
-                "element => element.getBoundingClientRect().top"
-            )
-            mobile_nav_top = mobile_nav.evaluate(
-                "element => element.getBoundingClientRect().top"
-            )
-            assert timeline_metrics["height"] >= 120
-            assert timeline_metrics["scrollHeight"] > timeline_metrics["clientHeight"]
-            assert timeline_metrics["overflowY"] == "auto"
-            assert timeline_metrics["top"] >= 0
-            assert timeline_metrics["bottom"] <= composer_top
-            assert timeline_metrics["bottom"] <= mobile_nav_top
-
-        composer.evaluate("element => element.scrollIntoView({ block: 'end' })")
+        timeline = page.locator("#timelineContainer")
+        expect(timeline).to_be_visible()
+        expect(composer).to_be_visible()
+        assert page.evaluate("window.scrollY") == 0
+        timeline_metrics = timeline.evaluate(
+            """
+            element => {
+              const rect = element.getBoundingClientRect();
+              const style = getComputedStyle(element);
+              return {
+                top: rect.top,
+                bottom: rect.bottom,
+                height: rect.height,
+                clientHeight: element.clientHeight,
+                scrollHeight: element.scrollHeight,
+                overflowY: style.overflowY,
+              };
+            }
+            """
+        )
         composer_box = composer.bounding_box()
         mobile_nav_box = mobile_nav.bounding_box()
         assert composer_box is not None and mobile_nav_box is not None
+        assert timeline_metrics["height"] > 0
+        assert timeline_metrics["overflowY"] == "auto"
+        assert timeline_metrics["top"] >= 0
+        assert timeline_metrics["bottom"] <= composer_box["y"] + 1
         assert composer_box["y"] >= 0
         assert composer_box["y"] + composer_box["height"] <= mobile_nav_box["y"]
 
@@ -698,6 +689,128 @@ def test_empty_files_action_returns_to_transfer_and_opens_picker(
     expect(page.locator("#transferPage")).to_be_visible()
     expect(page.locator('[data-route-heading="transfer"]')).to_be_focused()
     assert page.evaluate("location.hash") == "#transfer"
+    _assert_browser_clean(browser_session)
+
+
+def test_files_locate_routes_then_highlights_message_and_back_returns_files(
+    browser_session: BrowserSession,
+) -> None:
+    page = browser_session.page
+    _create_seed_session(browser_session, "playwright-locate-seed")
+    upload = browser_session.context.request.post(
+        f"{browser_session.base_url}/api/upload",
+        multipart={
+            "client_request_id": "browser-locate-upload",
+            "file": {
+                "name": "browser-locate.txt",
+                "mimeType": "text/plain",
+                "buffer": b"locate target",
+            },
+        },
+    )
+    assert upload.ok
+    message_id = upload.json()["id"]
+    browser_session.context.clear_cookies()
+
+    _open_locked_application(browser_session)
+    _unlock(page)
+    page.locator('.sidebar [data-route="files"]').click()
+    _assert_route_state(page, "files", ".sidebar")
+    page.locator(
+        f'[data-file-action="locate"][data-message-id="{message_id}"]'
+    ).click()
+
+    _assert_route_state(
+        page, "transfer", ".sidebar", expect_heading_focus=False
+    )
+    target = page.locator(f'.timeline-message[data-message-id="{message_id}"]')
+    expect(target).to_have_class(re.compile(r".*timeline-message-highlight.*"))
+    assert page.evaluate("location.hash") == "#transfer"
+
+    page.go_back()
+    _assert_route_state(page, "files", ".sidebar", expect_heading_focus=False)
+    assert page.evaluate("location.hash") == "#files"
+    _assert_browser_clean(browser_session)
+
+
+def test_health_storage_summary_is_loaded_only_in_manage(
+    browser_session: BrowserSession,
+) -> None:
+    page = browser_session.page
+    _create_seed_session(browser_session, "playwright-health-seed")
+    upload = browser_session.context.request.post(
+        f"{browser_session.base_url}/api/upload",
+        multipart={
+            "client_request_id": "browser-health-upload",
+            "file": {
+                "name": "browser-health.txt",
+                "mimeType": "text/plain",
+                "buffer": b"health summary",
+            },
+        },
+    )
+    assert upload.ok
+    browser_session.context.clear_cookies()
+
+    _open_locked_application(browser_session)
+    _unlock(page)
+    expect(page.locator("#transferPage")).to_be_visible()
+    expect(page.locator(".health")).to_be_hidden()
+    assert page.locator("#transferPage #metricCount").count() == 0
+    assert page.locator("#transferPage #metricSize").count() == 0
+
+    page.locator('.sidebar [data-route="manage"]').click()
+    _assert_route_state(page, "manage", ".sidebar")
+    expect(page.locator(".health")).to_be_visible()
+    expect(page.locator("#metricCount")).to_have_text("1")
+    expect(page.locator("#metricSize")).not_to_have_text("0 B")
+    _assert_browser_clean(browser_session)
+
+
+def test_route_history_restores_distinct_scroll_positions_without_focus_move(
+    browser_session: BrowserSession,
+) -> None:
+    page = browser_session.page
+    _open_locked_application(browser_session)
+    _unlock(page)
+    page.evaluate(
+        """
+        () => {
+          for (const route of ['filesPage', 'managePage']) {
+            const page = document.getElementById(route);
+            for (let index = 0; index < 18; index += 1) {
+              const filler = document.createElement('div');
+              filler.className = 'timeline-empty';
+              filler.textContent = `scroll filler ${index}`;
+              page.append(filler);
+            }
+          }
+        }
+        """
+    )
+
+    page.locator('.sidebar [data-route="files"]').click()
+    _assert_route_state(page, "files", ".sidebar")
+    page.evaluate("window.scrollTo(0, 420)")
+    page.wait_for_function("window.scrollY === 420")
+
+    page.locator('.sidebar [data-route="manage"]').click()
+    _assert_route_state(page, "manage", ".sidebar")
+    page.evaluate("window.scrollTo(0, 760)")
+    page.wait_for_function("window.scrollY === 760")
+    stable_control = page.locator("#themeToggle")
+    stable_control.focus()
+    expect(stable_control).to_be_focused()
+
+    page.go_back()
+    _assert_route_state(page, "files", ".sidebar", expect_heading_focus=False)
+    page.wait_for_function("window.scrollY === 420")
+    expect(stable_control).to_be_focused()
+
+    page.go_forward()
+    _assert_route_state(page, "manage", ".sidebar", expect_heading_focus=False)
+    page.wait_for_function("window.scrollY === 760")
+    expect(stable_control).to_be_focused()
     _assert_browser_clean(browser_session)
 
 
@@ -730,6 +843,11 @@ def test_mobile_batch_toolbar_selection_clear_and_route_exit(
 
     toolbar = page.locator("#batchToolbar")
     _assert_batch_toolbar_state(toolbar, visible=True)
+    toolbar_buttons = toolbar.locator("button").evaluate_all(
+        "elements => elements.map(element => getComputedStyle(element).minHeight)"
+    )
+    assert toolbar_buttons
+    assert all(float(value.removesuffix("px")) >= 44 for value in toolbar_buttons)
 
     page.locator("#batchToolbarClear").click()
     expect(checkbox).not_to_be_checked()

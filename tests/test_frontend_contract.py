@@ -554,6 +554,7 @@ def test_shell_has_three_matching_desktop_and_mobile_routes() -> None:
 
 def test_manage_page_groups_connection_storage_appearance_and_session() -> None:
     html = read_web("index.html")
+    transfer = html[html.index('id="transferPage"'):html.index('id="filesPage"')]
     manage = html[html.index('id="managePage"'):html.index('class="mobile-nav"')]
     for token in (
         'id="connectionPanel"',
@@ -563,6 +564,9 @@ def test_manage_page_groups_connection_storage_appearance_and_session() -> None:
         'id="logoutButton"',
     ):
         assert token in manage
+    for token in ('id="healthConnection"', 'id="metricCount"', 'id="metricSize"'):
+        assert token in manage
+        assert token not in transfer
     assert manage.count('class="manage-panel-body') == 4
 
 
@@ -654,11 +658,10 @@ def test_transfer_timeline_has_bounded_internal_scroll_at_all_viewports() -> Non
     assert ".composer-dock .panel-head" in mobile
 
 
-def test_mobile_transfer_layout_budget_for_short_and_tall_viewports() -> None:
+def test_mobile_transfer_reserves_space_for_fixed_composer_dock() -> None:
     css = read_web("styles.css")
-    mobile_start = css.index("@media (max-width: 720px)")
     compact_start = css.index("@media (max-width: 430px)")
-    mobile = css[mobile_start:compact_start]
+    compact = css[compact_start:]
 
     def rule(source: str, selector: str) -> str:
         match = re.search(rf"{re.escape(selector)}\s*\{{([^{{}}]*)\}}", source)
@@ -670,160 +673,28 @@ def test_mobile_transfer_layout_budget_for_short_and_tall_viewports() -> None:
         assert match, f"missing CSS declaration for {name}"
         return match.group(1).strip()
 
-    def pixels(expression: str) -> float:
-        match = re.search(r"(-?\d+(?:\.\d+)?)px", expression)
-        assert match, f"missing pixel value in {expression}"
-        return float(match.group(1))
+    root_vars = rule(compact, ":root")
+    workspace_rule = rule(compact, ".transfer-workspace")
+    composer_rule = rule(compact, ".composer-dock")
+    mobile = css[css.index("@media (max-width: 720px)"):compact_start]
+    nav_rule = rule(mobile, ".mobile-nav")
 
-    def clamp_pixels(expression: str, viewport_height: int) -> float:
-        match = re.fullmatch(
-            r"clamp\((\d+)px,\s*(\d+(?:\.\d+)?)dvh,\s*(\d+)px\)",
-            expression,
-        )
-        assert match, f"unsupported clamp expression {expression}"
-        minimum, viewport_ratio, maximum = map(float, match.groups())
-        return min(max(minimum, viewport_height * viewport_ratio / 100), maximum)
-
-    def layout(
-        stylesheet: str, viewport_width: int, viewport_height: int
-    ) -> dict[str, float]:
-        stylesheet_root = stylesheet[stylesheet.index(":root {"):stylesheet.index(".dark {")]
-        stylesheet_mobile_start = stylesheet.index("@media (max-width: 720px)")
-        stylesheet_compact_start = stylesheet.index("@media (max-width: 430px)")
-        stylesheet_mobile = stylesheet[stylesheet_mobile_start:stylesheet_compact_start]
-        stylesheet_compact = stylesheet[stylesheet_compact_start:]
-        assert viewport_width <= 430 < 720
-
-        root_vars = rule(stylesheet_root, ":root")
-        mobile_vars = rule(stylesheet_mobile, ":root")
-        compact_vars = rule(stylesheet_compact, ":root")
-        workspace_rule = rule(stylesheet_mobile, ".transfer-workspace")
-        timeline_rule = rule(stylesheet_mobile, ".transfer-workspace .timeline-container")
-        composer_rule = rule(stylesheet_mobile, ".composer-dock")
-        body_rule = rule(stylesheet_mobile, "body")
-        nav_rule = rule(stylesheet_mobile, ".mobile-nav")
-        compact_topbar_rule = rule(stylesheet_compact, ".topbar")
-
-        shell_variable = "var(--mobile-timeline-shell-min-height)"
-        inner_variable = "var(--mobile-timeline-min-height)"
-        assert declaration(workspace_rule, "grid-template-rows") == (
-            f"auto minmax({shell_variable}, 1fr) auto"
-        )
-        assert declaration(timeline_rule, "min-height") == inner_variable
-        assert declaration(workspace_rule, "min-height") == (
-            "max(var(--mobile-workspace-min-height), calc(100dvh - "
-            "var(--topbar-height) - var(--mobile-fixed-offset) - "
-            "var(--transfer-page-offset)))"
-        )
-        assert declaration(composer_rule, "position") == "relative"
-        assert declaration(composer_rule, "bottom") == "auto"
-        assert declaration(composer_rule, "scroll-margin-bottom") == "var(--mobile-fixed-offset)"
-        assert declaration(compact_topbar_rule, "height") == "var(--topbar-height)"
-        assert declaration(nav_rule, "height") == "var(--mobile-nav-height)"
-
-        topbar_height = pixels(declaration(compact_vars, "--topbar-height"))
-        nav_height = pixels(declaration(root_vars, "--mobile-nav-height"))
-        fixed_gap = pixels(declaration(root_vars, "--mobile-fixed-offset"))
-        nav_offset = nav_height + fixed_gap
-        page_offset = pixels(declaration(mobile_vars, "--transfer-page-offset"))
-        workspace_floor = pixels(declaration(mobile_vars, "--mobile-workspace-min-height"))
-        timeline_shell_min = pixels(
-            declaration(mobile_vars, "--mobile-timeline-shell-min-height")
-        )
-        timeline_inner_min = pixels(
-            declaration(mobile_vars, "--mobile-timeline-min-height")
-        )
-        timeline_max = clamp_pixels(
-            declaration(timeline_rule, "max-height"), viewport_height
-        )
-        composer_max = clamp_pixels(
-            declaration(composer_rule, "max-height"), viewport_height
-        )
-        body_clearance = pixels(declaration(body_rule, "padding-bottom"))
-        viewport_budget = viewport_height - topbar_height - nav_offset - page_offset
-        workspace_height = max(workspace_floor, viewport_budget)
-
-        assert timeline_shell_min > timeline_inner_min > 0
-        assert timeline_max >= timeline_inner_min
-        assert nav_offset >= nav_height
-        assert body_clearance >= nav_height
-        return {
-            "viewport_width": viewport_width,
-            "workspace": workspace_height,
-            "page_scroll": max(0, workspace_height - viewport_budget),
-            "timeline_shell_min": timeline_shell_min,
-            "timeline_inner_min": timeline_inner_min,
-            "timeline_max": round(timeline_max, 2),
-            "composer_max": round(composer_max, 2),
-            "composer_nav_gap": nav_offset - nav_height,
-            "page_nav_clearance": body_clearance - nav_height,
-        }
-
-    assert layout(css, 390, 568) == {
-        "viewport_width": 390,
-        "workspace": 520,
-        "page_scroll": 224,
-        "timeline_shell_min": 220,
-        "timeline_inner_min": 120,
-        "timeline_max": 160,
-        "composer_max": 181.76,
-        "composer_nav_gap": 12,
-        "page_nav_clearance": 4,
-    }
-    assert layout(css, 390, 844) == {
-        "viewport_width": 390,
-        "workspace": 572,
-        "page_scroll": 0,
-        "timeline_shell_min": 220,
-        "timeline_inner_min": 120,
-        "timeline_max": 236.32,
-        "composer_max": 240,
-        "composer_nav_gap": 12,
-        "page_nav_clearance": 4,
-    }
-
-    def mutate_mobile(old: str, new: str) -> str:
-        assert old in mobile
-        return css[:mobile_start] + mobile.replace(old, new, 1) + css[compact_start:]
-
-    broken_stylesheets = (
-        mutate_mobile(
-            "minmax(var(--mobile-timeline-shell-min-height), 1fr)",
-            "minmax(0, 1fr)",
-        ),
-        mutate_mobile(
-            "min-height: var(--mobile-timeline-min-height);",
-            "min-height: 0;",
-        ),
-        mutate_mobile(
-            "--mobile-timeline-shell-min-height: 220px;",
-            "--removed-timeline-shell-min-height: 220px;",
-        ),
-        mutate_mobile(
-            "--mobile-timeline-min-height: 120px;",
-            "--removed-timeline-min-height: 120px;",
-        ),
-        mutate_mobile(".transfer-workspace {", ".removed-transfer-workspace {"),
-        mutate_mobile(
-            ".transfer-workspace .timeline-container {",
-            ".removed-timeline-container {",
-        ),
-        mutate_mobile(".composer-dock {", ".removed-composer-dock {"),
-        mutate_mobile(
-            "scroll-margin-bottom: var(--mobile-fixed-offset);",
-            "scroll-margin-bottom: 0;",
-        ),
-        mutate_mobile("body { padding-bottom: 70px; }", "body { padding-bottom: 0; }"),
-        mutate_mobile("height: var(--mobile-nav-height);", "height: auto;"),
-    )
-    for broken_css in broken_stylesheets:
-        with pytest.raises(AssertionError):
-            layout(broken_css, 390, 568)
+    assert declaration(root_vars, "--mobile-composer-reserve")
+    assert "var(--mobile-composer-reserve)" in declaration(workspace_rule, "padding-bottom")
+    assert declaration(composer_rule, "position") == "fixed"
+    assert declaration(composer_rule, "bottom") == "var(--mobile-fixed-offset)"
+    assert declaration(composer_rule, "left") == "14px"
+    assert declaration(composer_rule, "right") == "14px"
+    assert declaration(nav_rule, "height") == "var(--mobile-nav-height)"
 
 
 def test_transfer_route_dead_styles_are_removed() -> None:
     css = read_web("styles.css")
-    for selector in (".transfer-route", ".route-node", "route-pulse"):
+    for selector in (
+        ".transfer-route", ".route-node", "route-pulse", ".hero",
+        ".quick-stats", ".stat-card", ".dashboard-grid", ".rail",
+        ".library-filter-toggle",
+    ):
         assert selector not in css
 
 
@@ -965,6 +836,84 @@ def test_library_empty_attach_listener_lifecycle_is_scoped_to_controller() -> No
         "secondAttachCalls": 1,
         "remainingListeners": 0,
     }
+
+
+def test_library_locate_loads_before_app_navigation_without_message_hash() -> None:
+    context = create_js_context()
+    load_js_module(context, "./library.js", read_web("js/library.js"))
+    context.eval(r"""
+      location.hash = '#files';
+      globalThis.locateSequence = [];
+      const timeline = {
+        ensureMessageLoaded(messageId) {
+          locateSequence.push(`load:${messageId}`);
+          return Promise.resolve(true);
+        },
+        focusMessage(messageId) { locateSequence.push(`early-focus:${messageId}`); return true; },
+      };
+      const controller = __modules['./library.js'].createLibrary({
+        root: document.getElementById('libraryView'),
+        api: () => Promise.resolve({}),
+        timeline,
+        onLocate(messageId) {
+          locateSequence.push(`route:${messageId}`);
+          locateSequence.push(`focus:${messageId}`);
+        },
+      });
+      globalThis.locatePromise = controller.openMessage('message-7');
+    """)
+    drain_jobs(context)
+
+    result = json.loads(context.eval(r"""
+      JSON.stringify({ sequence: locateSequence, hash: location.hash });
+    """))
+    assert result == {
+        "sequence": ["load:message-7", "route:message-7", "focus:message-7"],
+        "hash": "#files",
+    }
+
+
+def test_app_locate_navigates_before_focusing_timeline_message() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.locateSequence = [];
+      __modules['./api.js'] = {
+        request: () => Promise.resolve({}), unlock: () => Promise.resolve({}),
+        logout: () => Promise.resolve({}), getSession: () => Promise.resolve({}),
+        ApiError: class ApiError extends Error {},
+        connectEvents: () => ({ close() {} }), getLastSequence: () => 0,
+      };
+      __modules['./timeline.js'] = {
+        createTimeline: () => ({
+          loadInitial() {}, mergeEvent() {}, remove() {}, upsert() {},
+          focusMessage(messageId) { locateSequence.push(`focus:${messageId}`); return true; },
+        }),
+      };
+      __modules['./composer.js'] = { createComposer: () => ({}) };
+      __modules['./library.js'] = {
+        createLibrary: options => {
+          globalThis.locateFromLibrary = options.onLocate;
+          return { clearSelection() {} };
+        },
+      };
+      __modules['./navigation.js'] = {
+        createNavigation: () => ({
+          navigate(route, options) {
+            locateSequence.push(`route:${route}:${options && options.focus === false}`);
+            return Promise.resolve();
+          },
+          start() {},
+        }),
+      };
+    """)
+    load_js_module(context, "./app.js", read_web("js/app.js"))
+    context.eval("globalThis.locatePromise = locateFromLibrary('message-8');")
+    drain_jobs(context)
+
+    assert json.loads(context.eval("JSON.stringify(locateSequence)")) == [
+        "route:transfer:true",
+        "focus:message-8",
+    ]
 
 
 def test_library_destroy_clears_toast_timer_and_stale_callback_is_inert() -> None:
@@ -1294,6 +1243,67 @@ def test_navigation_focuses_user_navigation_and_preserves_focus_on_history() -> 
         ],
         "title": "传输工作台 · MonkeyCode",
         "breadcrumb": "传输工作台",
+    }
+
+
+def test_navigation_owns_scroll_restoration_and_restores_route_positions() -> None:
+    context = create_js_context()
+    load_js_module(context, "./navigation.js", read_web("js/navigation.js"))
+    result = json.loads(context.eval(r"""
+      const windowListeners = {};
+      const stableControl = { id: 'stable-control' };
+      const windowObject = {
+        scrollY: 0,
+        location: { hash: '#transfer' },
+        history: {
+          scrollRestoration: 'auto',
+          replaceState(_state, _title, hash) { windowObject.location.hash = hash; },
+        },
+        addEventListener(type, listener) { windowListeners[type] = listener; },
+        removeEventListener() {},
+        scrollTo(_x, y) { windowObject.scrollY = y; },
+      };
+      const documentObject = {
+        activeElement: stableControl,
+        title: '',
+        querySelectorAll() { return []; },
+        querySelector() { return null; },
+      };
+      const navigation = __modules['./navigation.js'].createNavigation({ windowObject, documentObject });
+      navigation.start();
+      const during = windowObject.history.scrollRestoration;
+
+      windowObject.scrollY = 125;
+      navigation.navigate('files', { focus: false });
+      windowListeners.hashchange();
+      windowObject.scrollY = 375;
+      navigation.navigate('manage', { focus: false });
+      windowListeners.hashchange();
+      windowObject.scrollY = 625;
+
+      windowObject.location.hash = '#files';
+      windowListeners.hashchange();
+      const filesScroll = windowObject.scrollY;
+      const historyFocus = documentObject.activeElement.id;
+      windowObject.location.hash = '#manage';
+      windowListeners.hashchange();
+      const manageScroll = windowObject.scrollY;
+      navigation.destroy();
+
+      JSON.stringify({
+        during,
+        after: windowObject.history.scrollRestoration,
+        filesScroll,
+        manageScroll,
+        historyFocus,
+      });
+    """))
+    assert result == {
+        "during": "manual",
+        "after": "auto",
+        "filesScroll": 375,
+        "manageScroll": 625,
+        "historyFocus": "stable-control",
     }
 
 
@@ -2081,7 +2091,7 @@ def test_library_contract_has_filters_batches_storage_and_timeline_location() ->
     assert 'id="gridViewBtn"' in html and 'aria-selected="true"' in html
     assert 'id="listViewBtn"' in html and 'aria-selected="false"' in html
     for token in ("/api/files?", "/api/files/batch-download", "/api/messages/batch-delete",
-                  "navigator.clipboard.writeText", "timeline.focusMessage", "/api/storage"):
+                  "navigator.clipboard.writeText", "timeline.ensureMessageLoaded", "onLocate", "/api/storage"):
         assert token in source
 
 

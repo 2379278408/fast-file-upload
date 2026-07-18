@@ -1,6 +1,6 @@
 import { UNDO_WINDOW_MS, TOAST_DURATION_MS } from './config.js';
 
-export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
+export function createLibrary({ root, api, timeline, onAttach = () => {}, onLocate = () => {} }) {
   const fileListEl = root.querySelector('#fileList');
   const libraryCountEl = root.querySelector('#libraryCount');
   const imageCountEl = root.querySelector('#imageCount');
@@ -247,20 +247,13 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
 
   async function openMessage(messageId) {
     if (destroyed || !timeline) return;
-    if (typeof timeline.focusMessage === 'function') {
-      const found = timeline.focusMessage(messageId);
-      if (!found && typeof timeline.ensureMessageLoaded === 'function') {
-        await timeline.ensureMessageLoaded(messageId);
-        if (destroyed) return;
-        timeline.focusMessage(messageId);
-      } else if (!found && typeof timeline.loadUntil === 'function') {
-        await timeline.loadUntil(messageId, { focus: false });
-        if (destroyed) return;
-        timeline.focusMessage(messageId);
-      }
+    if (typeof timeline.ensureMessageLoaded === 'function') {
+      await timeline.ensureMessageLoaded(messageId);
+    } else if (typeof timeline.loadUntil === 'function') {
+      await timeline.loadUntil(messageId, { focus: false });
     }
     if (destroyed) return;
-    location.hash = `message-${encodeURIComponent(messageId)}`;
+    await onLocate(messageId);
   }
 
   function getMessage(messageId) {

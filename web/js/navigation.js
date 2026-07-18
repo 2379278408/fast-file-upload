@@ -13,7 +13,10 @@ export function createNavigation({ windowObject, documentObject, onRouteChange =
   let currentRoute = null;
   const scrollPositions = new Map();
   const buttonHandlers = new Map();
-  let focusNextRoute = false;
+  const pendingRouteApplications = [];
+  let focusNextRoute = null;
+  let originalScrollRestoration = null;
+  let managesScrollRestoration = false;
   let started = false;
 
   function applyRoute(route) {
@@ -35,9 +38,14 @@ export function createNavigation({ windowObject, documentObject, onRouteChange =
     currentRoute = normalized;
     onRouteChange(normalized);
     windowObject.scrollTo(0, scrollPositions.get(normalized) || 0);
-    if (focusNextRoute) {
+    if (focusNextRoute === normalized) {
       documentObject.querySelector(`[data-route-heading="${normalized}"]`)?.focus({ preventScroll: true });
-      focusNextRoute = false;
+      focusNextRoute = null;
+    }
+    const completed = pendingRouteApplications.filter(item => item.route === normalized);
+    for (const item of completed) item.resolve();
+    for (let index = pendingRouteApplications.length - 1; index >= 0; index -= 1) {
+      if (pendingRouteApplications[index].route === normalized) pendingRouteApplications.splice(index, 1);
     }
   }
 
@@ -45,16 +53,24 @@ export function createNavigation({ windowObject, documentObject, onRouteChange =
     applyRoute(normalizeRoute(windowObject.location.hash));
   }
 
-  function navigate(route) {
+  function navigate(route, { focus = true } = {}) {
     const normalized = normalizeRoute(`#${route}`);
-    focusNextRoute = true;
-    if (windowObject.location.hash === ROUTES[normalized].hash) applyRoute(normalized);
-    else windowObject.location.hash = ROUTES[normalized].hash;
+    focusNextRoute = focus ? normalized : null;
+    return new Promise(resolve => {
+      pendingRouteApplications.push({ route: normalized, resolve });
+      if (windowObject.location.hash === ROUTES[normalized].hash) applyRoute(normalized);
+      else windowObject.location.hash = ROUTES[normalized].hash;
+    });
   }
 
   function start() {
     if (started) return;
     started = true;
+    if ('scrollRestoration' in windowObject.history) {
+      originalScrollRestoration = windowObject.history.scrollRestoration;
+      windowObject.history.scrollRestoration = 'manual';
+      managesScrollRestoration = true;
+    }
     documentObject.querySelectorAll('[data-route]').forEach(button => {
       const handleClick = () => navigate(button.dataset.route);
       buttonHandlers.set(button, handleClick);
@@ -75,7 +91,13 @@ export function createNavigation({ windowObject, documentObject, onRouteChange =
     });
     buttonHandlers.clear();
     windowObject.removeEventListener('hashchange', handleHashChange);
-    focusNextRoute = false;
+    focusNextRoute = null;
+    for (const item of pendingRouteApplications.splice(0)) item.resolve();
+    if (managesScrollRestoration) {
+      windowObject.history.scrollRestoration = originalScrollRestoration;
+      managesScrollRestoration = false;
+      originalScrollRestoration = null;
+    }
     started = false;
   }
 
