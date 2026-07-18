@@ -798,6 +798,26 @@ def test_app_starts_navigation_and_clears_file_selection_on_route_exit() -> None
     assert "createNavigation" in source
     assert "navigation.start()" in source
     assert "route !== 'files'" in source
+    assert "library.clearSelection?.()" in source
+
+
+def test_batch_toolbar_cannot_intercept_pointer_events_while_inactive() -> None:
+    css = read_web("styles.css")
+    base = css[css.index(".batch-toolbar {"):css.index(".batch-toolbar.visible {")]
+    visible = css[
+        css.index(".batch-toolbar.visible {"):css.index(".batch-toolbar .pill")
+    ]
+    assert "visibility: hidden" in base
+    assert "pointer-events: none" in base
+    assert "visibility: visible" in visible
+    assert "pointer-events: auto" in visible
+
+
+def test_files_empty_state_has_transfer_action() -> None:
+    source = read_web("js/library.js")
+    assert 'id="emptyFilesAction"' in source
+    assert 'data-file-action="empty-attach"' in source
+    assert "onAttach" in source
 
 
 def test_skip_link_preserves_application_route_hash() -> None:

@@ -2157,6 +2157,8 @@
             left: calc(228px + (100vw - 228px) / 2);
             bottom: 22px;
             display: flex;
+            visibility: hidden;
+            pointer-events: none;
             align-items: center;
             gap: 8px;
             padding: 7px;
@@ -2172,6 +2174,8 @@
         }
 
         .batch-toolbar.visible {
+            visibility: visible;
+            pointer-events: auto;
             transform: translate(-50%, 0);
             opacity: 1;
         }

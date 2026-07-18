@@ -1,6 +1,6 @@
 import { UNDO_WINDOW_MS, TOAST_DURATION_MS } from './config.js';
 
-export function createLibrary({ root, api, timeline }) {
+export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
   const fileListEl = root.querySelector('#fileList');
   const libraryCountEl = root.querySelector('#libraryCount');
   const imageCountEl = root.querySelector('#imageCount');
@@ -194,15 +194,19 @@ export function createLibrary({ root, api, timeline }) {
   }
 
   async function handleFileAction(event) {
-    const button = event.target.closest('[data-file-action]');
-    if (!button) return;
-    const message = getMessage(button.dataset.messageId);
+    const action = event.target.closest('[data-file-action]');
+    if (!action) return;
+    if (action.dataset.fileAction === 'empty-attach') {
+      onAttach();
+      return;
+    }
+    const message = getMessage(action.dataset.messageId);
     if (!message) return;
-    const action = button.dataset.fileAction;
-    if (action === 'preview') openPreview(message, button);
-    if (action === 'copy') await copyLink(message);
-    if (action === 'delete') await deleteMessage(message);
-    if (action === 'locate') await openMessage(message.id);
+    const actionName = action.dataset.fileAction;
+    if (actionName === 'preview') openPreview(message, action);
+    if (actionName === 'copy') await copyLink(message);
+    if (actionName === 'delete') await deleteMessage(message);
+    if (actionName === 'locate') await openMessage(message.id);
   }
 
   function openPreview(message, trigger) {
@@ -589,7 +593,14 @@ export function createLibrary({ root, api, timeline }) {
 
     if (!items.length) {
       fileListEl.className = 'file-list grid-mode';
-      fileListEl.innerHTML = '<div class="empty"><div><strong>还没有文件</strong><p>把文件拖进上传区，完成后会显示在这里。</p></div></div>';
+      fileListEl.innerHTML = `
+        <div class="empty">
+          <div>
+            <strong>还没有文件</strong>
+            <p>选择文件后，它会显示在这里。</p>
+            <button class="btn btn-primary" id="emptyFilesAction" type="button" data-file-action="empty-attach">选择文件</button>
+          </div>
+        </div>`;
       return;
     }
 

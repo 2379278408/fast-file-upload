@@ -338,6 +338,10 @@ const library = createLibrary({
   root: document.getElementById('libraryView'),
   api: (url, options) => apiRequest(url, options),
   timeline,
+  onAttach() {
+    navigation.navigate('transfer');
+    composerFileInput?.click();
+  },
 });
 
 if (composerAttachBtn && composerFileInput) {
@@ -647,7 +651,7 @@ const navigation = createNavigation({
   documentObject: document,
   onRouteChange(route) {
     if (route !== 'files') {
-      document.getElementById('clearSelectionBtn')?.click();
+      library.clearSelection?.();
     }
   },
 });
