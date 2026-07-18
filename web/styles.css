@@ -17,7 +17,7 @@
             --signal-soft: oklch(95% 0.035 170);
             --danger: oklch(54% 0.19 27);
             --danger-soft: oklch(96% 0.026 27);
-            --shadow-float-float: 0 22px 60px oklch(25% 0.04 258 / .16);
+            --shadow-float: 0 22px 60px oklch(25% 0.04 258 / .16);
             --font-display: "Outfit", "Avenir Next", -apple-system, BlinkMacSystemFont, sans-serif;
             --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             --font-mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
@@ -45,7 +45,7 @@
             --signal-soft: oklch(29% 0.05 170);
             --danger: oklch(70% 0.15 27);
             --danger-soft: oklch(29% 0.05 27);
-            --shadow-float-float: 0 22px 60px oklch(5% 0.02 258 / .45);
+            --shadow-float: 0 22px 60px oklch(5% 0.02 258 / .45);
         }
 
         * { box-sizing: border-box; }
@@ -436,13 +436,6 @@
             padding: 0;
         }
 
-        .timeline-panel {
-            padding: 0;
-            display: flex;
-            flex-direction: column;
-            max-height: 70vh;
-        }
-
         .timeline-panel .panel-head {
             flex-shrink: 0;
         }
@@ -479,88 +472,6 @@
             line-height: 1.55;
         }
 
-        .dropzone {
-            position: relative;
-            overflow: hidden;
-            border-radius: 22px;
-            background:
-                radial-gradient(circle at 16% 16%, rgba(32, 89, 235, 0.13), transparent 28%),
-                linear-gradient(135deg, #fbfdff 0%, #f3f7ff 58%, #eef4ff 100%);
-            border: 1px solid rgba(32, 89, 235, 0.18);
-            padding: 24px;
-            min-height: 236px;
-            cursor: pointer;
-            transition: transform 180ms ease, border-color 180ms ease, box-shadow 180ms ease;
-        }
-
-        .dropzone::before {
-            content: "";
-            position: absolute;
-            inset: 12px;
-            border: 1px dashed rgba(32, 89, 235, 0.22);
-            border-radius: 18px;
-            pointer-events: none;
-        }
-
-        .dark .dropzone {
-            background:
-                radial-gradient(circle at 16% 16%, rgba(77, 122, 247, 0.1), transparent 28%),
-                linear-gradient(135deg, #1a2035 0%, #151a28 58%, #111827 100%);
-            border-color: rgba(77, 122, 247, 0.2);
-        }
-
-        .dark .dropzone::before {
-            border-color: rgba(77, 122, 247, 0.18);
-        }
-
-        .dropzone.dragover {
-            transform: translateY(-2px);
-            border-color: rgba(32, 89, 235, 0.5);
-            box-shadow: inset 0 0 0 1px rgba(32, 89, 235, 0.12);
-        }
-
-        .dropzone input { display: none; }
-
-        .drop-inner {
-            display: grid;
-            align-content: center;
-            justify-items: start;
-            min-height: 180px;
-            gap: 14px;
-        }
-
-        .drop-icon {
-            width: 60px;
-            height: 60px;
-            border-radius: 18px;
-            display: grid;
-            place-items: center;
-            background: linear-gradient(135deg, #172033, #2059eb);
-            color: white;
-            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.16);
-        }
-
-        .drop-icon svg { width: 30px; height: 30px; }
-
-        .dark .drop-icon {
-            background: linear-gradient(135deg, #1a2035, #4d7af7);
-        }
-
-        .drop-copy h3 {
-            margin: 0 0 8px;
-            font-family: "Outfit", "Segoe UI", sans-serif;
-            font-size: clamp(1.45rem, 2.5vw, 2rem);
-            line-height: 1.05;
-            letter-spacing: 0;
-        }
-
-        .drop-copy p {
-            margin: 0;
-            max-width: 38ch;
-            color: var(--muted);
-            line-height: 1.6;
-        }
-
         .btn {
             display: inline-flex;
             align-items: center;
@@ -583,7 +494,7 @@
         }
 
         .btn-primary { background: var(--accent); color: white; }
-        .btn-soft { background: rgba(255,255,255,0.84); border-color: var(--border); color: var(--fg); }
+        .btn-soft { background: var(--surface-soft); border-color: var(--border); color: var(--fg); }
         .btn-danger { background: rgba(189, 62, 54, 0.1); color: var(--danger); }
         .btn-plain { background: transparent; color: var(--muted); border-color: var(--border); }
 
@@ -1726,16 +1637,10 @@
         }
 
         @media (max-width: 430px) {
-                flex-basis: 100%;
-            }
-
-            .filter-grid {
-                grid-template-columns: 1fr 1fr;
-            }
-
-            .library-actions {
-                flex-wrap: wrap;
-            }
+            .health { flex-wrap: wrap; gap: 10px; }
+            .health-item { flex-basis: 100%; }
+            .filter-grid { grid-template-columns: 1fr 1fr; }
+            .library-actions { flex-wrap: wrap; }
         }
 
         .session-overlay {
@@ -1797,6 +1702,7 @@
             padding: 20px;
             display: grid;
             gap: 14px;
+            max-height: 70vh;
         }
 
         .composer-form {
@@ -1985,20 +1891,6 @@
             margin-left: auto;
         }
 
-        .timeline-message-actions {
-            margin-top: 8px;
-            display: flex;
-            gap: 8px;
-        }
-
-        .timeline-copy-btn,
-        .timeline-delete-btn,
-        .timeline-undo-btn {
-            min-height: 32px;
-            padding: 0 10px;
-            font-size: 12px;
-        }
-
         .timeline-undo {
             display: flex;
             align-items: center;
@@ -2025,38 +1917,6 @@
 
         .timeline-sentinel {
             height: 1px;
-        }
-
-        /* Dark mode toggle */
-        .theme-toggle {
-            min-height: 36px;
-            padding: 0 10px;
-            border-radius: 999px;
-            border: 1px solid var(--border);
-            background: rgba(255,255,255,0.76);
-            color: var(--muted);
-            cursor: pointer;
-            font-size: 13px;
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            transition: background 160ms ease, color 160ms ease;
-        }
-
-        .dark .theme-toggle {
-            background: rgba(255,255,255,0.08);
-            color: var(--fg);
-            border-color: var(--border-strong);
-        }
-
-        .theme-toggle:hover {
-            color: var(--accent);
-            border-color: var(--accent);
-        }
-
-        .theme-toggle svg {
-            width: 16px;
-            height: 16px;
         }
 
         /* Timeline message hover actions */

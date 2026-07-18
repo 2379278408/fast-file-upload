@@ -1,6 +1,14 @@
 import { sendText, uploadFile } from './api.js';
 import { MAX_TEXT_LENGTH, TOAST_DURATION_MS } from './config.js';
 
+function generateUUID() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+
 export function createComposer({ form, textarea, fileInput, dropTarget, queue, api, timeline }) {
   const uploadTasks = [];
   let processing = false;
@@ -23,7 +31,7 @@ export function createComposer({ form, textarea, fileInput, dropTarget, queue, a
     if (!text.trim()) return;
     if (text.length > MAX_TEXT_LENGTH) return showComposerError('文本最多 10,000 个字符');
     try {
-      const message = await sendText(text, crypto.randomUUID());
+      const message = await sendText(text, generateUUID());
       textarea.value = '';
       timeline.upsert(message);
     } catch (error) {
@@ -45,13 +53,13 @@ export function createComposer({ form, textarea, fileInput, dropTarget, queue, a
 
   function createTask(file) {
     return {
-      id: crypto.randomUUID(),
+      id: generateUUID(),
       file,
       status: 'queued',
       progress: 0,
       error: null,
       controller: new AbortController(),
-      clientRequestId: crypto.randomUUID(),
+      clientRequestId: generateUUID(),
     };
   }
 
@@ -184,21 +192,30 @@ export function createComposer({ form, textarea, fileInput, dropTarget, queue, a
 
   // Drag and drop on drop target
   if (dropTarget) {
-    ['dragenter', 'dragover'].forEach(name => {
-      dropTarget.addEventListener(name, event => {
-        event.preventDefault();
-        dropTarget.classList.add('dragover');
-      });
+    let dragCounter = 0;
+    dropTarget.addEventListener('dragenter', event => {
+      event.preventDefault();
+      dragCounter++;
+      dropTarget.classList.add('dragover');
     });
 
-    ['dragleave', 'drop'].forEach(name => {
-      dropTarget.addEventListener(name, event => {
-        event.preventDefault();
+    dropTarget.addEventListener('dragover', event => {
+      event.preventDefault();
+    });
+
+    dropTarget.addEventListener('dragleave', event => {
+      event.preventDefault();
+      dragCounter--;
+      if (dragCounter <= 0) {
+        dragCounter = 0;
         dropTarget.classList.remove('dragover');
-      });
+      }
     });
 
     dropTarget.addEventListener('drop', event => {
+      event.preventDefault();
+      dragCounter = 0;
+      dropTarget.classList.remove('dragover');
       enqueueFiles(Array.from(event.dataTransfer.files));
     });
   }
@@ -228,10 +245,10 @@ export function createComposer({ form, textarea, fileInput, dropTarget, queue, a
   };
 }
 
+const _escDiv = document.createElement('div');
 function escapeHtml(value) {
-  const div = document.createElement('div');
-  div.textContent = value || '';
-  return div.innerHTML;
+  _escDiv.textContent = value || '';
+  return _escDiv.innerHTML;
 }
 
 function formatBytes(size) {

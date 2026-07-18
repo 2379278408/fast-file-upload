@@ -63,10 +63,10 @@ export function createTimeline({ container, newMessageButton, api, onRestore }) 
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   }
 
+  const _escSpan = document.createElement('span');
   function escapeHtml(value) {
-    const el = document.createElement('span');
-    el.textContent = value || '';
-    return el.innerHTML;
+    _escSpan.textContent = value || '';
+    return _escSpan.innerHTML;
   }
 
   function appendTextWithLinks(node, body) {
@@ -312,6 +312,9 @@ export function createTimeline({ container, newMessageButton, api, onRestore }) 
         const msg = { ...payload, id: event.entity_id };
         messages.set(event.entity_id, msg);
         if (container) {
+          const undoNotice = container.querySelector(`.timeline-undo[data-undo-message-id="${event.entity_id}"]`);
+          if (undoNotice) undoNotice.remove();
+
           const existing = container.querySelector(`[data-message-id="${event.entity_id}"]`);
           if (existing) {
             const replacement = renderMessage(msg);
@@ -436,7 +439,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore }) 
         }
         return true;
       } catch {
-        // silent fail for paging
+        window.dispatchEvent(new CustomEvent('timeline-error', { detail: { message: '加载历史消息失败，请稍后重试。' } }));
         return false;
       } finally {
         loading = false;

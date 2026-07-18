@@ -240,6 +240,22 @@ export function createLibrary({ root, api, timeline }) {
     previewModal.hidden = false;
     previewModal.classList.add('open');
     if (closePreviewBtn) closePreviewBtn.focus();
+    document.addEventListener('keydown', trapPreviewFocus);
+  }
+
+  function trapPreviewFocus(event) {
+    if (event.key !== 'Tab' || !previewModal || previewModal.hidden) return;
+    const focusable = previewModal.querySelectorAll('button:not([hidden]), a[href]:not([hidden]), [tabindex]:not([tabindex="-1"])');
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
   }
 
   function closePreview() {
@@ -248,6 +264,7 @@ export function createLibrary({ root, api, timeline }) {
     previewModal.classList.remove('open');
     if (previewImage) previewImage.removeAttribute('src');
     currentPreview = null;
+    document.removeEventListener('keydown', trapPreviewFocus);
     if (lastPreviewTrigger) lastPreviewTrigger.focus();
     lastPreviewTrigger = null;
   }
@@ -649,7 +666,7 @@ export function createLibrary({ root, api, timeline }) {
         <div class="card-body">
           <div class="card-top">
             <label class="select-line">
-              <input type="checkbox" data-select-message="${escapeAttr(message.id)}" ${selectedIds.has(message.id) ? 'checked' : ''}>
+              <input type="checkbox" data-select-message="${escapeAttr(message.id)}" ${selectedIds.has(message.id) ? 'checked' : ''} aria-label="选择 ${escapeAttr(file.name)}">
               选择文件
             </label>
             <div class="file-tag">${escapeHtml(file.is_previewable ? 'image' : (file.extension || 'file').replace('.', '') || 'file')}</div>
@@ -701,10 +718,10 @@ export function createLibrary({ root, api, timeline }) {
     return value ? `${value.slice(0, 10)}...` : '-';
   }
 
+  const _escDiv = document.createElement('div');
   function escapeHtml(value) {
-    const div = document.createElement('div');
-    div.textContent = value || '';
-    return div.innerHTML;
+    _escDiv.textContent = value || '';
+    return _escDiv.innerHTML;
   }
 
   function escapeAttr(value) {

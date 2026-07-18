@@ -54,10 +54,18 @@ export async function restoreTimelinePosition(container, snapshot, timeline) {
 function getOrCreateDeviceId() {
   let id = localStorage.getItem(DEVICE_ID_KEY);
   if (!id) {
-    id = crypto.randomUUID();
+    id = generateUUID();
     localStorage.setItem(DEVICE_ID_KEY, id);
   }
   return id;
+}
+
+function generateUUID() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
 }
 
 function getDeviceName() {
@@ -399,30 +407,10 @@ async function loadOperations() {
   if (largestFilesList) largestFilesList.textContent = '同步中...';
   if (auditEventsList) auditEventsList.textContent = '同步中...';
   try {
-    const [summaryResponse, auditResponse] = await Promise.all([
-      fetch('/api/admin/summary', { credentials: 'same-origin' }),
-      fetch('/api/audit', { credentials: 'same-origin' })
+    const [summary, audit] = await Promise.all([
+      apiRequest('/api/admin/summary'),
+      apiRequest('/api/audit')
     ]);
-    if (!summaryResponse.ok) {
-      if (summaryResponse.status === 401) {
-        window.dispatchEvent(new CustomEvent('session-expired'));
-        return;
-      }
-      const message = parseError(await summaryResponse.text(), '运营摘要读取失败');
-      renderOpsError(message);
-      return;
-    }
-    if (!auditResponse.ok) {
-      if (auditResponse.status === 401) {
-        window.dispatchEvent(new CustomEvent('session-expired'));
-        return;
-      }
-      const message = parseError(await auditResponse.text(), '审计日志读取失败');
-      renderOpsError(message);
-      return;
-    }
-    const summary = await summaryResponse.json();
-    const audit = await auditResponse.json();
     renderOperations(summary, audit.events || []);
   } catch (error) {
     renderOpsError('运营视图读取失败，请检查服务状态。');
@@ -519,10 +507,10 @@ function formatAuditTime(value) {
   return date.toLocaleString('zh-CN', { hour12: false });
 }
 
+const _escDiv = document.createElement('div');
 function escapeHtml(value) {
-  const div = document.createElement('div');
-  div.textContent = value || '';
-  return div.innerHTML;
+  _escDiv.textContent = value || '';
+  return _escDiv.innerHTML;
 }
 
 function escapeAttr(value) {
@@ -600,6 +588,10 @@ function startEventConnection() {
     onStatus: updateConnectionStatus,
   });
 }
+
+window.addEventListener('timeline-error', (event) => {
+  showToast(event.detail?.message || '操作失败', 'error');
+});
 
 // Dark mode toggle
 const themeToggle = document.getElementById('themeToggle');
