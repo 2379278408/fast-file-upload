@@ -574,6 +574,44 @@ def test_mobile_fixed_elements_share_offset_and_430_rule_is_single() -> None:
     assert "bottom: var(--mobile-fixed-offset)" in css
 
 
+def test_mobile_batch_toolbar_effective_bottom_respects_cascade_order() -> None:
+    css = read_web("styles.css")
+
+    def effective_bottom(stylesheet: str) -> str:
+        declarations: list[tuple[tuple[int, int, int], int, str]] = []
+        for rule_match in re.finditer(r"([^{}]+)\{([^{}]*)\}", stylesheet):
+            selectors, body = rule_match.groups()
+            bottom_match = re.search(r"(?:^|;)\s*bottom\s*:\s*([^;]+)", body)
+            if not bottom_match:
+                continue
+            for raw_selector in selectors.split(","):
+                selector = re.sub(r"/\*.*?\*/", "", raw_selector, flags=re.S).strip()
+                if selector != ".batch-toolbar":
+                    continue
+                specificity = (
+                    selector.count("#"),
+                    selector.count(".") + selector.count("["),
+                    0,
+                )
+                declarations.append((specificity, rule_match.start(), bottom_match.group(1).strip()))
+        assert declarations, "missing .batch-toolbar bottom declaration"
+        return max(declarations, key=lambda item: (item[0], item[1]))[2]
+
+    def assert_safe_mobile_bottom(stylesheet: str) -> None:
+        assert effective_bottom(stylesheet) == "var(--mobile-fixed-offset)"
+
+    assert_safe_mobile_bottom(css)
+
+    late_rule = css.rindex(".batch-toolbar {")
+    broken_css = css[:late_rule] + css[late_rule:].replace(
+        "position: fixed;",
+        "position: fixed;\n            bottom: 22px;",
+        1,
+    )
+    with pytest.raises(AssertionError):
+        assert_safe_mobile_bottom(broken_css)
+
+
 def test_manage_mobile_grid_active_nav_and_reduced_motion_contract() -> None:
     css = read_web("styles.css")
     mobile = css[css.index("@media (max-width: 720px)"):css.index("@media (max-width: 430px)")]

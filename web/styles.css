@@ -1450,6 +1450,8 @@
         .toast.error { background: var(--danger); }
         .toast.info { background: #2d5cb7; }
 
+        .batch-toolbar { bottom: 22px; }
+
         /* Preview drawer */
         .drawer-backdrop {
             position: fixed;
@@ -2171,7 +2173,6 @@
         .batch-toolbar {
             position: fixed;
             left: calc(228px + (100vw - 228px) / 2);
-            bottom: 22px;
             display: flex;
             visibility: hidden;
             pointer-events: none;
