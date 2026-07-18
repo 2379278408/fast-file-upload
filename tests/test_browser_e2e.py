@@ -32,6 +32,11 @@ REQUIRED_CSP_DIRECTIVES = {
     "base-uri": {"'self'"},
     "frame-ancestors": {"'none'"},
 }
+ROUTE_TITLES = {
+    "transfer": "传输工作台",
+    "files": "全部文件",
+    "manage": "管理与设置",
+}
 
 
 @dataclass(slots=True)
@@ -296,6 +301,50 @@ def _assert_no_horizontal_overflow(page: Page) -> None:
     )
 
 
+def _create_seed_session(session: BrowserSession, device_id: str) -> None:
+    response = session.context.request.post(
+        f"{session.base_url}/api/session",
+        data={
+            "access_token": UPLOAD_TOKEN,
+            "device_id": device_id,
+            "device_name": "Playwright seed",
+        },
+    )
+    assert response.ok
+
+
+def _assert_route_state(page: Page, route: str, visible_nav: str) -> None:
+    title = ROUTE_TITLES[route]
+    assert page.evaluate("location.hash") == f"#{route}"
+    expect(page.locator(f'#{route}Page')).to_be_visible()
+    for other_route in ROUTE_TITLES.keys() - {route}:
+        expect(page.locator(f'#{other_route}Page')).to_be_hidden()
+    expect(page).to_have_title(f"{title} · MonkeyCode")
+    expect(page.locator("[data-route-title]")).to_have_text(title)
+    expect(page.locator(f'[data-route-heading="{route}"]')).to_be_focused()
+
+    hidden_nav = ".mobile-nav" if visible_nav == ".sidebar" else ".sidebar"
+    expect(page.locator(f'{visible_nav} [data-route="{route}"]')).to_be_visible()
+    expect(page.locator(f'{hidden_nav} [data-route="{route}"]')).to_be_hidden()
+    for nav_selector in (".sidebar", ".mobile-nav"):
+        for candidate_route in ROUTE_TITLES:
+            button = page.locator(
+                f'{nav_selector} [data-route="{candidate_route}"]'
+            )
+            state = button.evaluate(
+                """
+                element => ({
+                  active: element.classList.contains('active'),
+                  ariaCurrent: element.getAttribute('aria-current'),
+                })
+                """
+            )
+            assert state == {
+                "active": candidate_route == route,
+                "ariaCurrent": "page" if candidate_route == route else None,
+            }
+
+
 def test_live_server_retries_an_occupied_first_port(tmp_path: Path) -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as blocker:
         blocker.bind(("127.0.0.1", 0))
@@ -507,6 +556,18 @@ def test_three_route_navigation_history_focus_and_viewport_safety(
 ) -> None:
     page = browser_session.page
     page.set_viewport_size(viewport)
+    if viewport == {"width": 390, "height": 568}:
+        _create_seed_session(browser_session, "playwright-compact-seed")
+        for index in range(18):
+            response = browser_session.context.request.post(
+                f"{browser_session.base_url}/api/messages",
+                data={
+                    "body": f"compact-seed-{index:02d}",
+                    "client_request_id": f"compact-seed-{index:02d}",
+                },
+            )
+            assert response.ok
+        browser_session.context.clear_cookies()
     _open_locked_application(browser_session)
     _unlock(page)
 
@@ -515,45 +576,69 @@ def test_three_route_navigation_history_focus_and_viewport_safety(
     _assert_no_horizontal_overflow(page)
 
     page.locator(f'{nav_selector} [data-route="transfer"]').click()
-    expect(page.locator('[data-route-heading="transfer"]')).to_be_focused()
-    expect(page).to_have_title("传输工作台 · MonkeyCode")
+    _assert_route_state(page, "transfer", nav_selector)
 
     page.locator(f'{nav_selector} [data-route="files"]').click()
-    expect(page.locator("#filesPage")).to_be_visible()
-    expect(page.locator('[data-route-heading="files"]')).to_be_focused()
-    expect(page).to_have_title("全部文件 · MonkeyCode")
-    assert page.evaluate("location.hash") == "#files"
+    _assert_route_state(page, "files", nav_selector)
     _assert_no_horizontal_overflow(page)
 
     assert page.locator("#batchToolbar").evaluate(
         "element => getComputedStyle(element).pointerEvents"
     ) == "none"
     page.locator(f'{nav_selector} [data-route="manage"]').click()
-    expect(page.locator("#managePage")).to_be_visible()
-    expect(page.locator('[data-route-heading="manage"]')).to_be_focused()
-    expect(page).to_have_title("管理与设置 · MonkeyCode")
-    assert page.evaluate("location.hash") == "#manage"
+    _assert_route_state(page, "manage", nav_selector)
     _assert_no_horizontal_overflow(page)
 
     page.go_back()
-    expect(page.locator("#filesPage")).to_be_visible()
-    assert page.evaluate("location.hash") == "#files"
+    _assert_route_state(page, "files", nav_selector)
     page.go_forward()
-    expect(page.locator("#managePage")).to_be_visible()
-    assert page.evaluate("location.hash") == "#manage"
+    _assert_route_state(page, "manage", nav_selector)
 
     page.locator(f'{nav_selector} [data-route="transfer"]').click()
-    expect(page.locator("#transferPage")).to_be_visible()
-    expect(page.locator('[data-route-heading="transfer"]')).to_be_focused()
+    _assert_route_state(page, "transfer", nav_selector)
     _assert_no_horizontal_overflow(page)
 
     if nav_selector == ".mobile-nav":
         composer = page.locator("#composerPanel")
         mobile_nav = page.locator(".mobile-nav")
+        if viewport["height"] == 568:
+            timeline = page.locator("#timelineContainer")
+            timeline.evaluate("element => element.scrollIntoView({ block: 'start' })")
+            expect(timeline).to_be_visible()
+            timeline_metrics = timeline.evaluate(
+                """
+                element => {
+                  const rect = element.getBoundingClientRect();
+                  const style = getComputedStyle(element);
+                  return {
+                    top: rect.top,
+                    bottom: rect.bottom,
+                    height: rect.height,
+                    clientHeight: element.clientHeight,
+                    scrollHeight: element.scrollHeight,
+                    overflowY: style.overflowY,
+                  };
+                }
+                """
+            )
+            composer_top = composer.evaluate(
+                "element => element.getBoundingClientRect().top"
+            )
+            mobile_nav_top = mobile_nav.evaluate(
+                "element => element.getBoundingClientRect().top"
+            )
+            assert timeline_metrics["height"] >= 120
+            assert timeline_metrics["scrollHeight"] > timeline_metrics["clientHeight"]
+            assert timeline_metrics["overflowY"] == "auto"
+            assert timeline_metrics["top"] >= 0
+            assert timeline_metrics["bottom"] <= composer_top
+            assert timeline_metrics["bottom"] <= mobile_nav_top
+
         composer.evaluate("element => element.scrollIntoView({ block: 'end' })")
         composer_box = composer.bounding_box()
         mobile_nav_box = mobile_nav.bounding_box()
         assert composer_box is not None and mobile_nav_box is not None
+        assert composer_box["y"] >= 0
         assert composer_box["y"] + composer_box["height"] <= mobile_nav_box["y"]
 
     _assert_browser_clean(browser_session)
@@ -579,6 +664,54 @@ def test_empty_files_action_returns_to_transfer_and_opens_picker(
     _assert_browser_clean(browser_session)
 
 
+def test_mobile_batch_toolbar_selection_clear_and_route_exit(
+    browser_session: BrowserSession,
+) -> None:
+    page = browser_session.page
+    page.set_viewport_size({"width": 390, "height": 568})
+    _create_seed_session(browser_session, "playwright-batch-seed")
+    upload = browser_session.context.request.post(
+        f"{browser_session.base_url}/api/upload",
+        multipart={
+            "client_request_id": "browser-batch-upload",
+            "file": {
+                "name": "browser-batch.txt",
+                "mimeType": "text/plain",
+                "buffer": b"browser batch toolbar",
+            },
+        },
+    )
+    assert upload.ok
+    browser_session.context.clear_cookies()
+
+    _open_locked_application(browser_session)
+    _unlock(page)
+    page.locator('.mobile-nav [data-route="files"]').click()
+    checkbox = page.locator("[data-select-message]").first
+    expect(checkbox).to_be_visible()
+    checkbox.check()
+
+    toolbar = page.locator("#batchToolbar")
+    expect(toolbar).to_have_class("batch-toolbar visible")
+    assert toolbar.evaluate("element => getComputedStyle(element).visibility") == "visible"
+    assert toolbar.evaluate("element => getComputedStyle(element).pointerEvents") == "auto"
+
+    page.locator("#batchToolbarClear").click()
+    expect(checkbox).not_to_be_checked()
+    expect(toolbar).to_have_class("batch-toolbar")
+    assert toolbar.evaluate("element => getComputedStyle(element).visibility") == "hidden"
+    assert toolbar.evaluate("element => getComputedStyle(element).pointerEvents") == "none"
+
+    checkbox.check()
+    expect(toolbar).to_have_class("batch-toolbar visible")
+    page.locator('.mobile-nav [data-route="manage"]').click()
+    _assert_route_state(page, "manage", ".mobile-nav")
+    expect(toolbar).to_have_class("batch-toolbar")
+    assert toolbar.evaluate("element => getComputedStyle(element).visibility") == "hidden"
+    assert toolbar.evaluate("element => getComputedStyle(element).pointerEvents") == "none"
+    _assert_browser_clean(browser_session)
+
+
 def test_old_page_anchor_restoration_has_no_smooth_drift_and_focuses_fallback(
     browser_session: BrowserSession,
 ) -> None:
@@ -594,7 +727,6 @@ def test_old_page_anchor_restoration_has_no_smooth_drift_and_focuses_fallback(
         },
     )
     assert session_response.ok
-    seeded_messages = []
     for index in range(60):
         response = context.request.post(
             f"{browser_session.base_url}/api/messages",
@@ -604,7 +736,17 @@ def test_old_page_anchor_restoration_has_no_smooth_drift_and_focuses_fallback(
             },
         )
         assert response.ok
-        seeded_messages.append(response.json())
+    first_page = context.request.get(
+        f"{browser_session.base_url}/api/messages?limit=50"
+    )
+    assert first_page.ok
+    next_before = first_page.json()["next_before"]
+    assert next_before
+    older_page = context.request.get(
+        f"{browser_session.base_url}/api/messages?limit=50&before={next_before}"
+    )
+    assert older_page.ok
+    anchor_id = older_page.json()["items"][0]["id"]
     context.clear_cookies()
 
     paged_requests: list[str] = []
@@ -617,16 +759,15 @@ def test_old_page_anchor_restoration_has_no_smooth_drift_and_focuses_fallback(
         ),
     )
     _open_locked_application(browser_session)
+    page.evaluate(
+        "localStorage.setItem('transfer-last-sequence', String(Number.MAX_SAFE_INTEGER))"
+    )
     _unlock(page)
 
-    anchor_id = seeded_messages[5]["id"]
     anchor = page.locator(f'[data-message-id="{anchor_id}"]')
     container = page.locator("#timelineContainer")
     container.evaluate("element => { element.scrollTop = 0; }")
     expect(anchor).to_be_attached(timeout=10_000)
-    request_deadline = time.monotonic() + 5.0
-    while not paged_requests and time.monotonic() < request_deadline:
-        page.wait_for_timeout(25)
     assert paged_requests
 
     snapshot = page.evaluate(
