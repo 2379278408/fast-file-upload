@@ -78,7 +78,6 @@
                 <div class="top-actions">
                     <span class="pill"><strong id="metricMode">公开</strong> 访问</span>
                     <span class="pill"><strong id="metricLimit">-</strong> 单文件</span>
-                    <span id="connectionStatus" class="pill" aria-live="polite">未连接</span>
                     <button class="button quiet" id="refreshHealthBtn" type="button">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 6v5h-5M4 18v-5h5"/><path d="M18.5 9A7 7 0 0 0 6 6.5L4 11M5.5 15A7 7 0 0 0 18 17.5l2-4.5"/></svg>
                         刷新状态
@@ -100,10 +99,34 @@
 
                 <section class="route-page transfer-page" id="transferPage" data-route-page="transfer">
                     <h1 class="route-heading visually-hidden" data-route-heading="transfer" tabindex="-1">传输工作台</h1>
-                    <div class="dashboard-grid">
-                        <div class="main-column">
+                    <div class="transfer-workspace">
+                        <header class="transfer-status" aria-label="传输状态">
+                            <div><span>当前设备</span><strong id="routeSource">本机</strong></div>
+                            <div class="route-link"><span>SHA-256</span></div>
+                            <div><span>目标设备</span><strong id="routeTarget">已连接设备</strong></div>
+                            <span id="connectionStatus" class="pill" aria-live="polite">未连接</span>
+                        </header>
+
+                        <!-- Timeline: recent activity -->
+                        <section class="panel timeline-panel" id="timelinePanel">
+                            <div class="panel-head">
+                                <div><h2>最近活动</h2><p>消息与文件时间线</p></div>
+                            </div>
+                            <div class="timeline-container" id="timelineContainer" tabindex="-1">
+                                <div class="timeline-empty" id="timelineEmpty">
+                                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                                    <strong>暂无消息</strong>
+                                    <p>在下方输入文字或上传文件开始传输</p>
+                                </div>
+                            </div>
+                            <button class="btn btn-primary timeline-new-btn" id="newMessageButton" type="button" hidden>
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
+                                新消息
+                            </button>
+                        </section>
+
                         <!-- Composer: text input + file upload -->
-                        <section class="panel transfer-panel" id="composerPanel">
+                        <section class="panel transfer-panel composer-dock" id="composerPanel">
                             <div class="panel-head">
                                 <div><h2>快速传输</h2><p>拖放文件，或从设备中选择。</p></div>
                                 <span class="mono-text">端到端校验</span>
@@ -119,11 +142,6 @@
                                     <span id="dropzone" class="visually-hidden">文件拖放区</span>
                                     <textarea class="composer-textarea" id="composerTextarea" placeholder="输入消息… (Enter 发送，Shift+Enter 换行)" rows="3" maxlength="10000"></textarea>
                                     <input type="file" id="composerFileInput" multiple hidden>
-                                    <div class="transfer-route" id="transferRoute" aria-label="传输路径">
-                                        <div class="route-node"><span>当前设备</span><strong id="routeSource">本机</strong></div>
-                                        <div class="route-link"><span>SHA-256</span></div>
-                                        <div class="route-node"><span>目标设备</span><strong id="routeTarget">已连接设备</strong></div>
-                                    </div>
                                     <div class="composer-actions">
                                         <button class="btn btn-soft btn-icon" type="button" id="composerAttachBtn">
                                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
@@ -139,27 +157,6 @@
                             </form>
                             <div class="composer-queue" id="composerQueue"></div>
                         </section>
-
-                        </div>
-                        <aside class="rail">
-                            <!-- Timeline: recent activity -->
-                            <section class="panel timeline-panel" id="timelinePanel">
-                                <div class="panel-head">
-                                    <div><h2>最近活动</h2><p>消息与文件时间线</p></div>
-                                </div>
-                                <div class="timeline-container" id="timelineContainer" tabindex="-1">
-                                    <div class="timeline-empty" id="timelineEmpty">
-                                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-                                        <strong>暂无消息</strong>
-                                        <p>在上方输入文字或上传文件开始传输</p>
-                                    </div>
-                                </div>
-                                <button class="btn btn-primary timeline-new-btn" id="newMessageButton" type="button" hidden>
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
-                                    新消息
-                                </button>
-                            </section>
-                        </aside>
                     </div>
                 </section>
 

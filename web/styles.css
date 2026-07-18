@@ -24,6 +24,8 @@
             --radius-xl: 14px;
             --radius-lg: 12px;
             --radius-md: 10px;
+            --topbar-height: 68px;
+            --mobile-fixed-offset: calc(74px + env(safe-area-inset-bottom));
             color-scheme: light dark;
         }
 
@@ -230,6 +232,50 @@
         .panel-head h2 { margin: 0; font-size: 18px; font-family: var(--font-display); letter-spacing: -.01em; }
 
         .transfer-panel { overflow: hidden; border-color: color-mix(in oklch, var(--accent) 18%, var(--border)); }
+
+        .transfer-workspace {
+            min-height: calc(100dvh - var(--topbar-height) - 60px);
+            display: grid;
+            grid-template-rows: auto minmax(320px, 1fr) auto;
+            gap: 14px;
+        }
+
+        .transfer-status {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .transfer-status > div:not(.route-link) {
+            min-width: 0;
+            padding: 9px 10px;
+            border: 1px solid var(--border);
+            border-radius: 9px;
+            background: var(--surface);
+        }
+
+        .transfer-status > div > span {
+            display: block;
+            color: var(--muted);
+            font-size: 10px;
+            letter-spacing: .02em;
+        }
+
+        .transfer-status > div > strong {
+            display: block;
+            overflow: hidden;
+            margin-top: 2px;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font: 500 11px/1.35 var(--font-mono);
+        }
+
+        .composer-dock {
+            position: sticky;
+            bottom: 16px;
+            z-index: 6;
+        }
 
         .mono-text { color: var(--muted); font: 11px/1.4 var(--font-mono); }
 
@@ -1550,6 +1596,7 @@
         }
 
         @media (max-width: 720px) {
+            :root { --topbar-height: 60px; }
             body { padding-bottom: 70px; }
             .app-shell { display: block; }
             .sidebar { display: none; }
@@ -1561,6 +1608,11 @@
             .health { width: 100%; justify-content: space-between; overflow-x: auto; }
             .rail { grid-template-columns: 1fr; }
             .rail .timeline-panel { grid-column: auto; }
+            .transfer-status { grid-template-columns: minmax(0, 1fr) auto; }
+            .transfer-status .route-link { display: none; }
+            .transfer-status > div:nth-of-type(3) { grid-column: 1; }
+            .transfer-status > .pill { grid-column: 2; grid-row: 1 / span 2; }
+            .composer-dock { bottom: var(--mobile-fixed-offset); }
             .panel { border-radius: 12px; }
             .library-tools { width: 100%; flex-wrap: wrap; }
             .search-wrap { flex-basis: 100%; }
@@ -1700,9 +1752,10 @@
 
         .timeline-panel {
             padding: 20px;
-            display: grid;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
             gap: 14px;
-            max-height: 70vh;
         }
 
         .composer-form {
@@ -1795,7 +1848,7 @@
             gap: 4px;
             max-height: none;
             flex: 1;
-            min-height: 0;
+            min-height: 280px;
             overflow-y: auto;
             scroll-behavior: auto;
             padding: 8px 0;

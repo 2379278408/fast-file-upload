@@ -542,6 +542,15 @@ def test_shell_has_three_matching_desktop_and_mobile_routes() -> None:
     assert 'data-route="devices"' not in html
 
 
+def test_transfer_page_is_timeline_first_and_composer_is_docked() -> None:
+    html = read_web("index.html")
+    transfer = html[html.index('id="transferPage"'):html.index('id="filesPage"')]
+    assert 'class="transfer-workspace"' in transfer
+    assert transfer.index('id="timelinePanel"') < transfer.index('id="composerPanel"')
+    assert 'class="panel transfer-panel composer-dock"' in transfer
+    assert 'class="transfer-status"' in transfer
+
+
 def test_shell_ids_are_unique_and_navigation_labels_match_route_hashes() -> None:
     parser = ShellContractParser()
     parser.feed(read_web("index.html"))
@@ -1416,7 +1425,7 @@ def test_composer_html_elements_exist(client: TestClient) -> None:
     for element_id in ("composerForm", "composerTextarea", "composerFileInput",
                        "composerDropTarget", "composerQueue"):
         assert f'id="{element_id}"' in html
-    assert 'class="panel transfer-panel"' in html
+    assert 'class="panel transfer-panel composer-dock"' in html
     assert 'Enter 发送，Shift+Enter 换行' in html
 
 
