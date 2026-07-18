@@ -129,6 +129,11 @@
                                     <span id="dropzone" class="visually-hidden">文件拖放区</span>
                                     <textarea class="composer-textarea" id="composerTextarea" placeholder="输入消息… (Enter 发送，Shift+Enter 换行)" rows="3" maxlength="10000"></textarea>
                                     <input type="file" id="composerFileInput" multiple hidden>
+                                    <div class="transfer-route" id="transferRoute" aria-label="传输路径">
+                                        <div class="route-node"><span>当前设备</span><strong id="routeSource">本机</strong></div>
+                                        <div class="route-link"><span>SHA-256</span></div>
+                                        <div class="route-node"><span>目标设备</span><strong id="routeTarget">已连接设备</strong></div>
+                                    </div>
                                     <div class="composer-actions">
                                         <button class="btn btn-soft btn-icon" type="button" id="composerAttachBtn">
                                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
@@ -190,7 +195,7 @@
                             <div class="control-row">
                                 <div class="view-switch" role="tablist" aria-label="文件视图切换">
                                     <button class="view-chip active" id="gridViewBtn" data-view="grid" type="button" role="tab" aria-selected="true" aria-controls="fileList" tabindex="0">卡片</button>
-                                    <button class="view-chip" id="listViewBtn" data-view="list" type="button" role="tab" aria-selected="false" aria-controls="fileList" tabindex="-1">列表</button>
+                                    <button class="view-chip" id="listViewBtn" data-view="list" type="button" role="tab" aria-selected="false" aria-controls="fileList" tabindex="-1">表格</button>
                                 </div>
                                 <div class="library-actions">
                                     <span class="pill"><strong id="imageCount">0</strong> 图片</span>
@@ -251,6 +256,36 @@
                             </button>
                         </section>
 
+                        <!-- Connection: status and latency -->
+                        <section class="panel connection-panel" id="connectionPanel" aria-live="polite">
+                            <div class="panel-head">
+                                <h2>连接状态</h2>
+                                <button class="icon-button" id="railRefresh" type="button" aria-label="刷新连接">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 6v5h-5M4 18v-5h5"/><path d="M18.5 9A7 7 0 0 0 6 6.5L4 11M5.5 15A7 7 0 0 0 18 17.5l2-4.5"/></svg>
+                                </button>
+                            </div>
+                            <div class="connection">
+                                <div class="connection-main">
+                                    <div class="connection-state">
+                                        <span class="status-dot" id="connectionDot"></span>
+                                        <div>
+                                            <strong id="connectionTitle">等待连接</strong>
+                                            <span id="connectionDetail">请先解锁会话</span>
+                                        </div>
+                                    </div>
+                                    <b class="latency" id="latencyValue">-</b>
+                                </div>
+                                <div class="connection-grid">
+                                    <div><span>当前设备</span><strong id="connectionDevice">-</strong></div>
+                                    <div><span>实时事件</span><strong id="connectionEvents">未订阅</strong></div>
+                                </div>
+                                <p class="connection-error" id="connectionError" role="alert" hidden>
+                                    <span>网络不可用，请检查连接后重试。</span>
+                                    <button class="btn btn-danger" id="retryConnection" type="button">重新连接</button>
+                                </p>
+                            </div>
+                        </section>
+
                         <!-- Operations: storage stats (summary only) -->
                         <section class="panel operations-panel" aria-labelledby="operationsTitle">
                             <div class="panel-head">
@@ -293,37 +328,39 @@
         </button>
     </nav>
 
-    <!-- Preview modal -->
-    <div class="preview-modal" id="previewModal" role="dialog" aria-modal="true" aria-labelledby="previewTitle" hidden>
-        <div class="preview-shell">
-            <div class="preview-image-frame">
-                <img id="previewImage" alt="图片预览">
-            </div>
-            <aside class="preview-side">
-                <div class="preview-copy">
-                    <span class="preview-kicker">文件预览</span>
+    <!-- Preview drawer -->
+    <div class="drawer-backdrop" id="previewModal" role="dialog" aria-modal="true" aria-labelledby="previewTitle" hidden>
+        <aside class="drawer" id="previewDrawer">
+            <header class="drawer-head">
+                <div>
+                    <p class="preview-kicker">文件预览</p>
                     <h3 id="previewTitle"></h3>
-                    <p class="preview-caption">预览链接会沿用当前会话。</p>
                 </div>
-                <div class="preview-meta"><strong id="previewSize">-</strong> 文件大小</div>
-                <div class="preview-meta"><strong id="previewDate">-</strong> 更新时间</div>
-                <div class="preview-meta"><strong id="previewType">-</strong> 文件类型</div>
-                <div class="preview-actions">
-                    <button class="btn btn-soft btn-icon" id="previewCopyBtn" type="button">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-                        复制链接
-                    </button>
-                    <a class="btn btn-primary btn-icon" id="previewDownloadBtn" href="#">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
-                        下载文件
-                    </a>
-                    <button class="btn btn-plain btn-icon" id="closePreviewBtn" type="button">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
-                        关闭
-                    </button>
-                </div>
-            </aside>
-        </div>
+                <button class="icon-button" id="closePreviewBtn" type="button" aria-label="关闭预览">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M6 6l12 12M18 6 6 18"/></svg>
+                </button>
+            </header>
+            <div class="preview-art" id="previewArt">
+                <img id="previewImage" alt="文件预览" hidden>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3" id="previewPlaceholder"><path d="M7 3h7l4 4v14H7z"/><path d="M14 3v5h5M10 12h5M10 16h5"/></svg>
+            </div>
+            <div class="preview-details">
+                <div class="detail-row"><span>文件名</span><strong id="previewFileName">-</strong></div>
+                <div class="detail-row"><span>大小</span><strong id="previewSize">-</strong></div>
+                <div class="detail-row"><span>更新时间</span><strong id="previewDate">-</strong></div>
+                <div class="detail-row"><span>类型</span><strong id="previewType">-</strong></div>
+            </div>
+            <div class="drawer-actions">
+                <button class="btn btn-soft btn-icon" id="previewCopyBtn" type="button">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+                    复制链接
+                </button>
+                <a class="btn btn-primary btn-icon" id="previewDownloadBtn" href="#">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>
+                    下载文件
+                </a>
+            </div>
+        </aside>
     </div>
 
     <!-- Toast -->

@@ -210,11 +210,29 @@ export function createLibrary({ root, api, timeline }) {
     if (!file || !file.is_previewable || !previewModal) return;
     currentPreview = message;
     lastPreviewTrigger = trigger || null;
+
+    const isImage = file.mime_type && file.mime_type.startsWith('image/');
+
     if (previewImage) {
-      previewImage.src = file.download_url;
-      previewImage.alt = file.name || '图片预览';
+      if (isImage && file.download_url) {
+        previewImage.src = file.download_url;
+        previewImage.alt = file.name || '图片预览';
+        previewImage.hidden = false;
+      } else {
+        previewImage.hidden = true;
+        previewImage.removeAttribute('src');
+      }
     }
-    if (previewTitle) previewTitle.textContent = file.name || '图片预览';
+
+    const placeholder = document.getElementById('previewPlaceholder');
+    if (placeholder) {
+      if (isImage) placeholder.classList.add('is-hidden');
+      else placeholder.classList.remove('is-hidden');
+    }
+
+    if (previewTitle) previewTitle.textContent = file.name || '文件预览';
+    const fileNameEl = document.getElementById('previewFileName');
+    if (fileNameEl) fileNameEl.textContent = file.name || '-';
     if (previewSize) previewSize.textContent = file.size || '-';
     if (previewDate) previewDate.textContent = file.created_at || message.created_at || '-';
     if (previewType) previewType.textContent = file.extension || file.mime_type || '-';
@@ -558,8 +576,64 @@ export function createLibrary({ root, api, timeline }) {
       return;
     }
 
-    fileListEl.className = `file-list ${viewMode}-mode`;
-    fileListEl.innerHTML = items.map((message) => renderFileCard(message)).join('');
+    if (viewMode === 'list') {
+      fileListEl.className = 'file-list table-mode';
+      fileListEl.innerHTML = renderFileTable(items);
+    } else {
+      fileListEl.className = 'file-list grid-mode';
+      fileListEl.innerHTML = items.map((message) => renderFileCard(message)).join('');
+    }
+  }
+
+  function renderFileTable(items) {
+    const rows = items.map((message) => {
+      const file = message.file;
+      const isSelected = selectedIds.has(message.id);
+      const icon = file.is_previewable
+        ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8" cy="9" r="1.5"/><path d="m5 17 4-4 3 3 2-2 5 4"/></svg>'
+        : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M7 3h7l4 4v14H7z"/><path d="M14 3v5h5M10 13h5M10 17h5"/></svg>';
+      return `
+        <tr data-message-id="${escapeAttr(message.id)}" data-name="${escapeAttr(file.name)}" data-type="${file.is_previewable ? 'image' : 'document'}">
+          <td><input class="check" type="checkbox" data-select-message="${escapeAttr(message.id)}" ${isSelected ? 'checked' : ''} aria-label="选择 ${escapeAttr(file.name)}"></td>
+          <td>
+            <div class="file-cell">
+              <span class="file-icon">${icon}</span>
+              <div class="file-name">
+                <strong>${escapeHtml(file.name)}</strong>
+                <span>${escapeHtml(file.size)} · ${escapeHtml(file.created_at || message.created_at || '')}</span>
+              </div>
+            </div>
+          </td>
+          <td class="mono">${escapeHtml(file.size)}</td>
+          <td class="mono">${escapeHtml(file.created_at || message.created_at || '')}</td>
+          <td><span class="status">可用</span></td>
+          <td>
+            <div class="row-actions">
+              <button class="row-action" type="button" data-file-action="copy" data-message-id="${escapeAttr(message.id)}" aria-label="复制链接">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/></svg>
+              </button>
+              ${file.is_previewable ? `<button class="row-action" type="button" data-file-action="preview" data-message-id="${escapeAttr(message.id)}" aria-label="预览 ${escapeAttr(file.name)}">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle cx="12" cy="12" r="2.5"/></svg>
+              </button>` : ''}
+            </div>
+          </td>
+        </tr>`;
+    }).join('');
+
+    return `
+      <table class="file-table">
+        <thead>
+          <tr>
+            <th class="col-check"><span class="visually-hidden">选择</span></th>
+            <th>文件</th>
+            <th>大小</th>
+            <th>更新时间</th>
+            <th>状态</th>
+            <th class="col-actions"><span class="visually-hidden">操作</span></th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`;
   }
 
   function renderFileCard(message) {

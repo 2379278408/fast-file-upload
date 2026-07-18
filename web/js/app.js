@@ -66,6 +66,8 @@ function getDeviceName() {
 
 function setDeviceName(name) {
   localStorage.setItem(DEVICE_NAME_KEY, name);
+  if (routeSource) routeSource.textContent = name || '本机';
+  if (connectionDevice) connectionDevice.textContent = name || '-';
 }
 
 const sessionExpiredOverlay = document.getElementById('sessionExpired');
@@ -232,6 +234,9 @@ async function checkSession() {
   try {
     await getSession();
     isUnlocked = true;
+    const storedName = getDeviceName();
+    if (routeSource && storedName) routeSource.textContent = storedName;
+    if (connectionDevice) connectionDevice.textContent = storedName || '-';
     await refreshAll();
     await timeline.loadInitial();
     hideLockOverlay();
@@ -308,6 +313,8 @@ const composerFileInput = document.getElementById('composerFileInput');
 const composerDropTarget = document.getElementById('composerDropTarget');
 const composerQueue = document.getElementById('composerQueue');
 const composerAttachBtn = document.getElementById('composerAttachBtn');
+const routeSource = document.getElementById('routeSource');
+const routeTarget = document.getElementById('routeTarget');
 
 const composer = createComposer({
   form: composerForm,
@@ -364,6 +371,11 @@ const refreshOpsBtn = document.getElementById('refreshOpsBtn');
 
 if (refreshHealthBtn) refreshHealthBtn.addEventListener('click', loadHealth);
 if (refreshOpsBtn) refreshOpsBtn.addEventListener('click', loadOperations);
+
+const railRefresh = document.getElementById('railRefresh');
+const retryConnection = document.getElementById('retryConnection');
+if (railRefresh) railRefresh.addEventListener('click', () => { loadHealth(); startEventConnection(); });
+if (retryConnection) retryConnection.addEventListener('click', () => { startEventConnection(); });
 
 async function loadHealth() {
   try {
@@ -522,6 +534,13 @@ async function refreshAll() {
 }
 
 const connectionStatusEl = document.getElementById('connectionStatus');
+const connectionTitle = document.getElementById('connectionTitle');
+const connectionDetail = document.getElementById('connectionDetail');
+const connectionDevice = document.getElementById('connectionDevice');
+const connectionEvents = document.getElementById('connectionEvents');
+const connectionError = document.getElementById('connectionError');
+const connectionPanel = document.getElementById('connectionPanel');
+const latencyValue = document.getElementById('latencyValue');
 let eventConnection = null;
 
 function closeEventConnection() {
@@ -538,6 +557,27 @@ function updateConnectionStatus(status) {
     closed: '连接已关闭',
   };
   connectionStatusEl.textContent = labels[status] || status;
+
+  // Update connection panel
+  if (connectionTitle) {
+    const panelLabels = {
+      connecting: '正在连接…',
+      connected: '安全连接已建立',
+      reconnecting: '重新连接中…',
+      closed: '连接已断开',
+    };
+    connectionTitle.textContent = panelLabels[status] || status;
+  }
+  if (connectionPanel) {
+    connectionPanel.dataset.connection = status === 'closed' ? 'offline' : 'online';
+  }
+  if (connectionEvents) {
+    connectionEvents.textContent = status === 'connected' ? '已订阅' : '未订阅';
+  }
+  if (connectionError) {
+    connectionError.hidden = status !== 'closed';
+  }
+
   if (status === 'closed') {
     showLockOverlay();
   }
