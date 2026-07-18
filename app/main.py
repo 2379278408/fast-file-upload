@@ -12,6 +12,7 @@ from pathlib import Path
 from secrets import compare_digest
 from time import monotonic, time
 from typing import Annotated, Literal
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request, UploadFile, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
@@ -302,6 +303,7 @@ def create_app(settings: Settings) -> FastAPI:
     )
     app.state.login_limiter = login_limiter
     rate_buckets: dict[tuple[str, str], list[float]] = {}
+    RATE_BUCKETS_MAX = 10_000
 
     async def broadcast_mutation(mutation: dict[str, object]) -> None:
         events = mutation.get("events")
@@ -389,7 +391,7 @@ def create_app(settings: Settings) -> FastAPI:
     upload_locks = _KeyedLockPool(settings.client_request_lock_capacity)
     app.state.upload_locks = upload_locks
 
-    def record_audit(action: str, file_id: str, name: str, size_bytes: int) -> None:
+    def record_audit(action: str, file_id: str, name: str, size_bytes: int, **extra: object) -> None:
         audit_path.parent.mkdir(parents=True, exist_ok=True)
         event = {
             "time": datetime.now(timezone.utc).isoformat(),
@@ -397,11 +399,17 @@ def create_app(settings: Settings) -> FastAPI:
             "file_id": file_id,
             "name": name,
             "size_bytes": size_bytes,
+            **extra,
         }
         with audit_path.open("a", encoding="utf-8") as target:
             target.write(json.dumps(event, ensure_ascii=False) + "\n")
 
     def read_audit_events(limit: int = 200) -> list[dict[str, object]]:
+        """Read the last `limit` audit events from the log file.
+
+        Uses backward seeking in 8KB chunks. Complexity is O(limit * chunk_size)
+        in the worst case, but performs well for the default 200-line limit.
+        """
         if not audit_path.exists():
             return []
         with audit_path.open("rb") as source:
@@ -435,6 +443,10 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=429, detail="Too many requests")
         bucket.append(now)
         rate_buckets[bucket_key] = bucket
+        if len(rate_buckets) > RATE_BUCKETS_MAX:
+            stale_keys = [k for k, v in rate_buckets.items() if not v or v[-1] < window_start]
+            for k in stale_keys[:len(stale_keys) // 2]:
+                del rate_buckets[k]
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
@@ -764,6 +776,7 @@ def create_app(settings: Settings) -> FastAPI:
                         pending.file_id,
                         pending.original_name,
                         pending.size_bytes,
+                        reason=type(error).__name__,
                     )
                 except OSError:
                     logger.exception(
@@ -876,7 +889,6 @@ def create_app(settings: Settings) -> FastAPI:
         origin = websocket.headers.get("origin", "")
         host = websocket.headers.get("host", "")
         if origin:
-            from urllib.parse import urlparse
             parsed_origin = urlparse(origin)
             origin_host = parsed_origin.netloc or parsed_origin.hostname or ""
             if origin_host and origin_host != host and "*" not in settings.allowed_origins:
