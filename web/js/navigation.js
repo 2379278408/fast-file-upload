@@ -50,7 +50,11 @@ export function createNavigation({ windowObject, documentObject, onRouteChange =
   }
 
   function handleHashChange() {
-    applyRoute(normalizeRoute(windowObject.location.hash));
+    const route = normalizeRoute(windowObject.location.hash);
+    if (windowObject.location.hash !== ROUTES[route].hash) {
+      windowObject.history.replaceState(null, '', ROUTES[route].hash);
+    }
+    applyRoute(route);
   }
 
   function navigate(route, { focus = true } = {}) {

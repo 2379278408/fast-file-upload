@@ -575,6 +575,9 @@ def test_tabs_skip_link_and_mobile_touch_targets(
         pytest.param(
             {"width": 390, "height": 568}, ".mobile-nav", id="mobile-390x568"
         ),
+        pytest.param(
+            {"width": 600, "height": 800}, ".mobile-nav", id="mobile-600x800"
+        ),
     ],
 )
 def test_three_route_navigation_history_focus_and_viewport_safety(
@@ -640,8 +643,10 @@ def test_three_route_navigation_history_focus_and_viewport_safety(
         composer = page.locator("#composerPanel")
         mobile_nav = page.locator(".mobile-nav")
         timeline = page.locator("#timelineContainer")
+        connection = page.locator("#connectionStatus")
         expect(timeline).to_be_visible()
         expect(composer).to_be_visible()
+        expect(connection).to_be_visible()
         assert page.evaluate("window.scrollY") == 0
         timeline_metrics = timeline.evaluate(
             """
@@ -662,12 +667,25 @@ def test_three_route_navigation_history_focus_and_viewport_safety(
         composer_box = composer.bounding_box()
         mobile_nav_box = mobile_nav.bounding_box()
         assert composer_box is not None and mobile_nav_box is not None
-        assert timeline_metrics["height"] > 0
+        assert composer.evaluate(
+            "element => getComputedStyle(element).position"
+        ) == "fixed"
+        assert timeline_metrics["height"] >= 120
         assert timeline_metrics["overflowY"] == "auto"
         assert timeline_metrics["top"] >= 0
-        assert timeline_metrics["bottom"] <= composer_box["y"] + 1
+        assert timeline_metrics["bottom"] <= composer_box["y"] + 1, {
+            "timeline": timeline_metrics,
+            "composer": composer_box,
+        }
         assert composer_box["y"] >= 0
         assert composer_box["y"] + composer_box["height"] <= mobile_nav_box["y"]
+        if viewport == {"width": 390, "height": 568}:
+            assert timeline_metrics["scrollHeight"] > timeline_metrics["clientHeight"]
+
+    else:
+        assert page.locator("#composerPanel").evaluate(
+            "element => getComputedStyle(element).position"
+        ) == "sticky"
 
     _assert_browser_clean(browser_session)
 
@@ -725,11 +743,60 @@ def test_files_locate_routes_then_highlights_message_and_back_returns_files(
     )
     target = page.locator(f'.timeline-message[data-message-id="{message_id}"]')
     expect(target).to_have_class(re.compile(r".*timeline-message-highlight.*"))
+    expect(target).to_have_attribute("tabindex", "-1")
+    expect(target).to_be_focused()
     assert page.evaluate("location.hash") == "#transfer"
 
     page.go_back()
     _assert_route_state(page, "files", ".sidebar", expect_heading_focus=False)
     assert page.evaluate("location.hash") == "#files"
+    _assert_browser_clean(browser_session)
+
+
+def test_mobile_toast_stays_above_composer_without_intercepting_it(
+    browser_session: BrowserSession,
+) -> None:
+    page = browser_session.page
+    page.set_viewport_size({"width": 390, "height": 568})
+    _open_locked_application(browser_session)
+    _unlock(page)
+    page.evaluate(
+        """
+        window.dispatchEvent(new CustomEvent('timeline-error', {
+          detail: { message: 'toast geometry' },
+        }))
+        """
+    )
+
+    toast = page.locator("#toast")
+    composer = page.locator("#composerPanel")
+    expect(toast).to_be_visible()
+    expect(composer).to_be_visible()
+    page.wait_for_function(
+        """
+        () => {
+          const toast = document.querySelector('#toast').getBoundingClientRect();
+          const composer = document.querySelector('#composerPanel').getBoundingClientRect();
+          return toast.bottom <= composer.top - 8;
+        }
+        """
+    )
+    toast_box = toast.bounding_box()
+    composer_box = composer.bounding_box()
+    attach_box = page.locator("#composerAttachBtn").bounding_box()
+    assert toast_box is not None and composer_box is not None and attach_box is not None
+    assert toast_box["y"] + toast_box["height"] <= composer_box["y"] - 8
+    assert page.evaluate(
+        """
+        ({ x, y }) => Boolean(
+          document.elementFromPoint(x, y)?.closest('#composerPanel')
+        )
+        """,
+        {
+            "x": attach_box["x"] + attach_box["width"] / 2,
+            "y": attach_box["y"] + attach_box["height"] / 2,
+        },
+    )
     _assert_browser_clean(browser_session)
 
 

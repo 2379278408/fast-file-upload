@@ -359,6 +359,8 @@ export function createTimeline({ container, newMessageButton, api, onRestore }) 
     if (el) {
       el.scrollIntoView({ behavior: 'smooth', block: 'center' });
       el.classList.add('timeline-message-highlight');
+      el.setAttribute('tabindex', '-1');
+      el.focus({ preventScroll: true });
       setTimeout(() => el.classList.remove('timeline-message-highlight'), HIGHLIGHT_DURATION_MS);
       return true;
     }

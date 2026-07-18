@@ -572,8 +572,15 @@ def test_manage_page_groups_connection_storage_appearance_and_session() -> None:
 
 def test_mobile_fixed_elements_share_offset_and_430_rule_is_single() -> None:
     css = read_web("styles.css")
-    assert "--mobile-nav-height: 66px" in css
-    assert "--mobile-fixed-offset:" in css
+    root = css[css.index(":root {"):css.index(".dark {")]
+    assert "--mobile-nav-base-height: 66px" in root
+    assert (
+        "--mobile-nav-height: calc(var(--mobile-nav-base-height) + "
+        "env(safe-area-inset-bottom))"
+    ) in root
+    assert "--mobile-fixed-offset: calc(var(--mobile-nav-height) + 12px)" in root
+    fixed_offset = re.search(r"--mobile-fixed-offset:\s*([^;]+)", root)
+    assert fixed_offset and "safe-area-inset-bottom" not in fixed_offset.group(1)
     assert css.count("@media (max-width: 430px)") == 1
     assert "bottom: var(--mobile-fixed-offset)" in css
 
@@ -673,19 +680,40 @@ def test_mobile_transfer_reserves_space_for_fixed_composer_dock() -> None:
         assert match, f"missing CSS declaration for {name}"
         return match.group(1).strip()
 
-    root_vars = rule(compact, ":root")
-    workspace_rule = rule(compact, ".transfer-workspace")
-    composer_rule = rule(compact, ".composer-dock")
     mobile = css[css.index("@media (max-width: 720px)"):compact_start]
+    root_vars = rule(mobile, ":root")
+    workspace_rule = rule(mobile, ".transfer-workspace")
+    composer_rule = rule(mobile, ".composer-dock")
     nav_rule = rule(mobile, ".mobile-nav")
 
     assert declaration(root_vars, "--mobile-composer-reserve")
+    assert "var(--mobile-timeline-min-height)" in declaration(
+        root_vars, "--mobile-workspace-min-height"
+    )
     assert "var(--mobile-composer-reserve)" in declaration(workspace_rule, "padding-bottom")
+    assert "var(--mobile-workspace-min-height)" in declaration(workspace_rule, "min-height")
     assert declaration(composer_rule, "position") == "fixed"
     assert declaration(composer_rule, "bottom") == "var(--mobile-fixed-offset)"
     assert declaration(composer_rule, "left") == "14px"
     assert declaration(composer_rule, "right") == "14px"
     assert declaration(nav_rule, "height") == "var(--mobile-nav-height)"
+    assert "env(safe-area-inset-bottom)" in declaration(nav_rule, "padding")
+    assert "--mobile-composer-reserve" in rule(compact, ":root")
+
+
+def test_mobile_toast_offset_clears_fixed_composer() -> None:
+    css = read_web("styles.css")
+    mobile = css[
+        css.index("@media (max-width: 720px)"):css.index("@media (max-width: 430px)")
+    ]
+    root_match = re.search(r":root\s*\{([^{}]*)\}", mobile)
+    toast_match = re.search(r"\.toast\s*\{([^{}]*)\}", mobile)
+    assert root_match and toast_match
+    assert (
+        "--mobile-toast-offset: calc(var(--mobile-fixed-offset) + "
+        "var(--mobile-composer-reserve) + 12px)"
+    ) in root_match.group(1)
+    assert "bottom: var(--mobile-toast-offset)" in toast_match.group(1)
 
 
 def test_transfer_route_dead_styles_are_removed() -> None:
@@ -1366,6 +1394,7 @@ def create_navigation_lifecycle_context() -> quickjs.Context:
           navigation,
           button,
           windowObject,
+          dispatchHashChange: () => windowListeners.dispatch('hashchange'),
           buttonListenerCount: () => buttonListeners.count('click'),
           windowListenerCount: () => windowListeners.count('hashchange'),
           routeChangeCount: () => routeChangeCount,
@@ -1373,6 +1402,22 @@ def create_navigation_lifecycle_context() -> quickjs.Context:
       };
     """)
     return context
+
+
+def test_navigation_runtime_unknown_hash_is_replaced_with_supported_route() -> None:
+    context = create_navigation_lifecycle_context()
+    result = json.loads(context.eval(r"""
+      const harness = createNavigationHarness();
+      harness.navigation.start();
+      harness.windowObject.location.hash = '#message-unsupported';
+      harness.dispatchHashChange();
+      JSON.stringify({
+        hash: harness.windowObject.location.hash,
+        route: harness.navigation.getCurrentRoute(),
+      });
+    """))
+
+    assert result == {"hash": "#transfer", "route": "transfer"}
 
 
 def test_navigation_destroy_removes_button_handlers_and_prevents_navigation() -> None:
@@ -2466,6 +2511,8 @@ def test_timeline_pages_from_top_and_loads_until_real_dto(client: TestClient) ->
         loadScrollCalls: __scrollIntoViewCalls,
         focused: timeline.focusMessage(oldestMessageId),
         focusedScrollCalls: __scrollIntoViewCalls,
+        focusedElement: document.activeElement?.dataset.messageId || null,
+        focusedTabIndex: document.activeElement?.getAttribute('tabindex'),
       });
     """))
 
@@ -2477,6 +2524,8 @@ def test_timeline_pages_from_top_and_loads_until_real_dto(client: TestClient) ->
     assert result["loadScrollCalls"] == 0
     assert result["focused"] is True
     assert result["focusedScrollCalls"] == 1
+    assert result["focusedElement"] == oldest_id
+    assert result["focusedTabIndex"] == "-1"
 
 
 def test_library_filters_reload_and_pagination_is_reachable(client: TestClient) -> None:
