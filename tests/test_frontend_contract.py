@@ -551,6 +551,33 @@ def test_transfer_page_is_timeline_first_and_composer_is_docked() -> None:
     assert 'class="transfer-status"' in transfer
 
 
+def test_transfer_timeline_has_bounded_internal_scroll_at_all_viewports() -> None:
+    css = read_web("styles.css")
+    workspace = css[css.index(".transfer-workspace {"):css.index(".transfer-status {")]
+    timeline_panel_start = css.rindex(".timeline-panel {")
+    timeline_panel = css[timeline_panel_start:css.index(".composer-form {", timeline_panel_start)]
+    timeline_container = css[css.index(".timeline-container {"):css.index(".timeline-date-separator {")]
+    mobile = css[css.index("@media (max-width: 720px)"):css.index("@media (max-width: 430px)")]
+
+    assert "height: clamp(" in workspace
+    assert "max-height: calc(100dvh" in workspace
+    assert "grid-template-rows: auto minmax(0, 1fr) auto" in workspace
+    assert "overflow: hidden" in timeline_panel
+    assert "min-height: 0" in timeline_container
+    assert "max-height: clamp(" in timeline_container
+    assert "overflow-y: auto" in timeline_container
+    assert "height: clamp(" in mobile
+    assert "var(--mobile-fixed-offset)" in mobile
+    assert ".transfer-workspace .timeline-container" in mobile
+    assert ".composer-dock .panel-head" in mobile
+
+
+def test_transfer_route_dead_styles_are_removed() -> None:
+    css = read_web("styles.css")
+    for selector in (".transfer-route", ".route-node", "route-pulse"):
+        assert selector not in css
+
+
 def test_shell_ids_are_unique_and_navigation_labels_match_route_hashes() -> None:
     parser = ShellContractParser()
     parser.feed(read_web("index.html"))

@@ -26,6 +26,7 @@
             --radius-md: 10px;
             --topbar-height: 68px;
             --mobile-fixed-offset: calc(74px + env(safe-area-inset-bottom));
+            --transfer-page-offset: 108px;
             color-scheme: light dark;
         }
 
@@ -234,9 +235,10 @@
         .transfer-panel { overflow: hidden; border-color: color-mix(in oklch, var(--accent) 18%, var(--border)); }
 
         .transfer-workspace {
-            min-height: calc(100dvh - var(--topbar-height) - 60px);
+            height: clamp(480px, calc(100dvh - var(--topbar-height) - var(--transfer-page-offset)), 900px);
+            max-height: calc(100dvh - var(--topbar-height) - var(--transfer-page-offset));
             display: grid;
-            grid-template-rows: auto minmax(320px, 1fr) auto;
+            grid-template-rows: auto minmax(0, 1fr) auto;
             gap: 14px;
         }
 
@@ -275,6 +277,9 @@
             position: sticky;
             bottom: 16px;
             z-index: 6;
+            max-height: clamp(220px, 38dvh, 340px);
+            overflow-y: auto;
+            overscroll-behavior: contain;
         }
 
         .mono-text { color: var(--muted); font: 11px/1.4 var(--font-mono); }
@@ -483,6 +488,7 @@
         }
 
         .timeline-panel .panel-head {
+            min-height: clamp(44px, 8dvh, 64px);
             flex-shrink: 0;
         }
 
@@ -1596,7 +1602,10 @@
         }
 
         @media (max-width: 720px) {
-            :root { --topbar-height: 60px; }
+            :root {
+                --topbar-height: 60px;
+                --transfer-page-offset: 90px;
+            }
             body { padding-bottom: 70px; }
             .app-shell { display: block; }
             .sidebar { display: none; }
@@ -1612,7 +1621,22 @@
             .transfer-status .route-link { display: none; }
             .transfer-status > div:nth-of-type(3) { grid-column: 1; }
             .transfer-status > .pill { grid-column: 2; grid-row: 1 / span 2; }
-            .composer-dock { bottom: var(--mobile-fixed-offset); }
+            .transfer-workspace {
+                height: clamp(420px, calc(100dvh - var(--topbar-height) - var(--mobile-fixed-offset) - var(--transfer-page-offset)), 680px);
+                max-height: calc(100dvh - var(--topbar-height) - var(--mobile-fixed-offset) - var(--transfer-page-offset));
+            }
+            .transfer-workspace .timeline-container { max-height: clamp(96px, 24dvh, 260px); }
+            .timeline-panel .panel-head { padding: 8px 10px; }
+            .composer-dock {
+                bottom: var(--mobile-fixed-offset);
+                max-height: clamp(180px, 32dvh, 240px);
+            }
+            .composer-dock .panel-head { min-height: 48px; padding: 8px 14px; }
+            .composer-dock .panel-head p,
+            .composer-dock .mono-text { display: none; }
+            .composer-dock .composer-form { padding: 10px; }
+            .composer-dock .composer-drop-target { gap: 8px; padding: 10px; }
+            .composer-dock .composer-textarea { min-height: 52px; max-height: 96px; }
             .panel { border-radius: 12px; }
             .library-tools { width: 100%; flex-wrap: wrap; }
             .search-wrap { flex-basis: 100%; }
@@ -1672,6 +1696,8 @@
         }
 
         @media (max-width: 430px) {
+            :root { --topbar-height: 104px; }
+            .composer-dock .panel-head { display: none; }
             .health-item { min-width: 68px; }
             .dropzone { padding: 12px; }
             .drop-target { min-height: 210px; padding: 18px; }
@@ -1751,11 +1777,12 @@
         }
 
         .timeline-panel {
-            padding: 20px;
+            padding: clamp(10px, 2dvh, 20px);
             min-height: 0;
             display: flex;
             flex-direction: column;
-            gap: 14px;
+            gap: clamp(8px, 1.5dvh, 14px);
+            overflow: hidden;
         }
 
         .composer-form {
@@ -1846,9 +1873,9 @@
         .timeline-container {
             display: grid;
             gap: 4px;
-            max-height: none;
             flex: 1;
-            min-height: 280px;
+            min-height: 0;
+            max-height: clamp(160px, 42dvh, 620px);
             overflow-y: auto;
             scroll-behavior: auto;
             padding: 8px 0;
@@ -2060,39 +2087,11 @@
             font-weight: 600;
         }
 
-        /* Transfer route visualization */
-        .transfer-route {
-            max-width: 430px;
-            display: grid;
-            grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-            align-items: center;
-            gap: 10px;
-            margin-top: 4px;
-        }
-
-        .route-node {
-            min-width: 0;
-            padding: 9px 10px;
-            border: 1px solid var(--border);
-            border-radius: 9px;
-            background: var(--surface);
-        }
-
-        .route-node span,
         .route-link span {
             display: block;
             color: var(--muted);
             font-size: 10px;
             letter-spacing: .02em;
-        }
-
-        .route-node strong {
-            display: block;
-            overflow: hidden;
-            margin-top: 2px;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-            font: 500 11px/1.35 var(--font-mono);
         }
 
         .route-link {
@@ -2131,16 +2130,6 @@
             padding: 0 4px;
             background: var(--surface-soft);
             font-family: var(--font-mono);
-        }
-
-        /* Route pulse animation for active transfers */
-        .transfer-route.active .route-link::before {
-            animation: route-pulse 1.5s ease-in-out infinite;
-        }
-
-        @keyframes route-pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.3; }
         }
 
         /* Library filter collapse */
