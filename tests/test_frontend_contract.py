@@ -265,6 +265,9 @@ class Element {
     };
   }
   addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); }
+  removeEventListener(type, listener) {
+    this.listeners[type] = (this.listeners[type] || []).filter(item => item !== listener);
+  }
   append(...nodes) { for (const node of nodes) { node.parentNode = this; this.children.push(node); } }
   insertBefore(node, reference) {
     node.parentNode = this;
@@ -348,6 +351,7 @@ class Element {
 globalThis.document = {
   activeElement: null,
   body: new Element('body', 'body'),
+  listeners: Object.create(null),
   createElement: tag => new Element(tag),
   createTextNode: text => { const node = new Element('#text'); node.textContent = String(text); return node; },
   getElementById: id => {
@@ -361,13 +365,19 @@ globalThis.document = {
   },
   querySelector: selector => selector.startsWith('#') ? document.getElementById(selector.slice(1)) : new Element('div'),
   querySelectorAll: selector => document.body.querySelectorAll(selector),
-  addEventListener() {},
+  addEventListener(type, listener) { (this.listeners[type] ||= []).push(listener); },
+  removeEventListener(type, listener) {
+    this.listeners[type] = (this.listeners[type] || []).filter(item => item !== listener);
+  },
 };
 globalThis.window = globalThis;
 window.scrollY = 0;
 window.scrollTo = () => {};
 window.listeners = Object.create(null);
 window.addEventListener = (type, listener) => { (window.listeners[type] ||= []).push(listener); };
+window.removeEventListener = (type, listener) => {
+  window.listeners[type] = (window.listeners[type] || []).filter(item => item !== listener);
+};
 window.dispatchEvent = event => {
   for (const listener of window.listeners[event.type] || []) listener(event);
   return true;
@@ -818,6 +828,119 @@ def test_files_empty_state_has_transfer_action() -> None:
     assert 'id="emptyFilesAction"' in source
     assert 'data-file-action="empty-attach"' in source
     assert "onAttach" in source
+
+
+def test_library_empty_attach_listener_lifecycle_is_scoped_to_controller() -> None:
+    context = create_js_context()
+    load_js_module(context, "./library.js", read_web("js/library.js"))
+    context.eval(r"""
+      const root = document.getElementById('libraryView');
+      const fileList = document.getElementById('fileList');
+      const emptyAction = document.createElement('button');
+      emptyAction.dataset.fileAction = 'empty-attach';
+      const api = path => Promise.resolve(
+        path.startsWith('/api/files?')
+          ? { items: [], next_cursor: null }
+          : { file_count: 0, total_size: '0 B', largest_files: [] }
+      );
+      globalThis.firstAttachCalls = 0;
+      globalThis.secondAttachCalls = 0;
+      globalThis.dispatchEmptyAttach = () => {
+        for (const listener of [...(fileList.listeners.click || [])]) {
+          listener({ target: { closest: () => emptyAction } });
+        }
+      };
+      globalThis.firstLibrary = __modules['./library.js'].createLibrary({
+        root,
+        api,
+        timeline: null,
+        onAttach: () => { firstAttachCalls += 1; },
+      });
+      firstLibrary.load({});
+    """)
+    drain_jobs(context)
+
+    context.eval("dispatchEmptyAttach();")
+    assert context.eval("firstAttachCalls") == 1
+    assert 'id="emptyFilesAction"' in context.eval(
+        "document.getElementById('fileList').innerHTML"
+    )
+
+    result = json.loads(context.eval(r"""
+      firstLibrary.destroy();
+      firstLibrary.destroy();
+      dispatchEmptyAttach();
+      globalThis.secondLibrary = __modules['./library.js'].createLibrary({
+        root,
+        api,
+        timeline: null,
+        onAttach: () => { secondAttachCalls += 1; },
+      });
+      dispatchEmptyAttach();
+      secondLibrary.destroy();
+      secondLibrary.destroy();
+      dispatchEmptyAttach();
+      let remainingListeners = Object.values(document.listeners)
+        .reduce((total, listeners) => total + listeners.length, 0);
+      for (const element of Object.values(__elements)) {
+        remainingListeners += Object.values(element.listeners)
+          .reduce((total, listeners) => total + listeners.length, 0);
+      }
+      JSON.stringify({ firstAttachCalls, secondAttachCalls, remainingListeners });
+    """))
+    assert result == {
+        "firstAttachCalls": 1,
+        "secondAttachCalls": 1,
+        "remainingListeners": 0,
+    }
+
+
+def test_app_empty_attach_navigation_and_picker_click_are_synchronous() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.attachSequence = [];
+      globalThis.userActivation = false;
+      document.getElementById('composerFileInput').click = () => {
+        attachSequence.push(`click:${userActivation}`);
+      };
+      __modules['./api.js'] = {
+        request: () => Promise.resolve({}),
+        unlock: () => Promise.resolve({}),
+        logout: () => Promise.resolve({}),
+        getSession: () => Promise.resolve({}),
+        ApiError: class ApiError extends Error {},
+        connectEvents: () => ({ close() {} }),
+        getLastSequence: () => 0,
+      };
+      __modules['./timeline.js'] = {
+        createTimeline: () => ({
+          loadInitial() {}, mergeEvent() {}, remove() {}, upsert() {},
+        }),
+      };
+      __modules['./composer.js'] = { createComposer: () => ({}) };
+      __modules['./library.js'] = {
+        createLibrary: options => {
+          globalThis.emptyAttach = options.onAttach;
+          return { clearSelection() {} };
+        },
+      };
+      __modules['./navigation.js'] = {
+        createNavigation: () => ({
+          navigate(route) { attachSequence.push(`navigate:${route}:${userActivation}`); },
+          start() {},
+        }),
+      };
+    """)
+    load_js_module(context, "./app.js", read_web("js/app.js"))
+
+    result = json.loads(context.eval(r"""
+      userActivation = true;
+      emptyAttach();
+      attachSequence.push('returned');
+      userActivation = false;
+      JSON.stringify(attachSequence);
+    """))
+    assert result == ["navigate:transfer:true", "click:true", "returned"]
 
 
 def test_skip_link_preserves_application_route_hash() -> None:

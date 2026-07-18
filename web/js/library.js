@@ -41,49 +41,73 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
   let hasMore = false;
   let currentPreview = null;
   let lastPreviewTrigger = null;
+  let destroyed = false;
+  const listenerCleanups = [];
+  const pendingTimers = new Set();
 
-  if (batchDownloadBtn) batchDownloadBtn.addEventListener('click', batchDownload);
-  if (batchCopyBtn) batchCopyBtn.addEventListener('click', copySelected);
-  if (batchDeleteBtn) batchDeleteBtn.addEventListener('click', batchDelete);
-  if (selectVisibleBtn) selectVisibleBtn.addEventListener('click', selectVisibleFiles);
-  if (clearSelectionBtn) clearSelectionBtn.addEventListener('click', clearSelection);
-  if (gridViewBtn) gridViewBtn.addEventListener('click', () => setViewMode('grid'));
-  if (listViewBtn) listViewBtn.addEventListener('click', () => setViewMode('list'));
+  listen(batchDownloadBtn, 'click', batchDownload);
+  listen(batchCopyBtn, 'click', copySelected);
+  listen(batchDeleteBtn, 'click', batchDelete);
+  listen(selectVisibleBtn, 'click', selectVisibleFiles);
+  listen(clearSelectionBtn, 'click', clearSelection);
+  listen(gridViewBtn, 'click', () => setViewMode('grid'));
+  listen(listViewBtn, 'click', () => setViewMode('list'));
   for (const button of [gridViewBtn, listViewBtn]) {
-    if (button) button.addEventListener('keydown', event => handleViewKeydown(event, button));
+    listen(button, 'keydown', event => handleViewKeydown(event, button));
   }
-  if (clearFiltersBtn) clearFiltersBtn.addEventListener('click', clearFilters);
-  if (loadMoreBtn) loadMoreBtn.addEventListener('click', loadMore);
+  listen(clearFiltersBtn, 'click', clearFilters);
+  listen(loadMoreBtn, 'click', loadMore);
 
   if (fileListEl) {
-    fileListEl.addEventListener('click', handleFileAction);
-    fileListEl.addEventListener('change', (event) => {
+    listen(fileListEl, 'click', handleFileAction);
+    listen(fileListEl, 'change', (event) => {
       const checkbox = event.target.closest('[data-select-message]');
       if (checkbox) toggleFileSelection(checkbox.dataset.selectMessage, checkbox.checked);
     });
   }
-  if (previewModal) previewModal.addEventListener('click', (event) => {
+  listen(previewModal, 'click', (event) => {
     if (event.target === previewModal) closePreview();
   });
-  if (closePreviewBtn) closePreviewBtn.addEventListener('click', closePreview);
-  if (previewCopyBtn) previewCopyBtn.addEventListener('click', () => {
+  listen(closePreviewBtn, 'click', closePreview);
+  listen(previewCopyBtn, 'click', () => {
     if (currentPreview) copyLink(currentPreview);
   });
-  document.addEventListener('keydown', (event) => {
+  listen(document, 'keydown', (event) => {
     if (event.key === 'Escape' && previewModal && !previewModal.hidden) closePreview();
   });
 
-  if (searchInput) searchInput.addEventListener('input', debounce(reloadFromStart, 300));
-  if (typeSelect) typeSelect.addEventListener('change', reloadFromStart);
-  if (deviceInput) deviceInput.addEventListener('input', reloadFromStart);
-  if (dateFromInput) dateFromInput.addEventListener('change', reloadFromStart);
-  if (dateToInput) dateToInput.addEventListener('change', reloadFromStart);
+  listen(searchInput, 'input', debounce(reloadFromStart, 300));
+  listen(typeSelect, 'change', reloadFromStart);
+  listen(deviceInput, 'input', reloadFromStart);
+  listen(dateFromInput, 'change', reloadFromStart);
+  listen(dateToInput, 'change', reloadFromStart);
+
+  function listen(target, type, handler) {
+    if (!target || destroyed) return;
+    target.addEventListener(type, handler);
+    listenerCleanups.push(() => target.removeEventListener(type, handler));
+  }
+
+  function destroy() {
+    if (destroyed) return;
+    destroyed = true;
+    while (listenerCleanups.length) listenerCleanups.pop()();
+    for (const timer of pendingTimers) clearTimeout(timer);
+    pendingTimers.clear();
+    reloadPending = false;
+  }
 
   function debounce(fn, ms) {
     let timer;
     return (...args) => {
       clearTimeout(timer);
-      timer = setTimeout(() => fn(...args), ms);
+      pendingTimers.delete(timer);
+      if (destroyed) return;
+      timer = setTimeout(() => {
+        pendingTimers.delete(timer);
+        if (!destroyed) fn(...args);
+      }, ms);
+      pendingTimers.add(timer);
     };
   }
 
@@ -244,7 +268,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
     previewModal.hidden = false;
     previewModal.classList.add('open');
     if (closePreviewBtn) closePreviewBtn.focus();
-    document.addEventListener('keydown', trapPreviewFocus);
+    listen(document, 'keydown', trapPreviewFocus);
   }
 
   function trapPreviewFocus(event) {
@@ -311,7 +335,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
     undoBtn.className = 'btn btn-soft';
     undoBtn.type = 'button';
     undoBtn.textContent = ' · 撤销';
-    undoBtn.addEventListener('click', async () => {
+    listen(undoBtn, 'click', async () => {
       undoBtn.disabled = true;
       try {
         await api(`/api/messages/${encodeURIComponent(messageId)}/restore`, { method: 'POST' });
@@ -529,7 +553,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
     undoBtn.className = 'btn btn-soft';
     undoBtn.type = 'button';
     undoBtn.textContent = ' · 撤销';
-    undoBtn.addEventListener('click', async () => {
+    listen(undoBtn, 'click', async () => {
       undoBtn.disabled = true;
       let restored = 0;
       for (const id of deletedIds) {
@@ -753,6 +777,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {} }) {
     loadMore,
     applyEvent,
     clearSelection,
+    destroy,
     openMessage,
     getFiles: () => filesState,
     reloadFromStart,
