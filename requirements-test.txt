@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest>=9.0,<10.0
+httpx>=0.28,<0.29
+quickjs==1.19.4
+playwright==1.55.0

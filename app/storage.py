@@ -12,7 +12,7 @@ from fastapi import HTTPException, UploadFile
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
-FILE_ID_PATTERN = re.compile(r"^[0-9a-f]{12}$")
+FILE_ID_PATTERN = re.compile(r"^(?:[0-9a-f]{12}|[0-9a-f]{32})$")
 MAX_DISPLAY_NAME_LENGTH = 120
 
 
@@ -86,6 +86,19 @@ class StoredFile:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class PendingFile:
+    file_id: str
+    original_name: str
+    storage_name: str
+    temporary_path: Path
+    final_path: Path
+    mime_type: str
+    extension: str
+    size_bytes: int
+    sha256: str
+
+
 class FileStorage:
     def __init__(self, upload_dir: Path, max_upload_size: int, allowed_extensions: set[str]) -> None:
         self.upload_dir = upload_dir
@@ -121,58 +134,100 @@ class FileStorage:
                 return item
         raise HTTPException(status_code=404, detail="File not found")
 
+    def path_for(self, storage_name: str) -> Path:
+        safe_name = Path(storage_name).name
+        if not safe_name or safe_name != storage_name:
+            raise ValueError("Invalid storage name")
+        return self.upload_dir / safe_name
+
     def delete_file(self, file_id: str) -> None:
         target = self.get_file(file_id)
         target.path.unlink()
 
-    def prune_expired(self, retention_days: int) -> int:
-        if retention_days <= 0:
-            return 0
-        cutoff = time() - (retention_days * 24 * 60 * 60)
-        removed = 0
-        for item in self.list_files():
-            if item.modified_at >= cutoff:
-                continue
-            item.path.unlink(missing_ok=True)
-            removed += 1
-        return removed
+    def purge_file(self, storage_name: str) -> None:
+        target = self.upload_dir / Path(storage_name).name
+        target.unlink(missing_ok=True)
 
-    def save_upload(self, upload: UploadFile) -> StoredFile:
+    def has_published_file(self, storage_name: str) -> bool:
+        return (self.upload_dir / Path(storage_name).name).is_file()
+
+    def pending_from_reservation(self, reservation: dict[str, object]) -> PendingFile:
+        file_id = str(reservation["file_id"])
+        storage_name = Path(str(reservation["storage_name"])).name
+        return PendingFile(
+            file_id=file_id,
+            original_name=str(reservation["original_name"]),
+            storage_name=storage_name,
+            temporary_path=self.upload_dir / f".{file_id}.uploading",
+            final_path=self.upload_dir / storage_name,
+            mime_type=str(reservation["mime_type"]),
+            extension=str(reservation["extension"]),
+            size_bytes=int(reservation["size_bytes"]),
+            sha256=str(reservation["sha256"]),
+        )
+
+    def discard_orphaned_temporary_files(
+        self, reserved_file_ids: set[str] | None = None
+    ) -> None:
+        protected_names = {
+            f".{file_id}.uploading" for file_id in (reserved_file_ids or set())
+        }
+        for path in self.upload_dir.glob(".*.uploading"):
+            if path.is_file() and path.name not in protected_names:
+                path.unlink(missing_ok=True)
+
+    def stage_upload(self, upload: UploadFile) -> PendingFile:
         safe_name = sanitize_filename(upload.filename or "unnamed-file")
         extension = Path(safe_name).suffix.lower()
         if self.allowed_extensions and extension not in self.allowed_extensions:
             allowed = ", ".join(sorted(self.allowed_extensions))
             raise HTTPException(status_code=400, detail=f"File type not allowed. Allowed: {allowed}")
 
-        file_id = uuid.uuid4().hex[:12]
-        destination = self.upload_dir / f"{file_id}_{safe_name}"
+        file_id = uuid.uuid4().hex
+        final_path = self.upload_dir / f"{file_id}_{safe_name}"
+        temporary_path = self.upload_dir / f".{file_id}.uploading"
+        digest = sha256()
         written = 0
         upload.file.seek(0)
-        with destination.open("wb") as output:
-            while True:
-                chunk = upload.file.read(1024 * 1024)
-                if not chunk:
-                    break
-                written += len(chunk)
-                if written > self.max_upload_size:
-                    output.close()
-                    destination.unlink(missing_ok=True)
-                    limit_mb = self.max_upload_size // (1024 * 1024)
-                    raise HTTPException(status_code=413, detail=f"File too large. Max {limit_mb} MB")
-                output.write(chunk)
+        try:
+            with temporary_path.open("xb") as output:
+                while True:
+                    chunk = upload.file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > self.max_upload_size:
+                        limit_mb = self.max_upload_size // (1024 * 1024)
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"File too large. Max {limit_mb} MB",
+                        )
+                    digest.update(chunk)
+                    output.write(chunk)
 
-        if written == 0:
-            destination.unlink(missing_ok=True)
-            raise HTTPException(status_code=400, detail="Empty files are not allowed")
+            if written == 0:
+                raise HTTPException(status_code=400, detail="Empty files are not allowed")
+        except Exception:
+            temporary_path.unlink(missing_ok=True)
+            raise
 
-        stat = destination.stat()
-        return StoredFile(
+        return PendingFile(
             file_id=file_id,
-            display_name=safe_name,
-            path=destination,
-            size_bytes=stat.st_size,
-            modified_at=stat.st_mtime,
+            original_name=safe_name,
+            storage_name=final_path.name,
+            temporary_path=temporary_path,
+            final_path=final_path,
+            mime_type=upload.content_type or "application/octet-stream",
+            extension=extension,
+            size_bytes=written,
+            sha256=digest.hexdigest(),
         )
+
+    def publish(self, pending: PendingFile) -> None:
+        pending.temporary_path.replace(pending.final_path)
+
+    def discard(self, pending: PendingFile) -> None:
+        pending.temporary_path.unlink(missing_ok=True)
 
     def stats(self) -> dict[str, str | int]:
         files = self.list_files()
