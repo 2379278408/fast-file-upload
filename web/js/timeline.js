@@ -1,3 +1,5 @@
+import { UNDO_WINDOW_MS, HIGHLIGHT_DURATION_MS } from './config.js';
+
 export function createTimeline({ container, newMessageButton, api, onRestore }) {
   const messages = new Map();
   const appliedSequences = new Set();
@@ -193,8 +195,8 @@ export function createTimeline({ container, newMessageButton, api, onRestore }) 
 
     const deletedAt = Date.parse(message.deleted_at || '');
     const undoMilliseconds = Number.isFinite(deletedAt)
-      ? Math.max(0, deletedAt + 30000 - Date.now())
-      : 30000;
+      ? Math.max(0, deletedAt + UNDO_WINDOW_MS - Date.now())
+      : UNDO_WINDOW_MS;
     const expiryTimer = setTimeout(() => notice.remove(), undoMilliseconds);
     undoButton.addEventListener('click', async () => {
       undoButton.disabled = true;
@@ -354,7 +356,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore }) 
     if (el) {
       el.scrollIntoView({ behavior: 'smooth', block: 'center' });
       el.classList.add('timeline-message-highlight');
-      setTimeout(() => el.classList.remove('timeline-message-highlight'), 2000);
+      setTimeout(() => el.classList.remove('timeline-message-highlight'), HIGHLIGHT_DURATION_MS);
       return true;
     }
     return false;

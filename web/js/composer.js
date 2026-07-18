@@ -1,4 +1,5 @@
 import { sendText, uploadFile } from './api.js';
+import { MAX_TEXT_LENGTH, TOAST_DURATION_MS } from './config.js';
 
 export function createComposer({ form, textarea, fileInput, dropTarget, queue, api, timeline }) {
   const uploadTasks = [];
@@ -14,13 +15,13 @@ export function createComposer({ form, textarea, fileInput, dropTarget, queue, a
     toastEl.textContent = message;
     toastEl.className = `toast ${type} show`;
     window.clearTimeout(showToast.timer);
-    showToast.timer = window.setTimeout(() => toastEl.classList.remove('show'), 2600);
+    showToast.timer = window.setTimeout(() => toastEl.classList.remove('show'), TOAST_DURATION_MS);
   }
 
   async function submitText() {
     const text = textarea.value;
     if (!text.trim()) return;
-    if (text.length > 10000) return showComposerError('文本最多 10,000 个字符');
+    if (text.length > MAX_TEXT_LENGTH) return showComposerError('文本最多 10,000 个字符');
     try {
       const message = await sendText(text, crypto.randomUUID());
       textarea.value = '';

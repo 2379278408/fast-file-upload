@@ -1,3 +1,5 @@
+import { RECONNECT_DELAYS } from './config.js';
+
 export class ApiError extends Error {
   constructor(status, body) {
     super(`API error ${status}`);
@@ -5,8 +7,6 @@ export class ApiError extends Error {
     this.body = body;
   }
 }
-
-const reconnectDelays = [1000, 2000, 4000, 8000, 16000, 30000];
 const LAST_SEQ_KEY = 'transfer-last-sequence';
 
 export function connectEvents({ after, onEvent, onStatus }) {
@@ -43,7 +43,7 @@ export function connectEvents({ after, onEvent, onStatus }) {
       }
       onStatus('reconnecting');
       clearReconnectTimer();
-      const delay = reconnectDelays[Math.min(attempt++, reconnectDelays.length - 1)];
+      const delay = RECONNECT_DELAYS[Math.min(attempt++, RECONNECT_DELAYS.length - 1)];
       const timer = window.setTimeout(() => {
         if (reconnectTimer !== timer) return;
         reconnectTimer = null;

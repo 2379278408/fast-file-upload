@@ -443,6 +443,13 @@ def transform_module(source: str, module_path: str) -> str:
 
 
 def load_js_module(context: quickjs.Context, module_path: str, source: str) -> None:
+    if module_path != "./config.js":
+        try:
+            context.eval('typeof globalThis.__modules["./config.js"]')
+            if 'undefined' in str(context.eval('typeof globalThis.__modules["./config.js"]')):
+                context.eval(transform_module(read_web("js/config.js"), "./config.js"))
+        except Exception:
+            context.eval(transform_module(read_web("js/config.js"), "./config.js"))
     context.eval(transform_module(source, module_path))
 
 
@@ -511,7 +518,7 @@ def test_unlock_form_and_session_expired_markup(client: TestClient) -> None:
 
 
 def load_app_modules(context: quickjs.Context) -> None:
-    for module_path in ("./api.js", "./timeline.js", "./composer.js", "./library.js"):
+    for module_path in ("./config.js", "./api.js", "./timeline.js", "./composer.js", "./library.js"):
         load_js_module(context, module_path, read_web(f"js/{module_path[2:]}"))
     load_js_module(context, "./app.js", read_web("js/app.js"))
     drain_jobs(context)
@@ -1080,7 +1087,7 @@ def test_timeline_css_classes_present(client: TestClient) -> None:
 def test_composer_contract_has_keyboard_paste_cancel_retry_and_preserved_text() -> None:
     source = read_web("js/composer.js")
     for token in ("event.key === 'Enter'", "event.shiftKey", "clipboardData.items", "kind === 'file'",
-                  "AbortController", "cancelUpload", "retryUpload", "text.length > 10000", "crypto.randomUUID"):
+                  "AbortController", "cancelUpload", "retryUpload", "MAX_TEXT_LENGTH", "crypto.randomUUID"):
         assert token in source
     assert "textarea.value = ''" in source
     assert source.index("await sendText") < source.index("textarea.value = ''")
@@ -1132,8 +1139,9 @@ def test_library_contract_has_filters_batches_storage_and_timeline_location() ->
 
 
 def test_reconnect_and_responsive_contracts() -> None:
-    api, css, html = read_web("js/api.js"), read_web("styles.css"), read_web("index.html")
-    assert "const reconnectDelays = [1000, 2000, 4000, 8000, 16000, 30000]" in api
+    api, config, css, html = read_web("js/api.js"), read_web("js/config.js"), read_web("styles.css"), read_web("index.html")
+    assert "RECONNECT_DELAYS" in api and "from './config.js'" in api
+    assert "RECONNECT_DELAYS = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000]" in config
     assert "transfer-last-sequence" in api and "event.sequence" in api
     assert "reconnecting" in api and "after=" in api
     assert "@media (max-width: 480px)" in css

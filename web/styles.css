@@ -1093,6 +1093,24 @@
             }
         }
 
+        @media (max-width: 945px) {
+            .library-filter-row {
+                flex-wrap: wrap;
+            }
+
+            .library-filter-row .field-grow {
+                flex-basis: 100%;
+            }
+
+            .filter-grid {
+                grid-template-columns: 1fr 1fr;
+            }
+
+            .library-actions {
+                flex-wrap: wrap;
+            }
+        }
+
         @media (max-width: 720px) {
             .app {
                 width: min(100vw - 20px, 100%);

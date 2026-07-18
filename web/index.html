@@ -8,6 +8,8 @@
 </head>
 <body>
     <a href="#timelineView" id="skipLink" class="visually-hidden skip-link">跳转到内容</a>
+
+    <!-- Session: unlock overlay (shown when token expires) -->
     <div id="sessionExpired" class="session-overlay is-hidden" role="dialog" aria-modal="true" aria-labelledby="unlockTitle">
         <form id="unlockForm" class="unlock-card">
             <h2 id="unlockTitle">访问验证</h2>
@@ -25,7 +27,9 @@
         </form>
     </div>
 
+    <!-- Main: timeline view (single-page layout) -->
     <main id="timelineView" class="app stack" tabindex="-1">
+        <!-- Masthead: topbar + hero stats -->
         <section class="panel masthead">
             <div class="topbar">
                 <div class="brand">File Transfer Workspace</div>
@@ -55,6 +59,7 @@
             </div>
         </section>
 
+        <!-- Library: file list with filters and batch actions -->
         <section id="libraryView" class="panel library-panel" tabindex="-1">
             <div class="library-head">
                 <div class="library-heading">
@@ -149,6 +154,7 @@
             <div class="storage-card" id="storageSummary">-</div>
         </section>
 
+        <!-- Composer: text input + file upload -->
         <section class="panel composer-panel" id="composerPanel">
             <form class="composer-form" id="composerForm">
                 <div class="composer-drop-target" id="composerDropTarget">
@@ -177,6 +183,7 @@
             <div class="composer-queue" id="composerQueue"></div>
         </section>
 
+        <!-- Timeline: message stream with undo -->
         <section class="panel timeline-panel" id="timelinePanel">
             <div class="timeline-head">
                 <div>
@@ -197,6 +204,7 @@
             </button>
         </section>
 
+        <!-- Operations: storage stats + audit trail -->
         <section class="panel operations-panel" aria-labelledby="operationsTitle">
             <div class="library-head">
                 <div class="library-heading">
@@ -229,6 +237,7 @@
         </section>
     </main>
 
+    <!-- Preview modal: image preview + metadata + actions -->
     <div class="preview-modal" id="previewModal" role="dialog" aria-modal="true" aria-labelledby="previewTitle" hidden>
         <div class="preview-shell">
             <div class="preview-image-frame">
@@ -261,8 +270,10 @@
         </div>
     </div>
 
+    <!-- Toast: global notification (undo + status) -->
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
+    <!-- Batch toolbar: fixed bottom bar for selected files -->
     <div class="batch-toolbar" id="batchToolbar" aria-label="批量操作">
         <span class="pill"><strong id="batchToolbarCount">0</strong> 已选择</span>
         <button class="btn btn-soft btn-icon" id="batchToolbarDownload" type="button">

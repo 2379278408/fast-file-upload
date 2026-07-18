@@ -2,6 +2,7 @@ import { request as apiRequest, unlock as apiUnlock, logout as apiLogout, getSes
 import { createTimeline } from './timeline.js';
 import { createComposer } from './composer.js';
 import { createLibrary } from './library.js';
+import { TOAST_DURATION_MS } from './config.js';
 
 const DEVICE_ID_KEY = 'device-id';
 const DEVICE_NAME_KEY = 'device-name';
@@ -485,7 +486,7 @@ function showToast(message, type) {
   toastEl.textContent = message;
   toastEl.className = `toast ${type} show`;
   window.clearTimeout(showToast.timer);
-  showToast.timer = window.setTimeout(() => toastEl.classList.remove('show'), 2600);
+  showToast.timer = window.setTimeout(() => toastEl.classList.remove('show'), TOAST_DURATION_MS);
 }
 
 function formatBytes(size) {

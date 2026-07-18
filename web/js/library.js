@@ -1,3 +1,5 @@
+import { UNDO_WINDOW_MS, TOAST_DURATION_MS } from './config.js';
+
 export function createLibrary({ root, api, timeline }) {
   const fileListEl = root.querySelector('#fileList');
   const libraryCountEl = root.querySelector('#libraryCount');
@@ -263,7 +265,7 @@ export function createLibrary({ root, api, timeline }) {
     const toastEl = document.getElementById('toast');
     if (!toastEl) return;
     const deletedAt = deleted && deleted.deleted_at ? Date.parse(deleted.deleted_at) : Date.now();
-    const remaining = Math.max(0, deletedAt + 30000 - Date.now());
+    const remaining = Math.max(0, deletedAt + UNDO_WINDOW_MS - Date.now());
 
     toastEl.textContent = '文件已删除';
     const undoBtn = document.createElement('button');
@@ -476,7 +478,7 @@ export function createLibrary({ root, api, timeline }) {
   function showBatchUndoToast(deletedIds, count) {
     const toastEl = document.getElementById('toast');
     if (!toastEl) return;
-    const remaining = 30000;
+    const remaining = UNDO_WINDOW_MS;
 
     if (!deletedIds.length) {
       showToast(`已删除 ${count} 个文件`, 'info');
@@ -641,7 +643,7 @@ export function createLibrary({ root, api, timeline }) {
     toastEl.textContent = message;
     toastEl.className = `toast ${type} show`;
     window.clearTimeout(showToast.timer);
-    showToast.timer = window.setTimeout(() => toastEl.classList.remove('show'), 2600);
+    showToast.timer = window.setTimeout(() => toastEl.classList.remove('show'), TOAST_DURATION_MS);
   }
 
   return {
