@@ -290,6 +290,12 @@ def _assert_browser_clean(session: BrowserSession) -> None:
     assert len(session.document_csp_headers) == 1
 
 
+def _assert_no_horizontal_overflow(page: Page) -> None:
+    assert page.evaluate(
+        "() => document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+    )
+
+
 def test_live_server_retries_an_occupied_first_port(tmp_path: Path) -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as blocker:
         blocker.bind(("127.0.0.1", 0))
@@ -412,22 +418,6 @@ def test_tabs_skip_link_and_mobile_touch_targets(
     assert unlock_box["width"] >= 44 and unlock_box["height"] >= 44
     _unlock(page)
 
-    grid = page.locator("#gridViewBtn")
-    list_view = page.locator("#listViewBtn")
-    grid.focus()
-    page.keyboard.press("ArrowRight")
-    expect(list_view).to_be_focused()
-    expect(list_view).to_have_attribute("aria-selected", "true")
-    page.keyboard.press("ArrowLeft")
-    expect(grid).to_be_focused()
-    expect(grid).to_have_attribute("aria-selected", "true")
-    page.keyboard.press("End")
-    expect(list_view).to_be_focused()
-    expect(list_view).to_have_attribute("aria-selected", "true")
-    page.keyboard.press("Home")
-    expect(grid).to_be_focused()
-    expect(grid).to_have_attribute("aria-selected", "true")
-
     skip_link = page.locator("#skipLink")
     page.evaluate(
         """
@@ -449,19 +439,34 @@ def test_tabs_skip_link_and_mobile_touch_targets(
     assert skip_box is not None and skip_box["width"] > 1 and skip_box["height"] > 1
     page.keyboard.press("Enter")
     expect(page.locator("#mainContent")).to_be_focused()
-    assert page.evaluate("location.hash") == "#mainContent"
+    assert page.evaluate("location.hash") == "#transfer"
     assert page.evaluate("window.__skipLinkFocusCalls") == 1
 
-    page.evaluate("history.replaceState(null, '', location.pathname + location.search)")
     skip_link.focus()
     skip_link.click()
     expect(page.locator("#mainContent")).to_be_focused()
-    assert page.evaluate("location.hash") == "#mainContent"
+    assert page.evaluate("location.hash") == "#transfer"
     assert page.evaluate("window.__skipLinkFocusCalls") == 2
 
-    assert page.evaluate(
-        "() => document.documentElement.scrollWidth <= document.documentElement.clientWidth"
-    )
+    page.locator('.mobile-nav [data-route="files"]').click()
+    expect(page.locator("#filesPage")).to_be_visible()
+    grid = page.locator("#gridViewBtn")
+    list_view = page.locator("#listViewBtn")
+    grid.focus()
+    page.keyboard.press("ArrowRight")
+    expect(list_view).to_be_focused()
+    expect(list_view).to_have_attribute("aria-selected", "true")
+    page.keyboard.press("ArrowLeft")
+    expect(grid).to_be_focused()
+    expect(grid).to_have_attribute("aria-selected", "true")
+    page.keyboard.press("End")
+    expect(list_view).to_be_focused()
+    expect(list_view).to_have_attribute("aria-selected", "true")
+    page.keyboard.press("Home")
+    expect(grid).to_be_focused()
+    expect(grid).to_have_attribute("aria-selected", "true")
+
+    _assert_no_horizontal_overflow(page)
     major_button_boxes = page.locator(
         "button.btn-primary:visible, #gridViewBtn:visible, #listViewBtn:visible, "
         "#composerAttachBtn:visible"
@@ -478,6 +483,99 @@ def test_tabs_skip_link_and_mobile_touch_targets(
         box["width"] >= 44 and box["height"] >= 44
         for box in major_button_boxes
     ), major_button_boxes
+    _assert_browser_clean(browser_session)
+
+
+@pytest.mark.parametrize(
+    ("viewport", "nav_selector"),
+    [
+        pytest.param(
+            {"width": 1440, "height": 900}, ".sidebar", id="desktop-1440"
+        ),
+        pytest.param(
+            {"width": 390, "height": 844}, ".mobile-nav", id="mobile-390x844"
+        ),
+        pytest.param(
+            {"width": 390, "height": 568}, ".mobile-nav", id="mobile-390x568"
+        ),
+    ],
+)
+def test_three_route_navigation_history_focus_and_viewport_safety(
+    browser_session: BrowserSession,
+    viewport: dict[str, int],
+    nav_selector: str,
+) -> None:
+    page = browser_session.page
+    page.set_viewport_size(viewport)
+    _open_locked_application(browser_session)
+    _unlock(page)
+
+    expect(page.locator("#transferPage")).to_be_visible()
+    assert page.evaluate("location.hash") == "#transfer"
+    _assert_no_horizontal_overflow(page)
+
+    page.locator(f'{nav_selector} [data-route="transfer"]').click()
+    expect(page.locator('[data-route-heading="transfer"]')).to_be_focused()
+    expect(page).to_have_title("传输工作台 · MonkeyCode")
+
+    page.locator(f'{nav_selector} [data-route="files"]').click()
+    expect(page.locator("#filesPage")).to_be_visible()
+    expect(page.locator('[data-route-heading="files"]')).to_be_focused()
+    expect(page).to_have_title("全部文件 · MonkeyCode")
+    assert page.evaluate("location.hash") == "#files"
+    _assert_no_horizontal_overflow(page)
+
+    assert page.locator("#batchToolbar").evaluate(
+        "element => getComputedStyle(element).pointerEvents"
+    ) == "none"
+    page.locator(f'{nav_selector} [data-route="manage"]').click()
+    expect(page.locator("#managePage")).to_be_visible()
+    expect(page.locator('[data-route-heading="manage"]')).to_be_focused()
+    expect(page).to_have_title("管理与设置 · MonkeyCode")
+    assert page.evaluate("location.hash") == "#manage"
+    _assert_no_horizontal_overflow(page)
+
+    page.go_back()
+    expect(page.locator("#filesPage")).to_be_visible()
+    assert page.evaluate("location.hash") == "#files"
+    page.go_forward()
+    expect(page.locator("#managePage")).to_be_visible()
+    assert page.evaluate("location.hash") == "#manage"
+
+    page.locator(f'{nav_selector} [data-route="transfer"]').click()
+    expect(page.locator("#transferPage")).to_be_visible()
+    expect(page.locator('[data-route-heading="transfer"]')).to_be_focused()
+    _assert_no_horizontal_overflow(page)
+
+    if nav_selector == ".mobile-nav":
+        composer = page.locator("#composerPanel")
+        mobile_nav = page.locator(".mobile-nav")
+        composer.evaluate("element => element.scrollIntoView({ block: 'end' })")
+        composer_box = composer.bounding_box()
+        mobile_nav_box = mobile_nav.bounding_box()
+        assert composer_box is not None and mobile_nav_box is not None
+        assert composer_box["y"] + composer_box["height"] <= mobile_nav_box["y"]
+
+    _assert_browser_clean(browser_session)
+
+
+def test_empty_files_action_returns_to_transfer_and_opens_picker(
+    browser_session: BrowserSession,
+) -> None:
+    page = browser_session.page
+    _open_locked_application(browser_session)
+    _unlock(page)
+
+    page.locator('.sidebar [data-route="files"]').click()
+    empty_action = page.locator("#emptyFilesAction")
+    expect(empty_action).to_be_visible()
+    with page.expect_file_chooser() as chooser_info:
+        empty_action.click()
+
+    assert chooser_info.value.is_multiple()
+    expect(page.locator("#transferPage")).to_be_visible()
+    expect(page.locator('[data-route-heading="transfer"]')).to_be_focused()
+    assert page.evaluate("location.hash") == "#transfer"
     _assert_browser_clean(browser_session)
 
 
