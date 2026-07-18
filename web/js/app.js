@@ -642,6 +642,56 @@ try {
   // matchMedia not available (e.g. QuickJS test environment)
 }
 
+// Sidebar navigation
+function setupNavigation() {
+  const navButtons = document.querySelectorAll('[data-section]');
+  if (!navButtons.length) return;
+
+  const sectionPanels = {
+    workspace: ['composerPanel', 'libraryView'],
+    files: ['libraryView'],
+    activity: ['timelinePanel'],
+    devices: ['connectionPanel'],
+    settings: ['operationsPanel']
+  };
+
+  function switchSection(section) {
+    navButtons.forEach(b => {
+      b.classList.remove('active');
+      b.removeAttribute('aria-current');
+    });
+    document.querySelectorAll(`[data-section="${section}"]`).forEach(b => {
+      b.classList.add('active');
+      b.setAttribute('aria-current', 'page');
+    });
+
+    // Show/hide panels based on section
+    const mainColumn = document.querySelector('.main-column');
+    const rail = document.querySelector('.rail');
+    if (mainColumn) {
+      const panels = mainColumn.querySelectorAll(':scope > .panel');
+      panels.forEach(p => {
+        const id = p.id;
+        const shouldShow = section === 'workspace' || (sectionPanels[section] && sectionPanels[section].includes(id));
+        p.hidden = !shouldShow;
+      });
+    }
+    if (rail) {
+      const railPanels = rail.querySelectorAll(':scope > .panel');
+      railPanels.forEach(p => {
+        const id = p.id;
+        const shouldShow = section === 'workspace' || (sectionPanels[section] && sectionPanels[section].includes(id));
+        p.hidden = !shouldShow;
+      });
+    }
+  }
+
+  navButtons.forEach(btn => {
+    btn.addEventListener('click', () => switchSection(btn.dataset.section));
+  });
+}
+try { setupNavigation(); } catch { /* noop */ }
+
 // Library filter toggle
 const filterToggleBtn = document.getElementById('filterToggleBtn');
 const filterGrid = document.getElementById('filterGrid');
