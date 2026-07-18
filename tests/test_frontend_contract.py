@@ -576,55 +576,167 @@ def test_transfer_timeline_has_bounded_internal_scroll_at_all_viewports() -> Non
 
 def test_mobile_transfer_layout_budget_for_short_and_tall_viewports() -> None:
     css = read_web("styles.css")
-    root = css[css.index(":root {"):css.index(".dark {")]
-    mobile = css[css.index("@media (max-width: 720px)"):css.index("@media (max-width: 430px)")]
-    compact = css[css.index("@media (max-width: 430px)"):]
+    mobile_start = css.index("@media (max-width: 720px)")
+    compact_start = css.index("@media (max-width: 430px)")
+    mobile = css[mobile_start:compact_start]
 
-    def px(source: str, name: str) -> int:
-        match = re.search(rf"{re.escape(name)}:\s*(?:calc\()?\s*(\d+)px", source)
-        assert match, f"missing pixel value for {name}"
-        return int(match.group(1))
+    def rule(source: str, selector: str) -> str:
+        match = re.search(rf"{re.escape(selector)}\s*\{{([^{{}}]*)\}}", source)
+        assert match, f"missing CSS rule for {selector}"
+        return match.group(1)
 
-    topbar_height = px(compact, "--topbar-height")
-    nav_offset = px(root, "--mobile-fixed-offset")
-    page_offset = px(mobile, "--transfer-page-offset")
-    workspace_floor = px(mobile, "--mobile-workspace-min-height")
-    timeline_shell_min = px(mobile, "--mobile-timeline-shell-min-height")
-    timeline_inner_min = px(mobile, "--mobile-timeline-min-height")
-    mobile_nav_start = mobile.index(".mobile-nav {")
-    mobile_nav = mobile[mobile_nav_start:mobile.index(".mobile-nav button", mobile_nav_start)]
-    mobile_body = mobile[mobile.index("body {"):mobile.index(".app-shell {")]
-    nav_height = px(mobile_nav, "height")
-    body_clearance = px(mobile_body, "padding-bottom")
+    def declaration(block: str, name: str) -> str:
+        match = re.search(rf"(?:^|;)\s*{re.escape(name)}\s*:\s*([^;]+)", block)
+        assert match, f"missing CSS declaration for {name}"
+        return match.group(1).strip()
 
-    def layout(viewport_height: int) -> dict[str, int]:
+    def pixels(expression: str) -> float:
+        match = re.search(r"(-?\d+(?:\.\d+)?)px", expression)
+        assert match, f"missing pixel value in {expression}"
+        return float(match.group(1))
+
+    def clamp_pixels(expression: str, viewport_height: int) -> float:
+        match = re.fullmatch(
+            r"clamp\((\d+)px,\s*(\d+(?:\.\d+)?)dvh,\s*(\d+)px\)",
+            expression,
+        )
+        assert match, f"unsupported clamp expression {expression}"
+        minimum, viewport_ratio, maximum = map(float, match.groups())
+        return min(max(minimum, viewport_height * viewport_ratio / 100), maximum)
+
+    def layout(
+        stylesheet: str, viewport_width: int, viewport_height: int
+    ) -> dict[str, float]:
+        stylesheet_root = stylesheet[stylesheet.index(":root {"):stylesheet.index(".dark {")]
+        stylesheet_mobile_start = stylesheet.index("@media (max-width: 720px)")
+        stylesheet_compact_start = stylesheet.index("@media (max-width: 430px)")
+        stylesheet_mobile = stylesheet[stylesheet_mobile_start:stylesheet_compact_start]
+        stylesheet_compact = stylesheet[stylesheet_compact_start:]
+        assert viewport_width <= 430 < 720
+
+        root_vars = rule(stylesheet_root, ":root")
+        mobile_vars = rule(stylesheet_mobile, ":root")
+        compact_vars = rule(stylesheet_compact, ":root")
+        workspace_rule = rule(stylesheet_mobile, ".transfer-workspace")
+        timeline_rule = rule(stylesheet_mobile, ".transfer-workspace .timeline-container")
+        composer_rule = rule(stylesheet_mobile, ".composer-dock")
+        body_rule = rule(stylesheet_mobile, "body")
+        nav_rule = rule(stylesheet_mobile, ".mobile-nav")
+        compact_topbar_rule = rule(stylesheet_compact, ".topbar")
+
+        shell_variable = "var(--mobile-timeline-shell-min-height)"
+        inner_variable = "var(--mobile-timeline-min-height)"
+        assert declaration(workspace_rule, "grid-template-rows") == (
+            f"auto minmax({shell_variable}, 1fr) auto"
+        )
+        assert declaration(timeline_rule, "min-height") == inner_variable
+        assert declaration(workspace_rule, "min-height") == (
+            "max(var(--mobile-workspace-min-height), calc(100dvh - "
+            "var(--topbar-height) - var(--mobile-fixed-offset) - "
+            "var(--transfer-page-offset)))"
+        )
+        assert declaration(composer_rule, "position") == "relative"
+        assert declaration(composer_rule, "bottom") == "auto"
+        assert declaration(composer_rule, "scroll-margin-bottom") == "var(--mobile-fixed-offset)"
+        assert declaration(compact_topbar_rule, "height") == "var(--topbar-height)"
+
+        topbar_height = pixels(declaration(compact_vars, "--topbar-height"))
+        nav_offset = pixels(declaration(root_vars, "--mobile-fixed-offset"))
+        page_offset = pixels(declaration(mobile_vars, "--transfer-page-offset"))
+        workspace_floor = pixels(declaration(mobile_vars, "--mobile-workspace-min-height"))
+        timeline_shell_min = pixels(
+            declaration(mobile_vars, "--mobile-timeline-shell-min-height")
+        )
+        timeline_inner_min = pixels(
+            declaration(mobile_vars, "--mobile-timeline-min-height")
+        )
+        timeline_max = clamp_pixels(
+            declaration(timeline_rule, "max-height"), viewport_height
+        )
+        composer_max = clamp_pixels(
+            declaration(composer_rule, "max-height"), viewport_height
+        )
+        nav_height = pixels(declaration(nav_rule, "height"))
+        body_clearance = pixels(declaration(body_rule, "padding-bottom"))
         viewport_budget = viewport_height - topbar_height - nav_offset - page_offset
         workspace_height = max(workspace_floor, viewport_budget)
+
+        assert timeline_shell_min > timeline_inner_min > 0
+        assert timeline_max >= timeline_inner_min
+        assert nav_offset >= nav_height
+        assert body_clearance >= nav_height
         return {
+            "viewport_width": viewport_width,
             "workspace": workspace_height,
             "page_scroll": max(0, workspace_height - viewport_budget),
             "timeline_shell_min": timeline_shell_min,
             "timeline_inner_min": timeline_inner_min,
-            "nav_clearance": body_clearance - nav_height,
+            "timeline_max": round(timeline_max, 2),
+            "composer_max": round(composer_max, 2),
+            "composer_nav_gap": nav_offset - nav_height,
+            "page_nav_clearance": body_clearance - nav_height,
         }
 
-    assert layout(568) == {
+    assert layout(css, 390, 568) == {
+        "viewport_width": 390,
         "workspace": 520,
         "page_scroll": 220,
         "timeline_shell_min": 220,
         "timeline_inner_min": 120,
-        "nav_clearance": 4,
+        "timeline_max": 160,
+        "composer_max": 181.76,
+        "composer_nav_gap": 8,
+        "page_nav_clearance": 4,
     }
-    assert layout(844) == {
+    assert layout(css, 390, 844) == {
+        "viewport_width": 390,
         "workspace": 576,
         "page_scroll": 0,
         "timeline_shell_min": 220,
         "timeline_inner_min": 120,
-        "nav_clearance": 4,
+        "timeline_max": 236.32,
+        "composer_max": 240,
+        "composer_nav_gap": 8,
+        "page_nav_clearance": 4,
     }
-    assert timeline_shell_min > timeline_inner_min
-    assert "position: relative" in mobile and "bottom: auto" in mobile
-    assert "height: var(--topbar-height)" in compact
+
+    def mutate_mobile(old: str, new: str) -> str:
+        assert old in mobile
+        return css[:mobile_start] + mobile.replace(old, new, 1) + css[compact_start:]
+
+    broken_stylesheets = (
+        mutate_mobile(
+            "minmax(var(--mobile-timeline-shell-min-height), 1fr)",
+            "minmax(0, 1fr)",
+        ),
+        mutate_mobile(
+            "min-height: var(--mobile-timeline-min-height);",
+            "min-height: 0;",
+        ),
+        mutate_mobile(
+            "--mobile-timeline-shell-min-height: 220px;",
+            "--removed-timeline-shell-min-height: 220px;",
+        ),
+        mutate_mobile(
+            "--mobile-timeline-min-height: 120px;",
+            "--removed-timeline-min-height: 120px;",
+        ),
+        mutate_mobile(".transfer-workspace {", ".removed-transfer-workspace {"),
+        mutate_mobile(
+            ".transfer-workspace .timeline-container {",
+            ".removed-timeline-container {",
+        ),
+        mutate_mobile(".composer-dock {", ".removed-composer-dock {"),
+        mutate_mobile(
+            "scroll-margin-bottom: var(--mobile-fixed-offset);",
+            "scroll-margin-bottom: 0;",
+        ),
+        mutate_mobile("body { padding-bottom: 70px; }", "body { padding-bottom: 0; }"),
+        mutate_mobile("height: 66px;", "height: auto;"),
+    )
+    for broken_css in broken_stylesheets:
+        with pytest.raises(AssertionError):
+            layout(broken_css, 390, 568)
 
 
 def test_transfer_route_dead_styles_are_removed() -> None:
