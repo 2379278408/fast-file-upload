@@ -59,6 +59,50 @@ class InlineStyleAttributeParser(HTMLParser):
     handle_startendtag = handle_starttag
 
 
+class ShellContractParser(HTMLParser):
+    NAV_LABELS = {"主导航", "移动端主导航"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ids: list[str] = []
+        self.route_labels: dict[str, dict[str, str]] = {}
+        self._current_nav: str | None = None
+        self._current_route: str | None = None
+        self._label_parts: list[str] = []
+        self._badge_depth = 0
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        attributes = dict(attrs)
+        if element_id := attributes.get("id"):
+            self.ids.append(element_id)
+        if tag == "nav" and attributes.get("aria-label") in self.NAV_LABELS:
+            self._current_nav = attributes["aria-label"]
+            self.route_labels[self._current_nav] = {}
+        elif tag == "button" and self._current_nav and attributes.get("data-route"):
+            self._current_route = attributes["data-route"]
+            self._label_parts = []
+        elif tag == "b" and self._current_route:
+            self._badge_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "b" and self._badge_depth:
+            self._badge_depth -= 1
+        elif tag == "button" and self._current_nav and self._current_route:
+            self.route_labels[self._current_nav][self._current_route] = "".join(
+                self._label_parts
+            ).strip()
+            self._current_route = None
+            self._label_parts = []
+        elif tag == "nav" and self._current_nav:
+            self._current_nav = None
+
+    def handle_data(self, data: str) -> None:
+        if self._current_route and not self._badge_depth:
+            self._label_parts.append(data)
+
+
 def find_inline_style_violations(source_name: str, source: str) -> list[str]:
     violations: list[str] = []
     parser = InlineStyleAttributeParser()
@@ -498,6 +542,53 @@ def test_shell_has_three_matching_desktop_and_mobile_routes() -> None:
     assert 'data-route="devices"' not in html
 
 
+def test_shell_ids_are_unique_and_navigation_labels_match_route_hashes() -> None:
+    parser = ShellContractParser()
+    parser.feed(read_web("index.html"))
+    duplicate_ids = sorted({element_id for element_id in parser.ids if parser.ids.count(element_id) > 1})
+    assert duplicate_ids == []
+
+    expected_labels = {"transfer": "传输", "files": "文件", "manage": "管理"}
+    assert parser.route_labels == {
+        "主导航": expected_labels,
+        "移动端主导航": expected_labels,
+    }
+
+    context = create_js_context()
+    load_js_module(context, "./navigation.js", read_web("js/navigation.js"))
+    set_json(context, "shellRoutes", list(expected_labels))
+    hashes = json.loads(context.eval(r"""
+      const routeHashes = {};
+      for (const route of shellRoutes) {
+        let clickHandler = null;
+        const button = {
+          dataset: { route },
+          classList: { toggle() {} },
+          setAttribute() {}, removeAttribute() {},
+          addEventListener(_type, handler) { clickHandler = handler; },
+          removeEventListener() {}, click() { clickHandler(); },
+        };
+        const windowObject = {
+          scrollY: 0,
+          location: { hash: '#transfer' },
+          history: { replaceState(_state, _title, hash) { windowObject.location.hash = hash; } },
+          addEventListener() {}, removeEventListener() {}, scrollTo() {},
+        };
+        const documentObject = {
+          title: '',
+          querySelectorAll(selector) { return selector === '[data-route]' ? [button] : []; },
+          querySelector() { return null; },
+        };
+        const navigation = __modules['./navigation.js'].createNavigation({ windowObject, documentObject });
+        navigation.start();
+        button.click();
+        routeHashes[route] = windowObject.location.hash;
+      }
+      JSON.stringify(routeHashes);
+    """))
+    assert hashes == {"transfer": "#transfer", "files": "#files", "manage": "#manage"}
+
+
 def test_app_starts_navigation_and_clears_file_selection_on_route_exit() -> None:
     source = read_web("js/app.js")
     assert "from './navigation.js'" in source
@@ -507,10 +598,65 @@ def test_app_starts_navigation_and_clears_file_selection_on_route_exit() -> None
 
 
 def test_skip_link_preserves_application_route_hash() -> None:
-    source = read_web("js/app.js")
-    handler = source[source.index("if (skipLink && mainContent)"):source.index("async function checkSession")]
-    assert "mainContent.focus()" in handler
-    assert "location.hash = 'mainContent'" not in handler
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.WebSocket = class WebSocket { close() {} };
+      location.hash = '#files';
+    """)
+    load_app_modules(context)
+    context.eval(r"""
+      document.getElementById('skipLink').listeners.click[0]({ preventDefault() {} });
+    """)
+    result = json.loads(context.eval(r"""
+      JSON.stringify({ hash: location.hash, focus: document.activeElement.id });
+    """))
+    assert result == {"hash": "#files", "focus": "mainContent"}
+
+
+def test_navigation_focus_preserves_restored_scroll_position() -> None:
+    context = create_js_context()
+    load_js_module(context, "./navigation.js", read_web("js/navigation.js"))
+    result = json.loads(context.eval(r"""
+      const focusOptions = [];
+      const scrollCalls = [];
+      const windowListeners = {};
+      const headings = Object.fromEntries(['transfer', 'files'].map(route => [route, {
+        focus(options) {
+          focusOptions.push(options || null);
+          if (!options || options.preventScroll !== true) windowObject.scrollY = 999;
+        },
+      }]));
+      const windowObject = {
+        scrollY: 0,
+        location: { hash: '#transfer' },
+        history: { replaceState(_state, _title, hash) { windowObject.location.hash = hash; } },
+        addEventListener(type, listener) { windowListeners[type] = listener; },
+        removeEventListener() {},
+        scrollTo(x, y) { scrollCalls.push([x, y]); windowObject.scrollY = y; },
+      };
+      const documentObject = {
+        title: '',
+        querySelectorAll() { return []; },
+        querySelector(selector) {
+          const match = selector.match(/^\[data-route-heading="(.+)"\]$/);
+          return match ? headings[match[1]] : null;
+        },
+      };
+      const navigation = __modules['./navigation.js'].createNavigation({ windowObject, documentObject });
+      navigation.start();
+      windowObject.scrollY = 140;
+      navigation.navigate('files');
+      windowListeners.hashchange();
+      windowObject.scrollY = 60;
+      navigation.navigate('transfer');
+      windowListeners.hashchange();
+      JSON.stringify({ focusOptions, scrollCalls, scrollY: windowObject.scrollY });
+    """))
+    assert result == {
+        "focusOptions": [{"preventScroll": True}, {"preventScroll": True}],
+        "scrollCalls": [[0, 0], [0, 0], [0, 140]],
+        "scrollY": 140,
+    }
 
 
 def create_navigation_lifecycle_context() -> quickjs.Context:

@@ -36,7 +36,7 @@ export function createNavigation({ windowObject, documentObject, onRouteChange =
     onRouteChange(normalized);
     windowObject.scrollTo(0, scrollPositions.get(normalized) || 0);
     if (focusNextRoute) {
-      documentObject.querySelector(`[data-route-heading="${normalized}"]`)?.focus();
+      documentObject.querySelector(`[data-route-heading="${normalized}"]`)?.focus({ preventScroll: true });
       focusNextRoute = false;
     }
   }
