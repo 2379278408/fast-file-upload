@@ -560,4 +560,136 @@ function startEventConnection() {
   });
 }
 
+// Dark mode toggle
+const themeToggle = document.getElementById('themeToggle');
+const themeIconLight = document.getElementById('themeIconLight');
+const themeIconDark = document.getElementById('themeIconDark');
+const THEME_KEY = 'theme-preference';
+
+function getThemePreference() {
+  const stored = localStorage.getItem(THEME_KEY);
+  if (stored) return stored;
+  try {
+    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  } catch {
+    return 'light';
+  }
+}
+
+function applyTheme(theme) {
+  try {
+    document.documentElement.classList.toggle('dark', theme === 'dark');
+    if (themeIconLight) themeIconLight.classList.toggle('is-hidden', theme === 'dark');
+    if (themeIconDark) themeIconDark.classList.toggle('is-hidden', theme !== 'dark');
+  } catch {
+    // DOM not available (e.g. QuickJS test environment)
+  }
+}
+
+try { applyTheme(getThemePreference()); } catch { /* noop */ }
+
+if (themeToggle) {
+  themeToggle.addEventListener('click', () => {
+    try {
+      const current = document.documentElement.classList.contains('dark') ? 'dark' : 'light';
+      const next = current === 'dark' ? 'light' : 'dark';
+      localStorage.setItem(THEME_KEY, next);
+      applyTheme(next);
+    } catch { /* noop */ }
+  });
+}
+
+try {
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', event => {
+    if (!localStorage.getItem(THEME_KEY)) {
+      applyTheme(event.matches ? 'dark' : 'light');
+    }
+  });
+} catch {
+  // matchMedia not available (e.g. QuickJS test environment)
+}
+
+// Library filter toggle
+const filterToggleBtn = document.getElementById('filterToggleBtn');
+const filterGrid = document.getElementById('filterGrid');
+const clearFiltersBtn = document.getElementById('clearFiltersBtn');
+
+function updateClearFiltersVisibility() {
+  if (!clearFiltersBtn || !filterGrid) return;
+  const hasActiveFilter = filterGrid.querySelector('select').value !== 'all'
+    || filterGrid.querySelector('input[type="text"]')?.value
+    || filterGrid.querySelector('input[type="date"]')?.value;
+  clearFiltersBtn.hidden = !hasActiveFilter;
+}
+
+if (filterToggleBtn && filterGrid) {
+  filterToggleBtn.addEventListener('click', () => {
+    const collapsed = filterGrid.classList.toggle('collapsed');
+    filterToggleBtn.setAttribute('aria-expanded', String(!collapsed));
+  });
+
+  filterGrid.querySelectorAll('select, input').forEach(el => {
+    el.addEventListener('change', updateClearFiltersVisibility);
+    el.addEventListener('input', updateClearFiltersVisibility);
+  });
+}
+
+if (clearFiltersBtn) {
+  clearFiltersBtn.addEventListener('click', () => {
+    if (filterGrid) {
+      filterGrid.querySelectorAll('select').forEach(s => s.value = 'all');
+      filterGrid.querySelectorAll('input[type="date"], input[type="text"]').forEach(i => i.value = '');
+    }
+    const searchInput = document.getElementById('librarySearch');
+    if (searchInput) searchInput.value = '';
+    clearFiltersBtn.hidden = true;
+    if (typeof library?.reloadFromStart === 'function') library.reloadFromStart();
+  });
+}
+
+// Batch toolbar
+const batchToolbar = document.getElementById('batchToolbar');
+const batchToolbarCount = document.getElementById('batchToolbarCount');
+const batchToolbarDownload = document.getElementById('batchToolbarDownload');
+const batchToolbarCopy = document.getElementById('batchToolbarCopy');
+const batchToolbarDelete = document.getElementById('batchToolbarDelete');
+const batchToolbarClear = document.getElementById('batchToolbarClear');
+
+function updateBatchToolbar(count) {
+  if (!batchToolbar) return;
+  if (count > 0) {
+    batchToolbar.classList.add('visible');
+    if (batchToolbarCount) batchToolbarCount.textContent = count;
+  } else {
+    batchToolbar.classList.remove('visible');
+  }
+}
+
+if (batchToolbarDownload) batchToolbarDownload.addEventListener('click', () => document.getElementById('batchDownload')?.click());
+if (batchToolbarCopy) batchToolbarCopy.addEventListener('click', () => document.getElementById('batchCopy')?.click());
+if (batchToolbarDelete) batchToolbarDelete.addEventListener('click', () => document.getElementById('batchDelete')?.click());
+if (batchToolbarClear) batchToolbarClear.addEventListener('click', () => document.getElementById('clearSelectionBtn')?.click());
+
+// Expose updateBatchToolbar for library module
+window.__updateBatchToolbar = updateBatchToolbar;
+
+// Timeline empty state
+const timelineEmpty = document.getElementById('timelineEmpty');
+
+function updateTimelineEmpty() {
+  if (!timelineEmpty || !timelineContainer) return;
+  const hasMessages = timelineContainer.querySelector('.timeline-message');
+  timelineEmpty.hidden = !!hasMessages;
+}
+
+try {
+  const timelineObserver = new MutationObserver(updateTimelineEmpty);
+  if (timelineContainer) {
+    timelineObserver.observe(timelineContainer, { childList: true, subtree: true });
+    updateTimelineEmpty();
+  }
+} catch {
+  // MutationObserver not available
+}
+
 checkSession();

@@ -542,6 +542,7 @@ export function createLibrary({ root, api, timeline }) {
     if (imageCountEl) imageCountEl.textContent = String(previewable.length);
     if (otherCountEl) otherCountEl.textContent = String(items.length - previewable.length);
     if (selectedCountEl) selectedCountEl.textContent = String(selectedIds.size);
+    if (typeof window.__updateBatchToolbar === 'function') window.__updateBatchToolbar(selectedIds.size);
   }
 
   function renderFiles() {
@@ -650,5 +651,6 @@ export function createLibrary({ root, api, timeline }) {
     clearSelection,
     openMessage,
     getFiles: () => filesState,
+    reloadFromStart,
   };
 }
