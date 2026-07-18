@@ -12,7 +12,9 @@ export function normalizeRoute(hash) {
 export function createNavigation({ windowObject, documentObject, onRouteChange = () => {} }) {
   let currentRoute = null;
   const scrollPositions = new Map();
+  const buttonHandlers = new Map();
   let focusNextRoute = false;
+  let started = false;
 
   function applyRoute(route) {
     const normalized = normalizeRoute(`#${route}`);
@@ -51,8 +53,12 @@ export function createNavigation({ windowObject, documentObject, onRouteChange =
   }
 
   function start() {
+    if (started) return;
+    started = true;
     documentObject.querySelectorAll('[data-route]').forEach(button => {
-      button.addEventListener('click', () => navigate(button.dataset.route));
+      const handleClick = () => navigate(button.dataset.route);
+      buttonHandlers.set(button, handleClick);
+      button.addEventListener('click', handleClick);
     });
     windowObject.addEventListener('hashchange', handleHashChange);
     const route = normalizeRoute(windowObject.location.hash);
@@ -63,7 +69,14 @@ export function createNavigation({ windowObject, documentObject, onRouteChange =
   }
 
   function destroy() {
+    if (!started) return;
+    buttonHandlers.forEach((handleClick, button) => {
+      button.removeEventListener('click', handleClick);
+    });
+    buttonHandlers.clear();
     windowObject.removeEventListener('hashchange', handleHashChange);
+    focusNextRoute = false;
+    started = false;
   }
 
   return { start, navigate, getCurrentRoute: () => currentRoute, destroy };

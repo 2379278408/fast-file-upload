@@ -478,6 +478,119 @@ def test_navigation_module_exports_controller_contract() -> None:
         assert token in source
 
 
+def create_navigation_lifecycle_context() -> quickjs.Context:
+    context = create_js_context()
+    load_js_module(context, "./navigation.js", read_web("js/navigation.js"))
+    context.eval(r"""
+      globalThis.createNavigationHarness = () => {
+        const listeners = () => ({
+          values: Object.create(null),
+          add(type, listener) { (this.values[type] ||= []).push(listener); },
+          remove(type, listener) {
+            this.values[type] = (this.values[type] || []).filter(item => item !== listener);
+          },
+          count(type) { return (this.values[type] || []).length; },
+          dispatch(type) { for (const listener of [...(this.values[type] || [])]) listener(); },
+        });
+        const buttonListeners = listeners();
+        const windowListeners = listeners();
+        const button = {
+          dataset: { route: 'files' },
+          classList: { toggle() {} },
+          setAttribute() {},
+          removeAttribute() {},
+          addEventListener: (type, listener) => buttonListeners.add(type, listener),
+          removeEventListener: (type, listener) => buttonListeners.remove(type, listener),
+          click: () => buttonListeners.dispatch('click'),
+        };
+        const pages = [
+          { dataset: { routePage: 'transfer' }, hidden: false },
+          { dataset: { routePage: 'files' }, hidden: true },
+        ];
+        const title = { textContent: '' };
+        const documentObject = {
+          title: '',
+          querySelectorAll(selector) {
+            if (selector === '[data-route]') return [button];
+            if (selector === '[data-route-page]') return pages;
+            return [];
+          },
+          querySelector(selector) {
+            return selector === '[data-route-title]' ? title : null;
+          },
+        };
+        const windowObject = {
+          scrollY: 0,
+          location: { hash: '#transfer' },
+          history: { replaceState(_state, _title, hash) { windowObject.location.hash = hash; } },
+          addEventListener: (type, listener) => windowListeners.add(type, listener),
+          removeEventListener: (type, listener) => windowListeners.remove(type, listener),
+          scrollTo() {},
+        };
+        let routeChangeCount = 0;
+        const navigation = __modules['./navigation.js'].createNavigation({
+          windowObject,
+          documentObject,
+          onRouteChange: () => { routeChangeCount += 1; },
+        });
+        return {
+          navigation,
+          button,
+          windowObject,
+          buttonListenerCount: () => buttonListeners.count('click'),
+          windowListenerCount: () => windowListeners.count('hashchange'),
+          routeChangeCount: () => routeChangeCount,
+        };
+      };
+    """)
+    return context
+
+
+def test_navigation_destroy_removes_button_handlers_and_prevents_navigation() -> None:
+    context = create_navigation_lifecycle_context()
+    result = json.loads(context.eval(r"""
+      const harness = createNavigationHarness();
+      harness.navigation.start();
+      harness.navigation.destroy();
+      harness.navigation.destroy();
+      harness.button.click();
+      JSON.stringify({
+        hash: harness.windowObject.location.hash,
+        buttonListeners: harness.buttonListenerCount(),
+        windowListeners: harness.windowListenerCount(),
+      });
+    """))
+
+    assert result == {"hash": "#transfer", "buttonListeners": 0, "windowListeners": 0}
+
+
+def test_navigation_repeated_start_does_not_accumulate_listeners() -> None:
+    context = create_navigation_lifecycle_context()
+    result = json.loads(context.eval(r"""
+      const harness = createNavigationHarness();
+      harness.navigation.start();
+      harness.navigation.start();
+      const repeatedStart = {
+        buttonListeners: harness.buttonListenerCount(),
+        windowListeners: harness.windowListenerCount(),
+        routeChanges: harness.routeChangeCount(),
+      };
+      harness.navigation.destroy();
+      harness.navigation.start();
+      const restarted = {
+        buttonListeners: harness.buttonListenerCount(),
+        windowListeners: harness.windowListenerCount(),
+        routeChanges: harness.routeChangeCount(),
+      };
+      JSON.stringify({ repeatedStart, restarted });
+    """))
+
+    assert result == {
+        "repeatedStart": {"buttonListeners": 1, "windowListeners": 1, "routeChanges": 1},
+        "restarted": {"buttonListeners": 1, "windowListeners": 1, "routeChanges": 2},
+    }
+
+
 def test_frontend_is_split_and_has_unlock_contract(client: TestClient) -> None:
     html = client.get("/").text
     assert '<link rel="stylesheet" href="/styles.css">' in html
