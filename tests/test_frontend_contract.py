@@ -294,8 +294,9 @@ class Element {
   }
   click() {}
   scrollTo(options) { this.scrollTop = options.top || 0; }
-  scrollIntoView() {
+  scrollIntoView(options) {
     globalThis.__scrollIntoViewCalls = (globalThis.__scrollIntoViewCalls || 0) + 1;
+    (globalThis.__scrollIntoViewOptions ||= []).push(options || null);
     if (typeof globalThis.__scrollIntoViewEffect === 'function') {
       globalThis.__scrollIntoViewEffect(this);
     }
@@ -2526,6 +2527,55 @@ def test_timeline_pages_from_top_and_loads_until_real_dto(client: TestClient) ->
     assert result["focusedScrollCalls"] == 1
     assert result["focusedElement"] == oldest_id
     assert result["focusedTabIndex"] == "-1"
+
+
+def test_timeline_focus_message_respects_reduced_motion_and_keeps_focus_state() -> None:
+    context = create_js_context()
+    load_js_module(context, "./timeline.js", read_web("js/timeline.js"))
+    result = json.loads(context.eval(r"""
+      const container = document.getElementById('timelineContainer');
+      const target = document.createElement('div');
+      target.className = 'timeline-message';
+      target.dataset.messageId = 'motion-message';
+      container.append(target);
+      const timeline = __modules['./timeline.js'].createTimeline({
+        container,
+        newMessageButton: document.getElementById('newMessageButton'),
+        api: () => Promise.resolve({ items: [], next_before: null }),
+        onRestore: null,
+      });
+      globalThis.__scrollIntoViewOptions = [];
+
+      window.matchMedia = () => ({ matches: false });
+      timeline.focusMessage('motion-message');
+      const regular = __scrollIntoViewOptions[__scrollIntoViewOptions.length - 1].behavior;
+
+      window.matchMedia = () => ({ matches: true });
+      timeline.focusMessage('motion-message');
+      const reduced = __scrollIntoViewOptions[__scrollIntoViewOptions.length - 1].behavior;
+
+      delete window.matchMedia;
+      timeline.focusMessage('motion-message');
+      const unavailable = __scrollIntoViewOptions[__scrollIntoViewOptions.length - 1].behavior;
+
+      JSON.stringify({
+        regular,
+        reduced,
+        unavailable,
+        focused: document.activeElement === target,
+        tabIndex: target.getAttribute('tabindex'),
+        highlighted: target.classList.contains('timeline-message-highlight'),
+      });
+    """))
+
+    assert result == {
+        "regular": "smooth",
+        "reduced": "auto",
+        "unavailable": "smooth",
+        "focused": True,
+        "tabIndex": "-1",
+        "highlighted": True,
+    }
 
 
 def test_library_filters_reload_and_pagination_is_reachable(client: TestClient) -> None:

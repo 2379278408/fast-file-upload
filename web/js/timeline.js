@@ -357,7 +357,19 @@ export function createTimeline({ container, newMessageButton, api, onRestore }) 
     if (!container) return false;
     const el = container.querySelector(`[data-message-id="${messageId}"]`);
     if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      let scrollBehavior = 'smooth';
+      try {
+        if (
+          typeof window !== 'undefined'
+          && typeof window.matchMedia === 'function'
+          && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+        ) {
+          scrollBehavior = 'auto';
+        }
+      } catch {
+        scrollBehavior = 'smooth';
+      }
+      el.scrollIntoView({ behavior: scrollBehavior, block: 'center' });
       el.classList.add('timeline-message-highlight');
       el.setAttribute('tabindex', '-1');
       el.focus({ preventScroll: true });
