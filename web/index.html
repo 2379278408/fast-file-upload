@@ -36,31 +36,20 @@
                 </span>
                 <span class="brand-copy"><strong>MonkeyCode</strong><span>传输工作台</span></span>
             </div>
-            <p class="side-label">工作区</p>
+            <p class="side-label">导航</p>
             <nav class="nav-list" aria-label="主导航">
-                <button class="nav-item active" type="button" aria-current="page" data-section="workspace">
+                <button class="nav-item active" type="button" data-route="transfer" aria-current="page">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18M9 21V9"/></svg>
-                    <span>传输工作台</span>
+                    <span>传输</span>
                 </button>
-                <button class="nav-item" type="button" data-section="files">
+                <button class="nav-item" type="button" data-route="files">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7h6l2 2h10v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/><path d="M3 7V5a2 2 0 0 1 2-2h4l2 2h6"/></svg>
-                    <span>全部文件</span>
+                    <span>文件</span>
                     <b class="nav-badge" id="navCount">0</b>
                 </button>
-                <button class="nav-item" type="button" data-section="activity">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 8v4l3 2"/><circle cx="12" cy="12" r="9"/></svg>
-                    <span>活动记录</span>
-                </button>
-            </nav>
-            <p class="side-label">管理</p>
-            <nav class="nav-list" aria-label="管理导航">
-                <button class="nav-item" type="button" data-section="devices">
+                <button class="nav-item" type="button" data-route="manage">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="3" width="16" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
-                    <span>连接设备</span>
-                </button>
-                <button class="nav-item" type="button" data-section="settings">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.83 2.83-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21H9.6v-.09A1.7 1.7 0 0 0 8.6 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06-2.83-2.83.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3V9.6h.09A1.7 1.7 0 0 0 4.6 8.6a1.7 1.7 0 0 0-.34-1.88l-.06-.06 2.83-2.83.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3h4v.09A1.7 1.7 0 0 0 15.4 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06 2.83 2.83-.06.06A1.7 1.7 0 0 0 19.4 9c.12.36.33.7.6 1 .3.28.7.42 1.1.4h.09v4h-.09a1.7 1.7 0 0 0-1.7.6Z"/></svg>
-                    <span>设置</span>
+                    <span>管理</span>
                 </button>
             </nav>
             <div class="sidebar-foot">
@@ -109,9 +98,10 @@
                     <div class="health-item"><span>总容量</span><strong id="metricSize">0 B</strong></div>
                 </div>
 
-                <div class="dashboard-grid">
-                    <!-- Main column -->
-                    <div class="main-column">
+                <section class="route-page transfer-page" id="transferPage" data-route-page="transfer">
+                    <h1 class="route-heading visually-hidden" data-route-heading="transfer" tabindex="-1">传输工作台</h1>
+                    <div class="dashboard-grid">
+                        <div class="main-column">
                         <!-- Composer: text input + file upload -->
                         <section class="panel transfer-panel" id="composerPanel">
                             <div class="panel-head">
@@ -150,6 +140,32 @@
                             <div class="composer-queue" id="composerQueue"></div>
                         </section>
 
+                        </div>
+                        <aside class="rail">
+                            <!-- Timeline: recent activity -->
+                            <section class="panel timeline-panel" id="timelinePanel">
+                                <div class="panel-head">
+                                    <div><h2>最近活动</h2><p>消息与文件时间线</p></div>
+                                </div>
+                                <div class="timeline-container" id="timelineContainer" tabindex="-1">
+                                    <div class="timeline-empty" id="timelineEmpty">
+                                        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+                                        <strong>暂无消息</strong>
+                                        <p>在上方输入文字或上传文件开始传输</p>
+                                    </div>
+                                </div>
+                                <button class="btn btn-primary timeline-new-btn" id="newMessageButton" type="button" hidden>
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
+                                    新消息
+                                </button>
+                            </section>
+                        </aside>
+                    </div>
+                </section>
+
+                <section class="route-page files-page" id="filesPage" data-route-page="files" hidden>
+                    <h1 class="route-heading" data-route-heading="files" tabindex="-1">全部文件</h1>
+                    <div class="main-column">
                         <!-- Library: file list with filters and batch actions -->
                         <section id="libraryView" class="panel library-panel" tabindex="-1">
                             <div class="panel-head">
@@ -235,27 +251,11 @@
                             </div>
                         </section>
                     </div>
+                </section>
 
-                    <!-- Context rail -->
-                    <aside class="rail">
-                        <!-- Timeline: recent activity -->
-                        <section class="panel timeline-panel" id="timelinePanel">
-                            <div class="panel-head">
-                                <div><h2>最近活动</h2><p>消息与文件时间线</p></div>
-                            </div>
-                            <div class="timeline-container" id="timelineContainer" tabindex="-1">
-                                <div class="timeline-empty" id="timelineEmpty">
-                                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-                                    <strong>暂无消息</strong>
-                                    <p>在上方输入文字或上传文件开始传输</p>
-                                </div>
-                            </div>
-                            <button class="btn btn-primary timeline-new-btn" id="newMessageButton" type="button" hidden>
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
-                                新消息
-                            </button>
-                        </section>
-
+                <section class="route-page manage-page" id="managePage" data-route-page="manage" hidden>
+                    <h1 class="route-heading" data-route-heading="manage" tabindex="-1">管理与设置</h1>
+                    <div class="main-column">
                         <!-- Connection: status and latency -->
                         <section class="panel connection-panel" id="connectionPanel" aria-live="polite">
                             <div class="panel-head">
@@ -302,29 +302,25 @@
                             </div>
                             <div class="storage-card" id="storageSummary">-</div>
                         </section>
-                    </aside>
-                </div>
+                    </div>
+                </section>
             </div>
         </main>
     </div>
 
     <!-- Mobile bottom nav -->
     <nav class="mobile-nav" aria-label="移动端主导航">
-        <button class="active" type="button" data-section="workspace" aria-current="page">
+        <button class="active" type="button" data-route="transfer" aria-current="page">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18M9 21V9"/></svg>
             工作台
         </button>
-        <button type="button" data-section="files">
+        <button type="button" data-route="files">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7h6l2 2h10v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>
             文件
         </button>
-        <button type="button" data-section="activity">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 8v4l3 2"/><circle cx="12" cy="12" r="9"/></svg>
-            活动
-        </button>
-        <button type="button" data-section="settings">
+        <button type="button" data-route="manage">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M4 12a8 8 0 1 0 16 0 8 8 0 0 0-16 0Z"/></svg>
-            设置
+            管理
         </button>
     </nav>
 

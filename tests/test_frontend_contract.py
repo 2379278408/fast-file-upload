@@ -316,6 +316,7 @@ globalThis.document = {
     return element;
   },
   querySelector: selector => selector.startsWith('#') ? document.getElementById(selector.slice(1)) : new Element('div'),
+  querySelectorAll: selector => document.body.querySelectorAll(selector),
   addEventListener() {},
 };
 globalThis.window = globalThis;
@@ -331,6 +332,7 @@ window.setTimeout = () => 1;
 window.clearTimeout = () => {};
 globalThis.setTimeout = window.setTimeout;
 globalThis.location = { origin: 'http://testserver', hash: '' };
+globalThis.history = { replaceState(_state, _title, hash) { location.hash = hash; } };
 globalThis.navigator = { clipboard: { writeText: () => Promise.resolve() } };
 globalThis.localStorage = { values: {}, getItem(key) { return this.values[key] || null; }, setItem(key, value) { this.values[key] = String(value); } };
 globalThis.crypto = { randomUUID: () => '00000000-0000-4000-8000-000000000001' };
@@ -450,6 +452,13 @@ def load_js_module(context: quickjs.Context, module_path: str, source: str) -> N
                 context.eval(transform_module(read_web("js/config.js"), "./config.js"))
         except Exception:
             context.eval(transform_module(read_web("js/config.js"), "./config.js"))
+    if module_path == "./app.js":
+        try:
+            navigation_type = context.eval('typeof globalThis.__modules["./navigation.js"]')
+            if "undefined" in str(navigation_type):
+                context.eval(transform_module(read_web("js/navigation.js"), "./navigation.js"))
+        except Exception:
+            context.eval(transform_module(read_web("js/navigation.js"), "./navigation.js"))
     context.eval(transform_module(source, module_path))
 
 
@@ -476,6 +485,32 @@ def test_navigation_module_exports_controller_contract() -> None:
     source = read_web("js/navigation.js")
     for token in ("ROUTES", "normalizeRoute", "createNavigation", "hashchange", "aria-current"):
         assert token in source
+
+
+def test_shell_has_three_matching_desktop_and_mobile_routes() -> None:
+    html = read_web("index.html")
+    for route in ("transfer", "files", "manage"):
+        assert html.count(f'data-route="{route}"') == 2
+        assert f'data-route-page="{route}"' in html
+        assert f'data-route-heading="{route}"' in html
+    assert 'data-section=' not in html
+    assert 'data-route="activity"' not in html
+    assert 'data-route="devices"' not in html
+
+
+def test_app_starts_navigation_and_clears_file_selection_on_route_exit() -> None:
+    source = read_web("js/app.js")
+    assert "from './navigation.js'" in source
+    assert "createNavigation" in source
+    assert "navigation.start()" in source
+    assert "route !== 'files'" in source
+
+
+def test_skip_link_preserves_application_route_hash() -> None:
+    source = read_web("js/app.js")
+    handler = source[source.index("if (skipLink && mainContent)"):source.index("async function checkSession")]
+    assert "mainContent.focus()" in handler
+    assert "location.hash = 'mainContent'" not in handler
 
 
 def create_navigation_lifecycle_context() -> quickjs.Context:

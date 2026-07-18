@@ -2,6 +2,7 @@ import { request as apiRequest, unlock as apiUnlock, logout as apiLogout, getSes
 import { createTimeline } from './timeline.js';
 import { createComposer } from './composer.js';
 import { createLibrary } from './library.js';
+import { createNavigation } from './navigation.js';
 import { TOAST_DURATION_MS } from './config.js';
 
 const DEVICE_ID_KEY = 'device-id';
@@ -233,7 +234,6 @@ if (sessionExpiredOverlay) {
 if (skipLink && mainContent) {
   skipLink.addEventListener('click', event => {
     event.preventDefault();
-    location.hash = 'mainContent';
     mainContent.focus();
   });
 }
@@ -642,55 +642,16 @@ try {
   // matchMedia not available (e.g. QuickJS test environment)
 }
 
-// Sidebar navigation
-function setupNavigation() {
-  const navButtons = document.querySelectorAll('[data-section]');
-  if (!navButtons.length) return;
-
-  const sectionPanels = {
-    workspace: ['composerPanel', 'libraryView'],
-    files: ['libraryView'],
-    activity: ['timelinePanel'],
-    devices: ['connectionPanel'],
-    settings: ['operationsPanel']
-  };
-
-  function switchSection(section) {
-    navButtons.forEach(b => {
-      b.classList.remove('active');
-      b.removeAttribute('aria-current');
-    });
-    document.querySelectorAll(`[data-section="${section}"]`).forEach(b => {
-      b.classList.add('active');
-      b.setAttribute('aria-current', 'page');
-    });
-
-    // Show/hide panels based on section
-    const mainColumn = document.querySelector('.main-column');
-    const rail = document.querySelector('.rail');
-    if (mainColumn) {
-      const panels = mainColumn.querySelectorAll(':scope > .panel');
-      panels.forEach(p => {
-        const id = p.id;
-        const shouldShow = section === 'workspace' || (sectionPanels[section] && sectionPanels[section].includes(id));
-        p.hidden = !shouldShow;
-      });
+const navigation = createNavigation({
+  windowObject: window,
+  documentObject: document,
+  onRouteChange(route) {
+    if (route !== 'files') {
+      document.getElementById('clearSelectionBtn')?.click();
     }
-    if (rail) {
-      const railPanels = rail.querySelectorAll(':scope > .panel');
-      railPanels.forEach(p => {
-        const id = p.id;
-        const shouldShow = section === 'workspace' || (sectionPanels[section] && sectionPanels[section].includes(id));
-        p.hidden = !shouldShow;
-      });
-    }
-  }
-
-  navButtons.forEach(btn => {
-    btn.addEventListener('click', () => switchSection(btn.dataset.section));
-  });
-}
-try { setupNavigation(); } catch { /* noop */ }
+  },
+});
+navigation.start();
 
 // Library filter toggle
 const filterToggleBtn = document.getElementById('filterToggleBtn');
