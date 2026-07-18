@@ -552,6 +552,38 @@ def test_shell_has_three_matching_desktop_and_mobile_routes() -> None:
     assert 'data-route="devices"' not in html
 
 
+def test_manage_page_groups_connection_storage_appearance_and_session() -> None:
+    html = read_web("index.html")
+    manage = html[html.index('id="managePage"'):html.index('class="mobile-nav"')]
+    for token in (
+        'id="connectionPanel"',
+        'id="operationsPanel"',
+        'id="appearancePanel"',
+        'id="sessionPanel"',
+        'id="logoutButton"',
+    ):
+        assert token in manage
+    assert manage.count('class="manage-panel-body') == 4
+
+
+def test_mobile_fixed_elements_share_offset_and_430_rule_is_single() -> None:
+    css = read_web("styles.css")
+    assert "--mobile-nav-height: 66px" in css
+    assert "--mobile-fixed-offset:" in css
+    assert css.count("@media (max-width: 430px)") == 1
+    assert "bottom: var(--mobile-fixed-offset)" in css
+
+
+def test_manage_mobile_grid_active_nav_and_reduced_motion_contract() -> None:
+    css = read_web("styles.css")
+    mobile = css[css.index("@media (max-width: 720px)"):css.index("@media (max-width: 430px)")]
+    assert ".manage-grid" in css
+    assert ".manage-grid" in mobile
+    assert "grid-template-columns: 1fr" in mobile
+    assert ".mobile-nav button.active" in mobile
+    assert "@media (prefers-reduced-motion: reduce)" in css
+
+
 def test_transfer_page_is_timeline_first_and_composer_is_docked() -> None:
     html = read_web("index.html")
     transfer = html[html.index('id="transferPage"'):html.index('id="filesPage"')]
@@ -649,9 +681,12 @@ def test_mobile_transfer_layout_budget_for_short_and_tall_viewports() -> None:
         assert declaration(composer_rule, "bottom") == "auto"
         assert declaration(composer_rule, "scroll-margin-bottom") == "var(--mobile-fixed-offset)"
         assert declaration(compact_topbar_rule, "height") == "var(--topbar-height)"
+        assert declaration(nav_rule, "height") == "var(--mobile-nav-height)"
 
         topbar_height = pixels(declaration(compact_vars, "--topbar-height"))
-        nav_offset = pixels(declaration(root_vars, "--mobile-fixed-offset"))
+        nav_height = pixels(declaration(root_vars, "--mobile-nav-height"))
+        fixed_gap = pixels(declaration(root_vars, "--mobile-fixed-offset"))
+        nav_offset = nav_height + fixed_gap
         page_offset = pixels(declaration(mobile_vars, "--transfer-page-offset"))
         workspace_floor = pixels(declaration(mobile_vars, "--mobile-workspace-min-height"))
         timeline_shell_min = pixels(
@@ -666,7 +701,6 @@ def test_mobile_transfer_layout_budget_for_short_and_tall_viewports() -> None:
         composer_max = clamp_pixels(
             declaration(composer_rule, "max-height"), viewport_height
         )
-        nav_height = pixels(declaration(nav_rule, "height"))
         body_clearance = pixels(declaration(body_rule, "padding-bottom"))
         viewport_budget = viewport_height - topbar_height - nav_offset - page_offset
         workspace_height = max(workspace_floor, viewport_budget)
@@ -690,23 +724,23 @@ def test_mobile_transfer_layout_budget_for_short_and_tall_viewports() -> None:
     assert layout(css, 390, 568) == {
         "viewport_width": 390,
         "workspace": 520,
-        "page_scroll": 220,
+        "page_scroll": 224,
         "timeline_shell_min": 220,
         "timeline_inner_min": 120,
         "timeline_max": 160,
         "composer_max": 181.76,
-        "composer_nav_gap": 8,
+        "composer_nav_gap": 12,
         "page_nav_clearance": 4,
     }
     assert layout(css, 390, 844) == {
         "viewport_width": 390,
-        "workspace": 576,
+        "workspace": 572,
         "page_scroll": 0,
         "timeline_shell_min": 220,
         "timeline_inner_min": 120,
         "timeline_max": 236.32,
         "composer_max": 240,
-        "composer_nav_gap": 8,
+        "composer_nav_gap": 12,
         "page_nav_clearance": 4,
     }
 
@@ -742,7 +776,7 @@ def test_mobile_transfer_layout_budget_for_short_and_tall_viewports() -> None:
             "scroll-margin-bottom: 0;",
         ),
         mutate_mobile("body { padding-bottom: 70px; }", "body { padding-bottom: 0; }"),
-        mutate_mobile("height: 66px;", "height: auto;"),
+        mutate_mobile("height: var(--mobile-nav-height);", "height: auto;"),
     )
     for broken_css in broken_stylesheets:
         with pytest.raises(AssertionError):

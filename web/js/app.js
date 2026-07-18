@@ -636,6 +636,11 @@ if (themeToggle) {
   });
 }
 
+document.getElementById('manageThemeToggle')?.addEventListener('click', () => themeToggle?.click());
+document.getElementById('logoutButton')?.addEventListener('click', () => {
+  window.dispatchEvent(new CustomEvent('session-logout'));
+});
+
 try {
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', event => {
     if (!localStorage.getItem(THEME_KEY)) {

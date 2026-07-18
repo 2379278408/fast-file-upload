@@ -252,16 +252,16 @@
 
                 <section class="route-page manage-page" id="managePage" data-route-page="manage" hidden>
                     <h1 class="route-heading" data-route-heading="manage" tabindex="-1">管理与设置</h1>
-                    <div class="main-column">
+                    <div class="manage-grid">
                         <!-- Connection: status and latency -->
-                        <section class="panel connection-panel" id="connectionPanel" aria-live="polite">
+                        <section class="panel manage-panel connection-panel" id="connectionPanel" aria-live="polite">
                             <div class="panel-head">
-                                <h2>连接状态</h2>
+                                <div><h2>连接状态</h2><p>查看当前设备与实时事件连接</p></div>
                                 <button class="icon-button" id="railRefresh" type="button" aria-label="刷新连接">
                                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 6v5h-5M4 18v-5h5"/><path d="M18.5 9A7 7 0 0 0 6 6.5L4 11M5.5 15A7 7 0 0 0 18 17.5l2-4.5"/></svg>
                                 </button>
                             </div>
-                            <div class="connection">
+                            <div class="manage-panel-body connection">
                                 <div class="connection-main">
                                     <div class="connection-state">
                                         <span class="status-dot" id="connectionDotRail"></span>
@@ -284,20 +284,32 @@
                         </section>
 
                         <!-- Operations: storage stats (summary only) -->
-                        <section class="panel operations-panel" id="operationsPanel" aria-labelledby="operationsTitle">
+                        <section class="panel manage-panel operations-panel" id="operationsPanel" aria-labelledby="operationsTitle">
                             <div class="panel-head">
-                                <div><h2 id="operationsTitle">存储状态</h2></div>
+                                <div><h2 id="operationsTitle">存储状态</h2><p>汇总文件占用与存储分布</p></div>
                                 <button class="icon-button" id="refreshOpsBtn" type="button" aria-label="刷新运营视图">
                                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 6v5h-5M4 18v-5h5"/><path d="M18.5 9A7 7 0 0 0 6 6.5L4 11M5.5 15A7 7 0 0 0 18 17.5l2-4.5"/></svg>
                                 </button>
                             </div>
-                            <div class="ops-grid" id="opsSummary">
-                                <div class="mini-kpi"><span>总占用</span><strong>-</strong></div>
-                                <div class="mini-kpi"><span>文件数</span><strong>-</strong></div>
-                                <div class="mini-kpi"><span>旧文件</span><strong>-</strong></div>
-                                <div class="mini-kpi"><span>大文件</span><strong>-</strong></div>
+                            <div class="manage-panel-body">
+                                <div class="ops-grid" id="opsSummary">
+                                    <div class="mini-kpi"><span>总占用</span><strong>-</strong></div>
+                                    <div class="mini-kpi"><span>文件数</span><strong>-</strong></div>
+                                    <div class="mini-kpi"><span>旧文件</span><strong>-</strong></div>
+                                    <div class="mini-kpi"><span>大文件</span><strong>-</strong></div>
+                                </div>
+                                <div class="storage-card" id="storageSummary">-</div>
                             </div>
-                            <div class="storage-card" id="storageSummary">-</div>
+                        </section>
+
+                        <section class="panel manage-panel" id="appearancePanel">
+                            <div class="panel-head"><div><h2>外观</h2><p>切换工作台显示主题</p></div></div>
+                            <div class="manage-panel-body"><button class="btn btn-soft" id="manageThemeToggle" type="button">切换深色模式</button></div>
+                        </section>
+
+                        <section class="panel manage-panel session-panel" id="sessionPanel">
+                            <div class="panel-head"><div><h2>当前会话</h2><p>退出后需要访问令牌重新解锁</p></div></div>
+                            <div class="manage-panel-body"><button class="btn btn-danger" id="logoutButton" type="button">退出当前会话</button></div>
                         </section>
                     </div>
                 </section>

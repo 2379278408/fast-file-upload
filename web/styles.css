@@ -25,7 +25,8 @@
             --radius-lg: 12px;
             --radius-md: 10px;
             --topbar-height: 68px;
-            --mobile-fixed-offset: calc(74px + env(safe-area-inset-bottom));
+            --mobile-nav-height: 66px;
+            --mobile-fixed-offset: calc(var(--mobile-nav-height) + env(safe-area-inset-bottom) + 12px);
             --transfer-page-offset: 108px;
             color-scheme: light dark;
         }
@@ -379,7 +380,7 @@
         }
 
         .topbar {
-            height: 68px;
+            height: var(--topbar-height);
             position: sticky;
             top: 0;
             display: flex;
@@ -476,6 +477,26 @@
         }
 
         .main-column, .rail { display: grid; gap: 18px; min-width: 0; }
+
+        .manage-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 18px;
+            align-items: start;
+        }
+
+        .manage-panel {
+            min-width: 0;
+            overflow: hidden;
+        }
+
+        .manage-panel-body {
+            padding: 16px 18px;
+        }
+
+        .manage-grid .operations-panel {
+            padding: 0;
+        }
 
         .upload-panel,
         .side-panel,
@@ -875,8 +896,6 @@
 
         /* Connection panel */
         .connection-panel .panel-head { min-height: 58px; }
-
-        .connection { padding: 16px 18px; }
 
         .connection-main {
             display: flex;
@@ -1612,7 +1631,7 @@
             body { padding-bottom: 70px; }
             .app-shell { display: block; }
             .sidebar { display: none; }
-            .topbar { height: 60px; padding: 0 16px; }
+            .topbar { height: var(--topbar-height); padding: 0 16px; }
             .mobile-brand { display: flex; align-items: center; gap: 9px; font: 600 15px/1 var(--font-display); }
             .mobile-brand .brand-mark { width: 30px; height: 30px; }
             .breadcrumb, .top-actions .button { display: none; }
@@ -1620,6 +1639,7 @@
             .health { width: 100%; justify-content: space-between; overflow-x: auto; }
             .rail { grid-template-columns: 1fr; }
             .rail .timeline-panel { grid-column: auto; }
+            .manage-grid { grid-template-columns: 1fr; }
             .transfer-status { grid-template-columns: minmax(0, 1fr) auto; }
             .transfer-status .route-link { display: none; }
             .transfer-status > div:nth-of-type(3) { grid-column: 1; }
@@ -1679,9 +1699,9 @@
                 left: 0;
                 right: 0;
                 bottom: 0;
-                height: 66px;
+                height: var(--mobile-nav-height);
                 display: grid;
-                grid-template-columns: repeat(4, 1fr);
+                grid-template-columns: repeat(3, 1fr);
                 padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
                 border-top: 1px solid var(--border);
                 background: color-mix(in oklch, var(--surface) 92%, transparent);
@@ -1702,7 +1722,7 @@
 
             .mobile-nav button.active { color: var(--accent-dark); }
             .mobile-nav svg { width: 19px; height: 19px; }
-            .batch-toolbar, .toast { left: 50%; bottom: 78px; max-width: calc(100vw - 24px); }
+            .batch-toolbar, .toast { left: 50%; bottom: var(--mobile-fixed-offset); max-width: calc(100vw - 24px); }
         }
 
         @media (max-width: 430px) {
@@ -1718,16 +1738,12 @@
             .topbar { flex-direction: column; align-items: flex-start; height: var(--topbar-height); padding: 12px 16px; gap: 8px; }
             .bulk-actions { flex-direction: column; }
             .file-actions { flex-wrap: wrap; }
-            .toast { min-width: 160px; max-width: calc(100vw - 32px); bottom: 16px; }
+            .toast { min-width: 160px; max-width: calc(100vw - 32px); }
             .batch-toolbar { padding: 10px 12px; gap: 8px; }
             .timeline-message-actions { opacity: 1; transform: translateY(0); pointer-events: auto; position: static; }
             .timeline-message-body { padding-right: 0; }
-        }
-
-        @media (max-width: 430px) {
             .health { flex-wrap: wrap; gap: 10px; }
             .health-item { flex-basis: 100%; }
-            .filter-grid { grid-template-columns: 1fr 1fr; }
             .library-actions { flex-wrap: wrap; }
         }
 
