@@ -30,6 +30,27 @@ CREATE TABLE IF NOT EXISTS upload_reservations (client_request_id TEXT PRIMARY K
  sha256 TEXT NOT NULL, created_at TEXT NOT NULL, device_id TEXT, device_name TEXT);
 CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT,
  action TEXT NOT NULL, entity_id TEXT, detail TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS upload_sessions (
+ id TEXT PRIMARY KEY, client_request_id TEXT NOT NULL UNIQUE,
+ source_device_id TEXT NOT NULL, original_name TEXT NOT NULL,
+ mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL CHECK(size_bytes > 0),
+ last_modified_ms INTEGER NOT NULL, sample_sha256 TEXT NOT NULL,
+ chunk_size_bytes INTEGER NOT NULL CHECK(chunk_size_bytes > 0),
+ status TEXT NOT NULL, confirmed_bytes INTEGER NOT NULL DEFAULT 0,
+ file_sha256 TEXT, message_id TEXT UNIQUE REFERENCES messages(id),
+ error_code TEXT, publication_state TEXT NOT NULL DEFAULT 'none',
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS upload_sessions_active_expiry
+ ON upload_sessions(status, expires_at);
+CREATE TABLE IF NOT EXISTS upload_parts (
+ upload_id TEXT NOT NULL REFERENCES upload_sessions(id) ON DELETE CASCADE,
+ part_index INTEGER NOT NULL CHECK(part_index >= 0),
+ start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
+ end_byte INTEGER NOT NULL CHECK(end_byte >= start_byte),
+ size_bytes INTEGER NOT NULL CHECK(size_bytes > 0), sha256 TEXT NOT NULL,
+ created_at TEXT NOT NULL, PRIMARY KEY(upload_id, part_index)
+);
 """
 
 
@@ -81,6 +102,14 @@ class Database:
             self._add_column(connection, "upload_reservations", "reservation_state TEXT NOT NULL DEFAULT 'staged'")
             self._add_column(connection, "upload_reservations", "owner_token TEXT")
             self._add_column(connection, "upload_reservations", "leased_until TEXT")
+            self._add_column(connection, "upload_sessions", "publication_state TEXT NOT NULL DEFAULT 'none'")
+            self._add_column(connection, "upload_sessions", "file_sha256 TEXT")
+            self._add_column(connection, "upload_sessions", "message_id TEXT REFERENCES messages(id)")
+            self._add_column(connection, "upload_sessions", "error_code TEXT")
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS upload_sessions_message_id "
+                "ON upload_sessions(message_id)"
+            )
 
     @staticmethod
     def _add_column(

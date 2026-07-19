@@ -4,6 +4,7 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Event
 
 import pytest
@@ -24,6 +25,23 @@ def test_initialize_creates_required_tables(settings: Settings) -> None:
             )
         }
     assert {"messages", "files", "events", "migration_imports", "audit_events"} <= names
+
+
+def test_database_initializes_resumable_upload_schema(tmp_path: Path) -> None:
+    database = Database(tmp_path / "timeline.sqlite3")
+    database.initialize()
+    with database.connect() as connection:
+        sessions = {row[1] for row in connection.execute("PRAGMA table_info(upload_sessions)")}
+        parts = {row[1] for row in connection.execute("PRAGMA table_info(upload_parts)")}
+        foreign_keys = connection.execute("PRAGMA foreign_key_list(upload_parts)").fetchall()
+    assert {
+        "id", "client_request_id", "source_device_id", "original_name", "mime_type",
+        "size_bytes", "last_modified_ms", "sample_sha256", "chunk_size_bytes", "status",
+        "confirmed_bytes", "file_sha256", "message_id", "error_code", "publication_state",
+        "created_at", "updated_at", "expires_at",
+    } <= sessions
+    assert {"upload_id", "part_index", "start_byte", "end_byte", "size_bytes", "sha256", "created_at"} <= parts
+    assert any(row[2] == "upload_sessions" and row[6] == "CASCADE" for row in foreign_keys)
 
 
 def test_message_id_is_lexically_sortable() -> None:

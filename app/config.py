@@ -47,6 +47,12 @@ class Settings:
     login_rate_limit_max_clients: int = 1024
     maintenance_interval_seconds: float = 60.0
     purge_claim_lease_seconds: float = 300.0
+    upload_chunk_size_bytes: int = 8 * 1024 * 1024
+    upload_session_ttl_seconds: int = 24 * 60 * 60
+    upload_storage_reserve_bytes: int = 256 * 1024 * 1024
+    max_active_upload_sessions: int = 128
+    max_concurrent_chunk_handlers: int = 16
+    upload_progress_interval_seconds: float = 0.25
 
     def __post_init__(self) -> None:
         if not self.auth_token or not self.auth_token.strip():
@@ -67,6 +73,18 @@ class Settings:
             raise ConfigurationError("MAX_BATCH_DOWNLOAD_TOTAL_BYTES must be at least 1")
         if self.client_request_lock_capacity < 1:
             raise ConfigurationError("CLIENT_REQUEST_LOCK_CAPACITY must be at least 1")
+        if self.upload_chunk_size_bytes < 1:
+            raise ConfigurationError("UPLOAD_CHUNK_SIZE_BYTES must be at least 1")
+        if self.upload_session_ttl_seconds < 1:
+            raise ConfigurationError("UPLOAD_SESSION_TTL_SECONDS must be at least 1")
+        if self.upload_storage_reserve_bytes < 0:
+            raise ConfigurationError("UPLOAD_STORAGE_RESERVE_BYTES must be non-negative")
+        if self.max_active_upload_sessions < 1:
+            raise ConfigurationError("MAX_ACTIVE_UPLOAD_SESSIONS must be at least 1")
+        if self.max_concurrent_chunk_handlers < 1:
+            raise ConfigurationError("MAX_CONCURRENT_CHUNK_HANDLERS must be at least 1")
+        if self.upload_progress_interval_seconds <= 0:
+            raise ConfigurationError("UPLOAD_PROGRESS_INTERVAL_SECONDS must be positive")
 
     @classmethod
     def from_env(cls, upload_dir: str, max_upload_size: int | None = None) -> "Settings":
@@ -118,5 +136,23 @@ class Settings:
             ),
             client_request_lock_capacity=int(
                 os.environ.get("CLIENT_REQUEST_LOCK_CAPACITY", "1024")
+            ),
+            upload_chunk_size_bytes=int(
+                os.environ.get("UPLOAD_CHUNK_SIZE_BYTES", str(8 * 1024 * 1024))
+            ),
+            upload_session_ttl_seconds=int(
+                os.environ.get("UPLOAD_SESSION_TTL_SECONDS", str(24 * 60 * 60))
+            ),
+            upload_storage_reserve_bytes=int(
+                os.environ.get("UPLOAD_STORAGE_RESERVE_BYTES", str(256 * 1024 * 1024))
+            ),
+            max_active_upload_sessions=int(
+                os.environ.get("MAX_ACTIVE_UPLOAD_SESSIONS", "128")
+            ),
+            max_concurrent_chunk_handlers=int(
+                os.environ.get("MAX_CONCURRENT_CHUNK_HANDLERS", "16")
+            ),
+            upload_progress_interval_seconds=float(
+                os.environ.get("UPLOAD_PROGRESS_INTERVAL_SECONDS", "0.25")
             ),
         )

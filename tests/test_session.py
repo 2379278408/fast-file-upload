@@ -132,6 +132,18 @@ def test_settings_derive_stable_secret_from_upload_token(monkeypatch: pytest.Mon
     assert second.session_secret == expected
 
 
+def test_resumable_upload_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("UPLOAD_TOKEN", "secret")
+    settings = Settings.from_env("uploads")
+    assert settings.max_upload_size == 512 * 1024 * 1024
+    assert settings.upload_chunk_size_bytes == 8 * 1024 * 1024
+    assert settings.upload_session_ttl_seconds == 86_400
+    assert settings.upload_storage_reserve_bytes == 256 * 1024 * 1024
+    assert settings.max_active_upload_sessions == 128
+    assert settings.max_concurrent_chunk_handlers == 16
+    assert settings.upload_progress_interval_seconds == 0.25
+
+
 @pytest.mark.parametrize("token", [None, "", "   "])
 def test_settings_reject_missing_or_blank_upload_token_in_every_environment(
     monkeypatch: pytest.MonkeyPatch, token: str | None
