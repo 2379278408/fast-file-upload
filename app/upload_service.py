@@ -80,6 +80,7 @@ class UploadService:
         self.upload_locks = upload_locks
         self.storage = storage
         self._writers: dict[str, int] = {}
+        self._completing: set[str] = set()
         self._assembly_slots = asyncio.Semaphore(
             settings.max_concurrent_chunk_handlers
         )
@@ -298,150 +299,191 @@ class UploadService:
     async def complete(
         self, upload_id: str, device: SessionData, now: datetime
     ) -> dict[str, object]:
-        async with self.upload_locks.hold(upload_id):
-            session = self._authorized(upload_id, device, source_only=True)
-            if session["status"] == "complete":
-                return self.repository.get_completed_message(upload_id)
-            session = self.repository.begin_completion(
-                upload_id, now, self.settings.upload_session_ttl_seconds
-            )
-            parts = self.repository.list_parts(upload_id)
-
+        if upload_id in self._completing:
+            raise UploadStateConflict("Upload completion is already in progress")
+        self._completing.add(upload_id)
         try:
-            pending = await self._assemble(session, parts)
-        except PartIntegrityError:
             async with self.upload_locks.hold(upload_id):
-                current = self.repository.get(upload_id)
-                if current is not None and current["status"] not in {
-                    "cancelled",
-                    "expired",
-                }:
+                session = self._authorized(upload_id, device, source_only=True)
+                if session["status"] == "complete":
+                    return {
+                        "result": self.repository.get_completed_message(upload_id),
+                        "events": [],
+                        "changed": False,
+                    }
+                session = self.repository.begin_completion(
+                    upload_id, now, self.settings.upload_session_ttl_seconds
+                )
+                parts = self.repository.list_parts(upload_id)
+                try:
+                    pending = await self._assemble(session, parts)
+                except PartIntegrityError:
                     self.repository.fail(
                         upload_id,
                         "integrity_error",
                         now,
                         self.settings.upload_session_ttl_seconds,
                     )
-            raise
-
-        async with self.upload_locks.hold(upload_id):
-            current = self.repository.get(upload_id)
-            if current is None or current["status"] in {"cancelled", "expired"}:
-                await asyncio.to_thread(self.chunks.discard_assembled, upload_id)
-                raise UploadStateConflict("Upload was cancelled during verification")
-            self.repository.set_publication_state(
-                upload_id,
-                "assembled",
-                pending.sha256,
-                now,
-                self.settings.upload_session_ttl_seconds,
-            )
-            await asyncio.to_thread(self.storage.publish, pending)
-            self.repository.set_publication_state(
-                upload_id,
-                "file_published",
-                pending.sha256,
-                now,
-                self.settings.upload_session_ttl_seconds,
-            )
-            self.repository.finalize_publication(upload_id, pending, now)
-            message = self.repository.get_completed_message(upload_id)
-        try:
-            await asyncio.to_thread(self.chunks.cleanup_session, upload_id)
-        except OSError:
-            pass
-        return message
-
-    def recover(self, now: datetime) -> list[dict[str, object]]:
-        sessions = self.repository.list_sessions()
-        session_ids = {str(session["upload_id"]) for session in sessions}
-        reconciled = self.chunks.reconcile(
-            session_ids, self.repository.confirmed_part_keys()
-        )
-        for orphan_id in reconciled.orphan_sessions:
-            self.chunks.cleanup_session(orphan_id)
-        self.repository.reconcile_missing_parts(
-            reconciled.missing_confirmed,
-            now,
-            self.settings.upload_session_ttl_seconds,
-        )
-
-        mutations: list[dict[str, object]] = []
-        for original in self.repository.list_sessions():
-            upload_id = str(original["upload_id"])
-            state = str(original["publication_state"])
-            status = str(original["status"])
-            if status == "complete":
-                continue
-            if status in {"cancelled", "expired"}:
-                try:
-                    self._discard_unpublished_final(original)
-                    self.chunks.cleanup_session(upload_id)
-                except OSError:
-                    pass
-                continue
-            if state == "assembling":
-                self.chunks.discard_assembled(upload_id)
-                self.repository.reset_assembling(upload_id, now)
-                continue
-            if state == "published":
-                self.repository.finish_published(upload_id, now)
-                continue
-            try:
-                if state == "assembled":
-                    try:
-                        pending = self.chunks.pending_from_session(
-                            original, published=True
-                        )
-                    except PartIntegrityError:
-                        pending = self.chunks.pending_from_session(
-                            original, published=False
-                        )
-                        self.storage.publish(pending)
-                    original = self.repository.set_publication_state(
-                        upload_id,
-                        "file_published",
-                        pending.sha256,
-                        now,
-                        self.settings.upload_session_ttl_seconds,
-                    )
-                    state = "file_published"
-                if state == "file_published":
-                    pending = self.chunks.pending_from_session(
-                        original, published=True
-                    )
-                    mutation = self.repository.finalize_publication(
-                        upload_id, pending, now
-                    )
-                    mutations.append(mutation)
-                    try:
-                        self.chunks.cleanup_session(upload_id)
-                    except OSError:
-                        pass
-            except (OSError, PartIntegrityError, UploadStateConflict):
-                self.repository.fail(
+                    raise
+                self.repository.set_publication_state(
                     upload_id,
-                    "publication_error",
+                    "assembled",
+                    pending.sha256,
                     now,
                     self.settings.upload_session_ttl_seconds,
                 )
+                await asyncio.to_thread(self.storage.publish, pending)
+                self.repository.set_publication_state(
+                    upload_id,
+                    "file_published",
+                    pending.sha256,
+                    now,
+                    self.settings.upload_session_ttl_seconds,
+                )
+                mutation = self.repository.finalize_publication(
+                    upload_id, pending, now
+                )
+                try:
+                    await asyncio.to_thread(self.chunks.cleanup_session, upload_id)
+                except OSError:
+                    pass
+                return self._completed_mutation(upload_id, mutation)
+        finally:
+            self._completing.discard(upload_id)
+
+    def _completed_mutation(
+        self, upload_id: str, mutation: dict[str, object]
+    ) -> dict[str, object]:
+        return {
+            **mutation,
+            "result": self.repository.get_completed_message(upload_id),
+        }
+
+    def _recover_locked(
+        self, upload_id: str, now: datetime
+    ) -> list[dict[str, object]]:
+        original = self.repository.get(upload_id)
+        if original is None:
+            return []
+        if self._writers.get(upload_id, 0) > 0:
+            return []
+        confirmed_indexes = {
+            part.part_index for part in self.repository.list_parts(upload_id)
+        }
+        missing = self.chunks.reconcile_session(upload_id, confirmed_indexes)
+        self.repository.reconcile_missing_parts(
+            missing,
+            now,
+            self.settings.upload_session_ttl_seconds,
+        )
+        original = self.repository.get(upload_id)
+        if original is None:
+            return []
+        state = str(original["publication_state"])
+        status = str(original["status"])
+        if status == "complete":
+            return []
+        if status in {"cancelled", "expired"}:
+            try:
+                self._discard_unpublished_final(original)
+                self.chunks.cleanup_session(upload_id)
+            except OSError:
+                pass
+            return []
+        if state == "assembling":
+            self.chunks.discard_assembled(upload_id)
+            self.repository.reset_assembling(upload_id, now)
+            return []
+        if state == "published":
+            self.repository.finish_published(upload_id, now)
+            return []
+        try:
+            if state == "assembled":
+                try:
+                    pending = self.chunks.pending_from_session(
+                        original, published=True
+                    )
+                except PartIntegrityError:
+                    pending = self.chunks.pending_from_session(
+                        original, published=False
+                    )
+                    self.storage.publish(pending)
+                original = self.repository.set_publication_state(
+                    upload_id,
+                    "file_published",
+                    pending.sha256,
+                    now,
+                    self.settings.upload_session_ttl_seconds,
+                )
+                state = "file_published"
+            if state == "file_published":
+                pending = self.chunks.pending_from_session(original, published=True)
+                mutation = self.repository.finalize_publication(upload_id, pending, now)
+                try:
+                    self.chunks.cleanup_session(upload_id)
+                except OSError:
+                    pass
+                return [self._completed_mutation(upload_id, mutation)]
+        except (OSError, PartIntegrityError, UploadStateConflict):
+            self.repository.fail(
+                upload_id,
+                "publication_error",
+                now,
+                self.settings.upload_session_ttl_seconds,
+            )
+        return []
+
+    async def recover(self, now: datetime) -> list[dict[str, object]]:
+        sessions = await asyncio.to_thread(self.repository.list_sessions)
+        session_ids = {str(session["upload_id"]) for session in sessions}
+        orphan_ids = await asyncio.to_thread(self.chunks.orphan_sessions, session_ids)
+        for orphan_id in orphan_ids:
+            await asyncio.to_thread(self.chunks.cleanup_session, orphan_id)
+        mutations: list[dict[str, object]] = []
+        for upload_id in sorted(session_ids):
+            async with self.upload_locks.hold(upload_id):
+                mutations.extend(
+                    await asyncio.to_thread(self._recover_locked, upload_id, now)
+                )
         return mutations
 
-    def expire(self, now: datetime) -> list[dict[str, object]]:
-        expired_before_recovery = self.repository.expired_ids(now)
-        mutations = self.recover(now)
-        mutations.extend(
-            self.repository.expire_mutations(
-                now, force_ids=expired_before_recovery
-            )
-        )
-        for mutation in mutations:
-            result = mutation["result"]
-            if isinstance(result, dict) and result["status"] == "expired":
-                upload_id = str(result["upload_id"])
-                if self._writers.get(upload_id, 0) == 0:
-                    try:
-                        self.chunks.cleanup_session(upload_id)
-                    except OSError:
-                        pass
+    def _expire_locked(
+        self, upload_id: str, now: datetime
+    ) -> list[dict[str, object]]:
+        session = self.repository.get(upload_id)
+        if session is None or session["status"] not in {
+            "queued",
+            "uploading",
+            "paused",
+            "verifying",
+            "failed",
+        }:
+            return []
+        if str(session["expires_at"]) > now.isoformat():
+            return []
+        if self._writers.get(upload_id, 0) > 0:
+            return []
+        mutations: list[dict[str, object]] = []
+        if session["status"] == "verifying":
+            mutations.extend(self._recover_locked(upload_id, now))
+            current = self.repository.get(upload_id)
+            if current is None or current["status"] == "complete":
+                return mutations
+        expired = self.repository.expire_one(upload_id, now, was_due=True)
+        if expired is not None:
+            mutations.append(expired)
+            try:
+                self.chunks.cleanup_session(upload_id)
+            except OSError:
+                pass
+        return mutations
+
+    async def expire(self, now: datetime) -> list[dict[str, object]]:
+        upload_ids = await asyncio.to_thread(self.repository.expired_ids, now)
+        mutations: list[dict[str, object]] = []
+        for upload_id in sorted(upload_ids):
+            async with self.upload_locks.hold(upload_id):
+                mutations.extend(
+                    await asyncio.to_thread(self._expire_locked, upload_id, now)
+                )
         return mutations

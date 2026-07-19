@@ -306,8 +306,6 @@ class UploadRepository:
     def begin_completion(self, upload_id: str, now: datetime, ttl_seconds: int) -> dict[str, object]:
         with self.db.transaction() as connection:
             session = self._load(connection, upload_id)
-            if session["status"] == "verifying" and session["publication_state"] == "assembling":
-                return session
             if session["status"] != "uploading":
                 raise UploadStateConflict(str(session["status"]))
             rows = connection.execute(
@@ -482,6 +480,30 @@ class UploadRepository:
                 (*ACTIVE_STATUSES, now.isoformat(), limit),
             ).fetchall()
             return {str(row["id"]) for row in rows}
+
+    def expire_one(
+        self, upload_id: str, now: datetime, *, was_due: bool = False
+    ) -> dict[str, object] | None:
+        with self.db.transaction() as connection:
+            session = self._load(connection, upload_id)
+            if session["status"] not in ACTIVE_STATUSES:
+                return None
+            if not was_due and str(session["expires_at"]) > now.isoformat():
+                return None
+            connection.execute(
+                "UPDATE upload_sessions SET status = 'expired', error_code = 'expired', "
+                "updated_at = ? WHERE id = ?",
+                (now.isoformat(), upload_id),
+            )
+            result = self._load(connection, upload_id)
+            event = self._append_event(
+                connection,
+                "upload.expired",
+                upload_id,
+                result,
+                now.isoformat(),
+            )
+            return {"result": result, "events": [event], "changed": True}
 
     def finish_published(self, upload_id: str, now: datetime) -> dict[str, object]:
         with self.db.transaction() as connection:

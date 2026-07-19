@@ -11,6 +11,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.auth import SessionData
 from app.config import Settings
 from app.database import Database
 from app.main import create_app
@@ -119,6 +120,156 @@ def test_complete_preserves_sanitized_filename_metadata(settings: Settings) -> N
 
     assert response.status_code == 200
     assert response.json()["file"]["original_name"] == "my  report.txt"
+
+
+def test_concurrent_complete_runs_assemble_and_finalize_once(
+    settings: Settings,
+) -> None:
+    app = create_app(settings)
+    original_assemble = app.state.chunk_storage.assemble
+    original_finalize = app.state.upload_repository.finalize_publication
+    assembling = threading.Event()
+    release = threading.Event()
+    calls = {"assemble": 0, "finalize": 0}
+
+    def blocked_assemble(*args, **kwargs):
+        calls["assemble"] += 1
+        assembling.set()
+        assert release.wait(timeout=2)
+        return original_assemble(*args, **kwargs)
+
+    def counted_finalize(*args, **kwargs):
+        calls["finalize"] += 1
+        return original_finalize(*args, **kwargs)
+
+    app.state.chunk_storage.assemble = blocked_assemble
+    app.state.upload_repository.finalize_publication = counted_finalize
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/session",
+            json={
+                "access_token": settings.auth_token,
+                "device_id": "source",
+                "device_name": "source",
+            },
+        ).status_code == 200
+        upload = create_upload(client, content=b"concurrent")
+        put_single_part(client, upload, b"concurrent")
+        responses: list[object] = []
+
+        def first_complete() -> None:
+            responses.append(
+                client.post(f"/api/uploads/{upload['upload_id']}/complete", json={})
+            )
+
+        first = threading.Thread(target=first_complete)
+        first.start()
+        assert assembling.wait(timeout=2)
+        second = client.post(f"/api/uploads/{upload['upload_id']}/complete", json={})
+        release.set()
+        first.join(timeout=2)
+
+    assert second.status_code == 409
+    assert len(responses) == 1
+    assert responses[0].status_code == 200
+    assert calls == {"assemble": 1, "finalize": 1}
+
+
+def test_complete_broadcasts_only_its_mutation_events(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_app(settings)
+    broadcasts: list[dict[str, object]] = []
+
+    async def capture(event: dict[str, object]) -> None:
+        broadcasts.append(event)
+
+    app.state.hub.broadcast = capture
+    original_complete = app.state.upload_service.complete
+    interleaved = False
+
+    async def complete_with_interleaved_message(*args, **kwargs):
+        nonlocal interleaved
+        mutation = await original_complete(*args, **kwargs)
+        if not interleaved:
+            interleaved = True
+            other = app.state.messages.create_text(
+                "interleaved",
+                "interleaved-message",
+                SessionData("other", "Other device", 2_000_000_000),
+            )
+            await app.state.hub.broadcast(other["event"])
+        return mutation
+
+    monkeypatch.setattr(
+        app.state.upload_service, "complete", complete_with_interleaved_message
+    )
+    with authenticated_client(settings, app=app, device_id="source") as client:
+        upload = create_upload(client, content=b"events")
+        put_single_part(client, upload, b"events")
+        response = client.post(f"/api/uploads/{upload['upload_id']}/complete", json={})
+        assert response.status_code == 200
+        assert response.json()["upload_id"] == upload["upload_id"]
+        event_types = [event["event_type"] for event in broadcasts]
+        assert event_types.count("message.created") == 2
+        assert event_types.count("upload.completed") == 1
+        assert event_types.count("file.finalized") == 1
+        other_events = [
+            event
+            for event in broadcasts
+            if event["entity_id"] != upload["upload_id"]
+            and event["payload"].get("client_request_id") == "interleaved-message"
+        ]
+        assert len(other_events) == 1
+
+        broadcasts.clear()
+        replay = client.post(f"/api/uploads/{upload['upload_id']}/complete", json={})
+        assert replay.status_code == 200
+        assert replay.json() == response.json()
+        assert broadcasts == []
+
+
+def test_complete_does_not_restart_durable_assembling_session(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_app(settings)
+    assemble_calls = 0
+    original_assemble = app.state.chunk_storage.assemble
+
+    def counted_assemble(*args, **kwargs):
+        nonlocal assemble_calls
+        assemble_calls += 1
+        return original_assemble(*args, **kwargs)
+
+    app.state.chunk_storage.assemble = counted_assemble
+    monkeypatch.setattr(
+        app.state.upload_repository,
+        "set_publication_state",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected failure before assembled persistence")
+        ),
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert client.post(
+            "/api/session",
+            json={
+                "access_token": settings.auth_token,
+                "device_id": "source",
+                "device_name": "source",
+            },
+        ).status_code == 200
+        upload = create_upload(client, content=b"assembling-replay")
+        put_single_part(client, upload, b"assembling-replay")
+
+        first = client.post(f"/api/uploads/{upload['upload_id']}/complete", json={})
+        replay = client.post(f"/api/uploads/{upload['upload_id']}/complete", json={})
+
+    assert first.status_code == 500
+    assert replay.status_code == 409
+    assert assemble_calls == 1
+    session = app.state.upload_repository.get(str(upload["upload_id"]))
+    assert session["status"] == "verifying"
+    assert session["publication_state"] == "assembling"
 
 
 def test_restart_recovers_file_published_session_without_duplicate_message(
@@ -279,6 +430,10 @@ def test_restart_recovers_each_publication_failure_to_one_message(
         assert app.state.upload_repository.get(str(upload["upload_id"]))[
             "publication_state"
         ] == expected_state
+        retry = client.post(
+            f"/api/uploads/{upload['upload_id']}/complete", json={}
+        )
+        assert retry.status_code == 409
 
     monkeypatch.undo()
     recovered_app = create_app(settings)
@@ -373,7 +528,7 @@ def test_expired_unrecoverable_assembled_session_becomes_expired(
             (sha256(content).hexdigest(), "2026-07-20T00:00:00+00:00", upload_id),
         )
 
-    mutations = app.state.upload_service.expire(now)
+    mutations = asyncio.run(app.state.upload_service.expire(now))
 
     assert len(mutations) == 1
     assert app.state.upload_repository.get(upload_id)["status"] == "expired"
@@ -488,17 +643,178 @@ def test_expire_returns_recovery_mutation_for_maintenance_broadcast(
         assert client.post(
             f"/api/uploads/{upload['upload_id']}/complete", json={}
         ).status_code == 500
+        with app.state.database.transaction() as connection:
+            connection.execute(
+                "UPDATE upload_sessions SET expires_at = ? WHERE id = ?",
+                ("2026-07-18T00:00:00+00:00", upload["upload_id"]),
+            )
 
     monkeypatch.undo()
-    mutations = app.state.upload_service.expire(
-        datetime(2026, 7, 19, tzinfo=timezone.utc)
+    mutations = asyncio.run(
+        app.state.upload_service.expire(
+            datetime(2026, 7, 19, tzinfo=timezone.utc)
+        )
     )
 
     assert len(mutations) == 1
-    assert mutations[0]["result"]["status"] == "complete"
+    assert mutations[0]["result"]["upload_id"] == upload["upload_id"]
+    assert app.state.upload_repository.get(str(upload["upload_id"]))[
+        "status"
+    ] == "complete"
     assert any(
         event["event_type"] == "message.created" for event in mutations[0]["events"]
     )
+
+
+def test_maintenance_waits_for_in_progress_assembly(
+    settings: Settings,
+) -> None:
+    app = create_app(settings)
+    original_assemble = app.state.chunk_storage.assemble
+    assembled = threading.Event()
+    release = threading.Event()
+
+    def blocked_after_assembly(*args, **kwargs):
+        pending = original_assemble(*args, **kwargs)
+        assembled.set()
+        assert release.wait(timeout=2)
+        return pending
+
+    app.state.chunk_storage.assemble = blocked_after_assembly
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/session",
+            json={
+                "access_token": settings.auth_token,
+                "device_id": "source",
+                "device_name": "source",
+            },
+        ).status_code == 200
+        upload = create_upload(client, content=b"maintenance-race")
+        put_single_part(client, upload, b"maintenance-race")
+        upload_id = str(upload["upload_id"])
+        responses: dict[str, object] = {}
+
+        def run_complete() -> None:
+            responses["complete"] = client.post(
+                f"/api/uploads/{upload_id}/complete", json={}
+            )
+
+        complete_thread = threading.Thread(target=run_complete)
+        complete_thread.start()
+        assert assembled.wait(timeout=2)
+        with app.state.database.transaction() as connection:
+            connection.execute(
+                "UPDATE upload_sessions SET expires_at = ? WHERE id = ?",
+                ("2026-07-18T00:00:00+00:00", upload_id),
+            )
+
+        def run_expire() -> None:
+            responses["expire"] = client.portal.call(
+                app.state.upload_service.expire,
+                datetime(2026, 7, 19, tzinfo=timezone.utc),
+            )
+
+        expire_thread = threading.Thread(target=run_expire)
+        expire_thread.start()
+        time.sleep(0.05)
+        maintenance_waited = expire_thread.is_alive()
+        assembled_path = settings.upload_dir / ".resumable" / upload_id / "final.uploading"
+        assembled_survived = assembled_path.is_file()
+        release.set()
+        complete_thread.join(timeout=2)
+        expire_thread.join(timeout=2)
+
+    assert maintenance_waited
+    assert assembled_survived
+    assert responses["complete"].status_code == 200
+    assert responses["expire"] == []
+    assert app.state.upload_repository.get(upload_id)["status"] == "complete"
+
+
+def test_maintenance_does_not_recover_unexpired_verifying_session(
+    settings: Settings,
+) -> None:
+    app = create_app(settings)
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/session",
+            json={
+                "access_token": settings.auth_token,
+                "device_id": "source",
+                "device_name": "source",
+            },
+        ).status_code == 200
+        content = b"not-due"
+        upload = create_upload(client, content=content)
+        put_single_part(client, upload, content)
+        upload_id = str(upload["upload_id"])
+        now = datetime(2026, 7, 19, tzinfo=timezone.utc)
+        session = app.state.upload_repository.begin_completion(
+            upload_id, now, settings.upload_session_ttl_seconds
+        )
+        pending = app.state.chunk_storage.assemble(
+            session, app.state.upload_repository.list_parts(upload_id)
+        )
+        app.state.upload_repository.set_publication_state(
+            upload_id,
+            "assembled",
+            pending.sha256,
+            now,
+            settings.upload_session_ttl_seconds,
+        )
+
+        mutations = client.portal.call(app.state.upload_service.expire, now)
+
+    current = app.state.upload_repository.get(upload_id)
+    assert mutations == []
+    assert current["status"] == "verifying"
+    assert current["publication_state"] == "assembled"
+    assert pending.temporary_path.is_file()
+
+
+def test_maintenance_recovers_due_verifying_session_under_upload_lock(
+    settings: Settings,
+) -> None:
+    app = create_app(settings)
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/session",
+            json={
+                "access_token": settings.auth_token,
+                "device_id": "source",
+                "device_name": "source",
+            },
+        ).status_code == 200
+        content = b"due-recovery"
+        upload = create_upload(client, content=content)
+        put_single_part(client, upload, content)
+        upload_id = str(upload["upload_id"])
+        now = datetime(2026, 7, 19, tzinfo=timezone.utc)
+        session = app.state.upload_repository.begin_completion(
+            upload_id, now, settings.upload_session_ttl_seconds
+        )
+        pending = app.state.chunk_storage.assemble(
+            session, app.state.upload_repository.list_parts(upload_id)
+        )
+        app.state.upload_repository.set_publication_state(
+            upload_id,
+            "assembled",
+            pending.sha256,
+            now,
+            settings.upload_session_ttl_seconds,
+        )
+        with app.state.database.transaction() as connection:
+            connection.execute(
+                "UPDATE upload_sessions SET expires_at = ? WHERE id = ?",
+                ("2026-07-18T00:00:00+00:00", upload_id),
+            )
+
+        mutations = client.portal.call(app.state.upload_service.expire, now)
+
+    assert len(mutations) == 1
+    assert mutations[0]["result"]["upload_id"] == upload_id
+    assert app.state.upload_repository.get(upload_id)["status"] == "complete"
 
 
 def test_expire_cleans_temporary_parts_and_emits_event(settings: Settings) -> None:
@@ -515,7 +831,7 @@ def test_expire_cleans_temporary_parts_and_emits_event(settings: Settings) -> No
             ("2026-07-20T00:00:00+00:00", upload_id),
         )
 
-    mutations = app.state.upload_service.expire(now)
+    mutations = asyncio.run(app.state.upload_service.expire(now))
 
     assert len(mutations) == 1
     assert mutations[0]["events"][0]["event_type"] == "upload.expired"

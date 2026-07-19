@@ -284,9 +284,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(lifespan_app: FastAPI) -> AsyncIterator[None]:
-        upload_mutations = await asyncio.to_thread(
-            upload_service.recover, lifespan_app.state.clock()
-        )
+        upload_mutations = await upload_service.recover(lifespan_app.state.clock())
         for mutation in upload_mutations:
             await broadcast_mutation(mutation)
         recovered = await asyncio.to_thread(messages.recover_upload_reservations, storage)
@@ -331,8 +329,8 @@ def create_app(settings: Settings) -> FastAPI:
                     except Exception:
                         logger.exception("Periodic purge failed")
                     try:
-                        expired = await asyncio.to_thread(
-                            upload_service.expire, lifespan_app.state.clock()
+                        expired = await upload_service.expire(
+                            lifespan_app.state.clock()
                         )
                         for mutation in expired:
                             await broadcast_mutation(mutation)
@@ -341,9 +339,7 @@ def create_app(settings: Settings) -> FastAPI:
 
         await run_purge()
         try:
-            expired = await asyncio.to_thread(
-                upload_service.expire, lifespan_app.state.clock()
-            )
+            expired = await upload_service.expire(lifespan_app.state.clock())
             for mutation in expired:
                 await broadcast_mutation(mutation)
         except Exception:
@@ -1023,9 +1019,8 @@ def create_app(settings: Settings) -> FastAPI:
         session: SessionData = Depends(require_session),
         _: None = Depends(enforce_rate_limit),
     ) -> dict[str, object]:
-        sequence = await asyncio.to_thread(messages.latest_sequence)
         try:
-            result = await upload_service.complete(
+            mutation = await upload_service.complete(
                 upload_id, session, request.app.state.clock()
             )
         except UploadNotFound as error:
@@ -1038,8 +1033,10 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(
                 status_code=507, detail="Upload storage operation failed"
             ) from error
-        for event in await asyncio.to_thread(messages.events_after, sequence):
-            await hub.broadcast(event)
+        await broadcast_mutation(mutation)
+        result = mutation.get("result")
+        if not isinstance(result, dict):
+            raise RuntimeError("Upload completion returned an invalid result")
         return result
 
     @app.delete("/api/uploads/{upload_id}")

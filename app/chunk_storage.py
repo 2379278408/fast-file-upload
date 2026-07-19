@@ -364,3 +364,33 @@ class ChunkStorage:
             or self.part_path(*key).is_symlink()
         }
         return StorageReconcileResult(missing_confirmed, orphan_sessions)
+
+    def reconcile_session(
+        self, upload_id: str, confirmed_indexes: set[int]
+    ) -> set[tuple[str, int]]:
+        _validate_key(upload_id, 0)
+        for part_index in confirmed_indexes:
+            _validate_key(upload_id, part_index)
+        session_dir = self._session_dir(upload_id)
+        if session_dir.exists():
+            for incoming in session_dir.glob("incoming-*"):
+                if incoming.is_file() or incoming.is_symlink():
+                    incoming.unlink(missing_ok=True)
+        return {
+            (upload_id, part_index)
+            for part_index in confirmed_indexes
+            if not self.part_path(upload_id, part_index).is_file()
+            or self.part_path(upload_id, part_index).is_symlink()
+        }
+
+    def orphan_sessions(self, session_ids: set[str]) -> set[str]:
+        if not self.resumable_dir.exists():
+            return set()
+        return {
+            candidate.name
+            for candidate in self.resumable_dir.iterdir()
+            if not candidate.is_symlink()
+            and candidate.is_dir()
+            and UPLOAD_ID_PATTERN.fullmatch(candidate.name) is not None
+            and candidate.name not in session_ids
+        }

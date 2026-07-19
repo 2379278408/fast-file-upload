@@ -51,3 +51,34 @@
 
 - 测试环境持续报告 Starlette 关于 `httpx` 兼容层的弃用警告。
 - 仓库环境未安装 Ruff；静态验证使用 `compileall` 与 `git diff --check`。
+
+## 高中严重性发现修复追加
+
+### 红灯证据
+
+- 并发 complete 与精确事件传播：`2 failed`。第二个 complete 启动第二次 assemble；interleaved message event 被 sequence 窗口重复广播。
+- maintenance 锁与到期语义：`2 failed, 1 passed`。maintenance 在 assemble 期间重置 session；未到期 verifying 被全局 recover 提前发布。
+
+### 修复内容
+
+- `complete()` 的 keyed upload lock 覆盖 assemble、publish、database finalize 和临时清理；进程内 completion ownership 让并发 HTTP complete 立即返回 `409`。
+- `begin_completion()` 仅接受持久化 `uploading`；`verifying` 的 `assembling`、`assembled`、`file_published` 均由 startup 或到期 maintenance recovery 继续处理。
+- `complete()` 返回精确 mutation envelope，`result` 为永久 message DTO；route 仅广播该 envelope 的 events，replay 返回空 events。
+- `recover()` 启动时枚举全部 session，并逐 upload 获取同一 keyed lock；part reconciliation、publication recovery 和文件清理均在该锁所有权下执行。
+- `expire()` 仅查询到期非终态 ID，逐 upload 加锁后重读 status 与 expiry；仅到期 verifying 执行对应 publication recovery，且不再调用全局 recover。
+- 活跃 part writer 使 recover/expire 跳过该 upload，避免 incoming/part 文件与 put 并发清理。
+- lifespan 和 maintenance 直接 await 异步 recover/expire，并逐 envelope 精确广播持久事件。
+- Task 5 brief 已同步 async recover/expire 与 complete mutation envelope 内部契约。
+
+### 并发与事件证据
+
+- 两个真实并发 complete 请求：一个 `200`、一个 `409`，assemble 与 finalize 均严格调用一次。
+- maintenance 与已生成 `final.uploading` 的 assemble 并发：maintenance 等待 upload lock，文件保持存在，complete 收敛后 maintenance 重读为终态并跳过。
+- 未到期 `verifying/assembled`：maintenance 返回空 mutation，状态与 assembled 文件保持。
+- 到期 `verifying/assembled`：maintenance 在 upload lock 内完成 publication，返回永久 message mutation。
+- interleaved text message：其 event 仅广播一次，complete 仅广播自己的 `upload.completed`、`message.created`、`file.finalized`；complete replay 无广播。
+- durable `assembling`、`assembled`、`file_published` 的 HTTP complete replay 均返回 `409`，由 recovery 继续。
+
+### 追加 Commit
+
+- `fix(upload): serialize recovery and completion events`（本追加报告随新 commit 提交）
