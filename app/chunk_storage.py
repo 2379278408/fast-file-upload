@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from uuid import uuid4
 
 from .storage import PendingFile, sanitize_filename
 from .upload_repository import PartRecord
@@ -20,6 +21,14 @@ class ChunkSizeMismatch(ValueError):
 
 
 class ChunkDigestMismatch(ValueError):
+    pass
+
+
+class PartConflict(ValueError):
+    pass
+
+
+class PartIntegrityError(ValueError):
     pass
 
 
@@ -85,24 +94,47 @@ class ChunkStorage:
     ) -> StoredPart:
         if expected_size < 0:
             raise ValueError("expected_size must be non-negative")
-        incoming = self.incoming_path(upload_id, part_index)
+        incoming_base = self.incoming_path(upload_id, part_index)
+        incoming = incoming_base.with_name(f"{incoming_base.name}-{uuid4().hex}")
         confirmed = self.part_path(upload_id, part_index)
-        incoming.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(incoming.parent.mkdir, parents=True, exist_ok=True)
         if incoming.parent.is_symlink():
             raise ValueError("Upload session cannot be a symbolic link")
         digest = sha256()
         written = 0
         output = None
+        failure: BaseException | None = None
+        result: StoredPart | None = None
+
+        def write_and_hash(piece: bytes) -> None:
+            output.write(piece)
+            digest.update(piece)
+
+        def confirmed_digest() -> tuple[int, str]:
+            existing_digest = sha256()
+            existing_size = 0
+            descriptor = os.open(confirmed, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "rb") as source:
+                while piece := source.read(self.buffer_size):
+                    existing_size += len(piece)
+                    existing_digest.update(piece)
+            return existing_size, existing_digest.hexdigest()
+
         try:
-            output = incoming.open("xb")
+            output = await asyncio.to_thread(incoming.open, "xb")
             async for chunk in chunks:
                 if not isinstance(chunk, bytes):
                     raise TypeError("Upload chunks must be bytes")
-                await asyncio.to_thread(output.write, chunk)
-                written += len(chunk)
-                digest.update(chunk)
-                if on_bytes is not None:
-                    await on_bytes(len(chunk))
+                for offset in range(0, len(chunk), self.buffer_size):
+                    piece = chunk[offset : offset + self.buffer_size]
+                    if written + len(piece) > expected_size:
+                        raise ChunkSizeMismatch(
+                            f"Expected {expected_size} bytes, received more data"
+                        )
+                    await asyncio.to_thread(write_and_hash, piece)
+                    written += len(piece)
+                    if on_bytes is not None:
+                        await on_bytes(len(piece))
             await asyncio.to_thread(output.flush)
             await asyncio.to_thread(os.fsync, output.fileno())
             await asyncio.to_thread(output.close)
@@ -112,13 +144,38 @@ class ChunkStorage:
             actual_sha256 = digest.hexdigest()
             if actual_sha256 != expected_sha256:
                 raise ChunkDigestMismatch("Chunk SHA-256 mismatch")
-            await asyncio.to_thread(incoming.replace, confirmed)
-            return StoredPart(confirmed, written, actual_sha256)
-        finally:
-            if output is not None:
+            try:
+                await asyncio.to_thread(os.link, incoming, confirmed)
+            except FileExistsError:
+                try:
+                    existing_size, existing_sha256 = await asyncio.to_thread(confirmed_digest)
+                except OSError as exc:
+                    raise PartConflict(
+                        f"Confirmed part {part_index} cannot be verified"
+                    ) from exc
+                if (existing_size, existing_sha256) != (written, actual_sha256):
+                    raise PartConflict(
+                        f"Confirmed part {part_index} has different content"
+                    )
+            result = StoredPart(confirmed, written, actual_sha256)
+        except BaseException as exc:
+            failure = exc
+        if output is not None:
+            try:
                 await asyncio.to_thread(output.close)
-            if incoming.exists() or incoming.is_symlink():
-                await asyncio.to_thread(incoming.unlink, missing_ok=True)
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        try:
+            await asyncio.to_thread(incoming.unlink, missing_ok=True)
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+        if failure is not None:
+            raise failure
+        if result is None:
+            raise RuntimeError("Part write ended without a result")
+        return result
 
     def assemble(
         self, session: Mapping[str, object], parts: Sequence[PartRecord]
@@ -131,25 +188,46 @@ class ChunkStorage:
         written = 0
         ordered = sorted(parts, key=lambda part: part.part_index)
         if [part.part_index for part in ordered] != list(range(len(ordered))):
-            raise ValueError("Upload parts must be contiguous and unique")
+            raise PartIntegrityError("Upload part indexes must be contiguous and unique")
+        expected_size = int(session["size_bytes"])
+        expected_start = 0
+        for part in ordered:
+            range_size = part.end_byte - part.start_byte + 1
+            if part.upload_id != upload_id:
+                raise PartIntegrityError("Part belongs to a different upload")
+            if part.start_byte != expected_start or part.end_byte < part.start_byte:
+                raise PartIntegrityError("Upload part ranges must be precisely contiguous")
+            if part.size_bytes != range_size:
+                raise PartIntegrityError("Upload part size does not match its byte range")
+            expected_start = part.end_byte + 1
+        if expected_start != expected_size:
+            raise PartIntegrityError("Upload parts do not cover the complete file range")
         try:
             with temporary_path.open("xb") as output:
                 for part in ordered:
-                    if part.upload_id != upload_id:
-                        raise ValueError("Part belongs to a different upload")
                     source_path = self.part_path(upload_id, part.part_index)
                     if source_path.is_symlink():
-                        raise ValueError("Upload part cannot be a symbolic link")
-                    with source_path.open("rb") as source:
-                        while chunk := source.read(self.buffer_size):
-                            output.write(chunk)
-                            digest.update(chunk)
-                            written += len(chunk)
+                        raise PartIntegrityError("Upload part cannot be a symbolic link")
+                    part_digest = sha256()
+                    part_written = 0
+                    try:
+                        with source_path.open("rb") as source:
+                            while chunk := source.read(self.buffer_size):
+                                output.write(chunk)
+                                digest.update(chunk)
+                                part_digest.update(chunk)
+                                part_written += len(chunk)
+                                written += len(chunk)
+                    except FileNotFoundError as exc:
+                        raise PartIntegrityError("Stored upload part is missing") from exc
+                    if part_written != part.size_bytes:
+                        raise PartIntegrityError("Stored part size differs from its record")
+                    if part_digest.hexdigest() != part.sha256:
+                        raise PartIntegrityError("Stored part SHA-256 differs from its record")
                 output.flush()
                 os.fsync(output.fileno())
-            expected_size = int(session["size_bytes"])
             if written != expected_size:
-                raise ChunkSizeMismatch(
+                raise PartIntegrityError(
                     f"Expected {expected_size} assembled bytes, received {written}"
                 )
         except BaseException:
@@ -157,6 +235,7 @@ class ChunkStorage:
             raise
 
         safe_name = sanitize_filename(str(session["original_name"]))
+        safe_name = " ".join(safe_name.split()) or "unnamed-file"
         return PendingFile(
             file_id=upload_id,
             original_name=safe_name,
