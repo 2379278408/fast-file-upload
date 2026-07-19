@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import tempfile
@@ -29,6 +30,7 @@ from .auth import (
     require_session,
 )
 from .config import SESSION_DAYS, Settings
+from .chunk_storage import ChunkDigestMismatch, ChunkSizeMismatch, ChunkStorage, PartConflict
 from .database import Database
 from .events import EventHub
 from .repository import (
@@ -41,6 +43,20 @@ from .repository import (
     utc_now,
 )
 from .storage import FILE_ID_PATTERN, FileStorage
+from .upload_repository import (
+    UploadCapacityExceeded,
+    UploadConflict,
+    UploadCreate,
+    UploadNotFound,
+    UploadRepository,
+    UploadStateConflict,
+)
+from .upload_service import (
+    InvalidUploadPart,
+    UploadService,
+    UploadStorageExceeded,
+    UploadTooLarge,
+)
 
 
 logger = logging.getLogger("transfer.upload")
@@ -78,6 +94,22 @@ class TextMessageRequest(BaseModel):
 
 class BatchRequest(BaseModel):
     message_ids: Annotated[list[MessageId], Field(min_length=1, max_length=50)]
+
+
+class CreateUploadRequest(BaseModel):
+    client_request_id: str = Field(
+        min_length=1, max_length=128, pattern=IDENTIFIER_PATTERN
+    )
+    name: str = Field(min_length=1, max_length=255)
+    size_bytes: int = Field(ge=1)
+    mime_type: str = Field(default="application/octet-stream", max_length=255)
+    last_modified_ms: int = Field(ge=0)
+    chunk_size_bytes: int = Field(gt=0)
+    sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class UploadControlRequest(BaseModel):
+    action: Literal["pause", "resume"]
 
 
 class _LockEntry:
@@ -381,7 +413,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
-        allow_methods=["GET", "POST", "DELETE"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
         allow_headers=["*"],
     )
 
@@ -390,6 +422,13 @@ def create_app(settings: Settings) -> FastAPI:
     web_root = web_dir / "index.html"
     upload_locks = _KeyedLockPool(settings.client_request_lock_capacity)
     app.state.upload_locks = upload_locks
+    upload_repository = UploadRepository(database)
+    chunk_storage = ChunkStorage(settings.upload_dir)
+    upload_service = UploadService(
+        upload_repository, chunk_storage, settings, upload_locks
+    )
+    app.state.upload_repository = upload_repository
+    app.state.upload_service = upload_service
 
     def record_audit(action: str, file_id: str, name: str, size_bytes: int, **extra: object) -> None:
         audit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -804,6 +843,160 @@ def create_app(settings: Settings) -> FastAPI:
             return message, mutation
 
         return execute()
+
+    @app.post("/api/uploads")
+    async def create_resumable_upload(
+        payload: CreateUploadRequest,
+        request: Request,
+        session: SessionData = Depends(require_session),
+        _: None = Depends(enforce_rate_limit),
+    ) -> dict[str, object]:
+        command = UploadCreate(
+            client_request_id=payload.client_request_id,
+            original_name=payload.name,
+            mime_type=payload.mime_type,
+            size_bytes=payload.size_bytes,
+            last_modified_ms=payload.last_modified_ms,
+            sample_sha256=payload.sample_sha256,
+            chunk_size_bytes=payload.chunk_size_bytes,
+            source_device_id=session.device_id,
+            source_device_name=session.device_name,
+        )
+        try:
+            return await upload_locks.run(
+                payload.client_request_id,
+                upload_service.create,
+                command,
+                session,
+                request.app.state.clock(),
+            )
+        except _KeyedLockCapacityExceeded as error:
+            raise HTTPException(
+                status_code=503, detail="Too many active client requests"
+            ) from error
+        except UploadTooLarge as error:
+            raise HTTPException(status_code=413, detail=str(error)) from error
+        except UploadStorageExceeded as error:
+            raise HTTPException(status_code=507, detail=str(error)) from error
+        except UploadCapacityExceeded as error:
+            raise HTTPException(status_code=429, detail="Too many active uploads") from error
+        except UploadConflict as error:
+            raise HTTPException(
+                status_code=409,
+                detail="client_request_id was already used with different metadata",
+            ) from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.get("/api/uploads/active")
+    async def list_active_uploads(
+        _: SessionData = Depends(require_session),
+        __: None = Depends(enforce_rate_limit),
+    ) -> list[dict[str, object]]:
+        return await asyncio.to_thread(upload_service.list_active, _)
+
+    @app.get("/api/uploads/{upload_id}")
+    async def get_resumable_upload(
+        upload_id: str,
+        session: SessionData = Depends(require_session),
+        _: None = Depends(enforce_rate_limit),
+    ) -> dict[str, object]:
+        try:
+            return await asyncio.to_thread(upload_service.get, upload_id, session)
+        except UploadNotFound as error:
+            raise HTTPException(status_code=404, detail="Upload not found") from error
+
+    @app.put("/api/uploads/{upload_id}/parts/{part_index}")
+    async def put_upload_part(
+        upload_id: str,
+        part_index: int,
+        request: Request,
+        session: SessionData = Depends(require_session),
+        _: None = Depends(enforce_rate_limit),
+    ) -> dict[str, object]:
+        try:
+            return await upload_service.put_part(
+                upload_id,
+                part_index,
+                request.headers.get("content-range", ""),
+                request.headers.get("x-chunk-sha256", ""),
+                request.stream(),
+                session,
+                request.app.state.clock(),
+            )
+        except UploadNotFound as error:
+            raise HTTPException(status_code=404, detail="Upload not found") from error
+        except InvalidUploadPart as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except (ChunkSizeMismatch, ChunkDigestMismatch) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except OSError as error:
+            if error.errno == errno.ENOSPC:
+                raise HTTPException(
+                    status_code=507, detail="Insufficient storage capacity"
+                ) from error
+            raise
+        except (UploadConflict, PartConflict) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except UploadStateConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except _KeyedLockCapacityExceeded as error:
+            raise HTTPException(
+                status_code=503, detail="Too many active upload operations"
+            ) from error
+
+    @app.patch("/api/uploads/{upload_id}")
+    async def control_resumable_upload(
+        upload_id: str,
+        payload: UploadControlRequest,
+        request: Request,
+        session: SessionData = Depends(require_session),
+        _: None = Depends(enforce_rate_limit),
+    ) -> dict[str, object]:
+        try:
+            return await upload_locks.run(
+                upload_id,
+                upload_service.control,
+                upload_id,
+                payload.action,
+                session,
+                request.app.state.clock(),
+            )
+        except UploadNotFound as error:
+            raise HTTPException(status_code=404, detail="Upload not found") from error
+        except (UploadConflict, UploadStateConflict) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except _KeyedLockCapacityExceeded as error:
+            raise HTTPException(
+                status_code=503, detail="Too many active upload operations"
+            ) from error
+
+    @app.delete("/api/uploads/{upload_id}")
+    async def cancel_resumable_upload(
+        upload_id: str,
+        request: Request,
+        session: SessionData = Depends(require_session),
+        _: None = Depends(enforce_rate_limit),
+    ) -> dict[str, object]:
+        try:
+            return await upload_locks.run(
+                upload_id,
+                upload_service.cancel,
+                upload_id,
+                session,
+                request.app.state.clock(),
+            )
+        except UploadNotFound as error:
+            raise HTTPException(status_code=404, detail="Upload not found") from error
+        except UploadStateConflict as error:
+            detail = str(error)
+            if detail == "complete uploads cannot be cancelled":
+                detail = "Completed uploads cannot be cancelled"
+            raise HTTPException(status_code=409, detail=detail) from error
+        except _KeyedLockCapacityExceeded as error:
+            raise HTTPException(
+                status_code=503, detail="Too many active upload operations"
+            ) from error
 
     @app.post("/api/upload")
     async def upload(
