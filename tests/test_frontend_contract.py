@@ -508,6 +508,12 @@ def load_js_module(context: quickjs.Context, module_path: str, source: str) -> N
         except Exception:
             context.eval(transform_module(read_web("js/config.js"), "./config.js"))
     if module_path == "./app.js":
+        for dependency in ("./upload-coordinator.js", "./upload-persistence.js"):
+            dependency_type = context.eval(
+                f'typeof globalThis.__modules[{json.dumps(dependency)}]'
+            )
+            if "undefined" in str(dependency_type):
+                context.eval(transform_module(read_web(f"js/{dependency[2:]}"), dependency))
         try:
             navigation_type = context.eval('typeof globalThis.__modules["./navigation.js"]')
             if "undefined" in str(navigation_type):
@@ -2087,16 +2093,90 @@ def test_timeline_css_classes_present(client: TestClient) -> None:
         assert cls in css
 
 
-def test_composer_contract_has_keyboard_paste_cancel_retry_and_preserved_text() -> None:
+def test_composer_contract_has_keyboard_paste_and_preserved_text() -> None:
     source = read_web("js/composer.js")
     for token in ("event.key === 'Enter'", "event.shiftKey", "clipboardData.items", "kind === 'file'",
-                  "AbortController", "cancelUpload", "retryUpload", "MAX_TEXT_LENGTH", "crypto.randomUUID"):
+                  "MAX_TEXT_LENGTH", "crypto.randomUUID"):
         assert token in source
     assert "textarea.value = ''" in source
     assert source.index("await sendText") < source.index("textarea.value = ''")
-    assert '<progress class="progress" max="100"' in source
-    assert 'value="${task.progress}"' in source
-    assert 'aria-label="上传进度"' in source
+
+
+def test_composer_delegates_select_drop_and_paste_to_one_coordinator() -> None:
+    source = read_web("js/composer.js")
+    assert "uploadCoordinator.enqueueFiles" in source
+    assert "uploadFile(" not in source
+    assert "uploadTasks" not in source
+    assert "renderQueue" not in source
+
+
+def test_timeline_upload_projection_replaces_card_without_duplicate() -> None:
+    context = create_js_context()
+    load_js_module(context, "./timeline.js", read_web("js/timeline.js"))
+    context.eval(r"""
+      globalThis.container = document.createElement('div');
+      globalThis.timeline = __modules['./timeline.js'].createTimeline({
+        container, newMessageButton: null, api: () => Promise.resolve({ items: [] }),
+        onRestore: () => {}, onUploadAction: () => {},
+      });
+      timeline.upsertUpload({ uploadId: 'upload-1', clientRequestId: 'request-1', name: 'a.txt', sizeBytes: 4, status: 'uploading', confirmedBytes: 2, progressPercent: 50, isSourceDevice: true });
+      timeline.upsert({ id: 'message-1', upload_id: 'upload-1', client_request_id: 'request-1', created_at: '2026-07-19T00:00:00Z', file: { id: 'upload-1', name: 'a.txt', size: '4 B', download_url: '/download/upload-1' } });
+    """)
+    assert context.eval("container.querySelectorAll('[data-upload-id=\"upload-1\"]').length") == 0
+    assert context.eval("container.querySelectorAll('[data-message-id=\"message-1\"]').length") == 1
+    assert context.eval("container.children.length") == 1
+
+
+def test_upload_cards_render_text_states_metrics_and_observer_permissions() -> None:
+    context = create_js_context()
+    load_js_module(context, "./timeline.js", read_web("js/timeline.js"))
+    context.eval(r"""
+      globalThis.container = document.createElement('div');
+      globalThis.timeline = __modules['./timeline.js'].createTimeline({
+        container, newMessageButton: null, api: () => Promise.resolve({ items: [] }),
+        onRestore: () => {}, onUploadAction: () => {},
+      });
+      ['queued', 'uploading', 'paused', 'verifying', 'failed', 'complete', 'cancelled', 'expired'].forEach((status, index) => {
+        timeline.upsertUpload({ uploadId: `upload-${index}`, name: `${status}.txt`, sizeBytes: 100, status, confirmedBytes: 50, progressPercent: 50, speedBytesPerSecond: 10, etaSeconds: 5, isSourceDevice: true, errorMessage: status === 'failed' ? '网络中断，请重试' : null });
+      });
+      timeline.upsertUpload({ uploadId: 'observer', name: 'remote.txt', sizeBytes: 100, status: 'uploading', confirmedBytes: 50, progressPercent: 50, isSourceDevice: false });
+    """)
+    states = json.loads(context.eval(
+        "JSON.stringify(container.querySelectorAll('.upload-card-status').map(node => node.textContent))"
+    ))
+    for label in ("等待上传", "上传中", "已暂停", "正在校验", "上传失败", "已完成", "已取消", "已过期"):
+        assert label in states
+    uploading_text = context.eval(
+        "container.querySelector('[data-upload-id=\"upload-1\"]').querySelector('.upload-card-metrics').textContent"
+    )
+    for token in ("50%", "50 B / 100 B", "10 B/s", "剩余 5 秒"):
+        assert token in uploading_text
+    observer = context.eval("container.querySelector('[data-upload-id=\"observer\"]')")
+    assert observer is not None
+    assert context.eval("container.querySelector('[data-upload-id=\"observer\"]').querySelector('[data-upload-action=\"pause\"]') === null") is True
+    assert context.eval("container.querySelector('[data-upload-id=\"observer\"]').querySelector('[data-upload-action=\"resume\"]') === null") is True
+    assert context.eval("container.querySelector('[data-upload-id=\"observer\"]').querySelector('[data-upload-action=\"cancel\"]') !== null") is True
+
+
+def test_upload_summary_drop_overlay_and_accessible_responsive_contract() -> None:
+    html = read_web("index.html")
+    css = read_web("styles.css")
+    app = read_web("js/app.js")
+    for element_id in ("uploadSummary", "pauseAllUploads", "resumeAllUploads", "cancelAllUploads", "transferDropOverlay", "uploadLiveRegion"):
+        assert f'id="{element_id}"' in html
+    assert "uploadSummary.hidden = activeTasks.length === 0" in app
+    assert "pauseAllUploads" in app and ".pauseAll()" in app
+    assert "resumeAllUploads" in app and ".resumeAll()" in app
+    assert "cancelAllUploads" in app and ".cancelAll()" in app
+    assert "transferDropOverlay" in app
+    assert "min-width: 44px" in css and "min-height: 44px" in css
+    assert "gap: 8px" in css
+    assert ":focus-visible" in css
+    assert "@media (max-width: 375px)" in css
+    assert "overflow-x: hidden" in css
+    assert "transition" in css and "180ms" in css
+    assert "@media (prefers-reduced-motion: reduce)" in css
+    assert "progress" in read_web("js/timeline.js")
 
 
 def test_composer_module_is_served(client: TestClient) -> None:
@@ -2108,8 +2188,9 @@ def test_composer_module_is_served(client: TestClient) -> None:
 def test_composer_html_elements_exist(client: TestClient) -> None:
     html = client.get("/").text
     for element_id in ("composerForm", "composerTextarea", "composerFileInput",
-                       "composerDropTarget", "composerQueue"):
+                       "composerDropTarget"):
         assert f'id="{element_id}"' in html
+    assert 'id="composerQueue"' not in html
     assert 'class="panel transfer-panel composer-dock"' in html
     assert 'Enter 发送，Shift+Enter 换行' in html
 
@@ -3701,7 +3782,7 @@ def test_app_lock_logout_close_once_and_unlock_reconnects() -> None:
     assert context.eval("socketCloseCount") == 2
 
 
-def test_upload_abort_rejects_abort_error_and_composer_continues_queue() -> None:
+def test_upload_abort_rejects_abort_error_and_composer_delegates_batch() -> None:
     context = create_js_context()
     context.eval(r"""
       globalThis.FormData = class FormData { append() {} };
@@ -3731,27 +3812,24 @@ def test_upload_abort_rejects_abort_error_and_composer_continues_queue() -> None
       directController.abort();
 
       const fileInput = document.getElementById('composerFileInput');
-      const queue = document.getElementById('composerQueue');
+      globalThis.delegatedFiles = [];
       __modules['./composer.js'].createComposer({
         form: document.getElementById('composerForm'),
         textarea: document.getElementById('composerTextarea'),
         fileInput,
         dropTarget: document.getElementById('composerDropTarget'),
-        queue,
         api: null,
         timeline: null,
+        uploadCoordinator: { enqueueFiles(files) { delegatedFiles.push(...files); } },
       });
       fileInput.listeners.change[0]({
         target: { files: [{ name: 'one.txt', size: 1 }, { name: 'two.txt', size: 1 }], value: '' },
       });
-      queue.listeners.click[0]({
-        target: { closest: () => ({ dataset: { action: 'cancel', taskId: '00000000-0000-4000-8000-000000000001' } }) },
-      });
     """)
     drain_jobs(context)
-    result = json.loads(context.eval("JSON.stringify({ abortName, xhrCount: xhrs.length })"))
+    result = json.loads(context.eval("JSON.stringify({ abortName, delegatedCount: delegatedFiles.length })"))
 
-    assert result == {"abortName": "AbortError", "xhrCount": 3}
+    assert result == {"abortName": "AbortError", "delegatedCount": 2}
 
 
 def test_upload_with_preaborted_signal_rejects_without_abort_event() -> None:

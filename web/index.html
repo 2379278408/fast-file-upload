@@ -100,6 +100,17 @@
                             <span id="connectionStatus" class="pill" aria-live="polite">未连接</span>
                         </header>
 
+                        <section class="upload-summary" id="uploadSummary" aria-label="上传任务" hidden>
+                            <p id="uploadSummaryText">0 个活动任务</p>
+                            <div class="upload-summary-actions">
+                                <button class="btn btn-soft" id="pauseAllUploads" type="button">全部暂停</button>
+                                <button class="btn btn-soft" id="resumeAllUploads" type="button">全部继续</button>
+                                <button class="btn btn-danger" id="cancelAllUploads" type="button">全部取消</button>
+                            </div>
+                        </section>
+                        <div class="transfer-drop-overlay" id="transferDropOverlay" aria-hidden="true">释放文件以添加到传输时间线</div>
+                        <div class="visually-hidden" id="uploadLiveRegion" aria-live="polite" aria-atomic="true"></div>
+
                         <!-- Timeline: recent activity -->
                         <section class="panel timeline-panel" id="timelinePanel">
                             <div class="panel-head">
@@ -148,7 +159,6 @@
                                 </div>
                                 <div class="composer-drop-hint" id="composerDropHint" hidden>拖放文件到此处</div>
                             </form>
-                            <div class="composer-queue" id="composerQueue"></div>
                         </section>
                     </div>
                 </section>

@@ -1,6 +1,9 @@
 import { request as apiRequest, unlock as apiUnlock, logout as apiLogout, getSession, ApiError, connectEvents, getLastSequence } from './api.js';
+import * as resumableApi from './api.js';
 import { createTimeline } from './timeline.js';
 import { createComposer } from './composer.js';
+import { createUploadCoordinator } from './upload-coordinator.js';
+import { createUploadPersistence } from './upload-persistence.js';
 import { createLibrary } from './library.js';
 import { createNavigation } from './navigation.js';
 import { TOAST_DURATION_MS } from './config.js';
@@ -247,6 +250,7 @@ async function checkSession() {
     if (connectionDevice) connectionDevice.textContent = storedName || '-';
     await refreshAll();
     await timeline.loadInitial();
+    await restoreUploads();
     hideLockOverlay();
     startEventConnection();
   } catch {
@@ -279,6 +283,7 @@ if (unlockForm) {
       setDeviceName(name);
       await refreshAll();
       await timeline.loadInitial();
+      await restoreUploads();
       hideLockOverlay();
       startEventConnection();
     } catch (err) {
@@ -300,6 +305,26 @@ window.addEventListener('session-logout', async () => {
 
 const timelineContainer = document.getElementById('timelineContainer');
 const newMessageButton = document.getElementById('newMessageButton');
+const uploadPersistence = createUploadPersistence({ indexedDB: window.indexedDB });
+const uploadCoordinator = createUploadCoordinator({
+  api: resumableApi,
+  persistence: uploadPersistence,
+});
+let uploadCoordinatorStarted = false;
+
+async function restoreUploads() {
+  try {
+    if (!uploadCoordinatorStarted) {
+      await uploadCoordinator.start();
+      uploadCoordinatorStarted = true;
+    } else {
+      await uploadCoordinator.reconcile();
+    }
+    uploadCoordinator.getSnapshot().forEach(task => timeline.upsertUpload?.(task));
+  } catch (error) {
+    showToast(error.message || '上传任务恢复失败', 'error');
+  }
+}
 
 const timeline = createTimeline({
   container: timelineContainer,
@@ -313,13 +338,17 @@ const timeline = createTimeline({
       if (savedTimelinePosition === snapshot) savedTimelinePosition = null;
     }
   },
+  onUploadAction({ action, uploadId }) {
+    const handler = uploadCoordinator[action];
+    if (typeof handler === 'function') handler.call(uploadCoordinator, uploadId);
+  },
 });
 
 const composerForm = document.getElementById('composerForm');
 const composerTextarea = document.getElementById('composerTextarea');
 const composerFileInput = document.getElementById('composerFileInput');
 const composerDropTarget = document.getElementById('composerDropTarget');
-const composerQueue = document.getElementById('composerQueue');
+const transferPage = document.getElementById('transferPage');
 const composerAttachBtn = document.getElementById('composerAttachBtn');
 const routeSource = document.getElementById('routeSource');
 const routeTarget = document.getElementById('routeTarget');
@@ -328,11 +357,42 @@ const composer = createComposer({
   form: composerForm,
   textarea: composerTextarea,
   fileInput: composerFileInput,
-  dropTarget: composerDropTarget,
-  queue: composerQueue,
+  dropTarget: transferPage || composerDropTarget,
   api: (url, opts) => apiRequest(url, opts),
   timeline,
+  uploadCoordinator,
 });
+
+const uploadSummary = document.getElementById('uploadSummary');
+const uploadSummaryText = document.getElementById('uploadSummaryText');
+const pauseAllUploads = document.getElementById('pauseAllUploads');
+const resumeAllUploads = document.getElementById('resumeAllUploads');
+const cancelAllUploads = document.getElementById('cancelAllUploads');
+const transferDropOverlay = document.getElementById('transferDropOverlay');
+const uploadLiveRegion = document.getElementById('uploadLiveRegion');
+const announcedUploadStates = new Map();
+
+uploadCoordinator.subscribe(tasks => {
+  tasks.forEach(task => {
+    timeline.upsertUpload?.(task);
+    const previousStatus = announcedUploadStates.get(task.uploadId);
+    if (uploadLiveRegion && previousStatus && previousStatus !== task.status) {
+      uploadLiveRegion.textContent = `${task.name}状态已更新`;
+    }
+    announcedUploadStates.set(task.uploadId, task.status);
+  });
+  const activeStates = ['queued', 'uploading', 'paused', 'verifying', 'completing', 'failed', 'needs-file'];
+  const activeTasks = tasks.filter(task => activeStates.includes(task.status));
+  if (uploadSummary) uploadSummary.hidden = activeTasks.length === 0;
+  if (uploadSummaryText) {
+    const uploading = activeTasks.filter(task => task.status === 'uploading').length;
+    const paused = activeTasks.filter(task => task.status === 'paused').length;
+    uploadSummaryText.textContent = `${activeTasks.length} 个活动任务 · ${uploading} 个上传中 · ${paused} 个已暂停`;
+  }
+});
+pauseAllUploads?.addEventListener('click', () => uploadCoordinator.pauseAll());
+resumeAllUploads?.addEventListener('click', () => uploadCoordinator.resumeAll());
+cancelAllUploads?.addEventListener('click', () => uploadCoordinator.cancelAll());
 
 const library = createLibrary({
   root: document.getElementById('libraryView'),
@@ -352,22 +412,30 @@ if (composerAttachBtn && composerFileInput) {
   composerAttachBtn.addEventListener('click', () => composerFileInput.click());
 }
 
-if (timelineContainer) {
-  ['dragenter', 'dragover'].forEach(name => {
-    timelineContainer.addEventListener(name, event => {
-      event.preventDefault();
-      timelineContainer.classList.add('dragover');
-    });
+if (transferPage && transferDropOverlay) {
+  let dragDepth = 0;
+  transferPage.addEventListener('dragenter', event => {
+    event.preventDefault();
+    dragDepth += 1;
+    transferDropOverlay.classList.add('is-visible');
+    transferDropOverlay.setAttribute('aria-hidden', 'false');
   });
-  ['dragleave', 'drop'].forEach(name => {
-    timelineContainer.addEventListener(name, event => {
-      event.preventDefault();
-      timelineContainer.classList.remove('dragover');
-    });
+  transferPage.addEventListener('dragover', event => {
+    event.preventDefault();
   });
-  timelineContainer.addEventListener('drop', event => {
-    const files = Array.from(event.dataTransfer.files);
-    if (files.length) composer.enqueueFiles(files);
+  transferPage.addEventListener('dragleave', event => {
+    event.preventDefault();
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) {
+      transferDropOverlay.classList.remove('is-visible');
+      transferDropOverlay.setAttribute('aria-hidden', 'true');
+    }
+  });
+  transferPage.addEventListener('drop', event => {
+      event.preventDefault();
+      dragDepth = 0;
+      transferDropOverlay.classList.remove('is-visible');
+      transferDropOverlay.setAttribute('aria-hidden', 'true');
   });
 }
 
@@ -581,6 +649,9 @@ function updateConnectionStatus(status) {
 
 function applyIncomingEvent(event) {
   if (!event) return false;
+  if (event.event_type?.startsWith('upload.')) {
+    uploadCoordinator.applyRemoteEvent(event.payload || event);
+  }
   timeline.mergeEvent(event);
   if (library && typeof library.applyEvent === 'function') {
     library.applyEvent(event);

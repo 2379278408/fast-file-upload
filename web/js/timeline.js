@@ -1,7 +1,8 @@
 import { UNDO_WINDOW_MS, HIGHLIGHT_DURATION_MS } from './config.js';
 
-export function createTimeline({ container, newMessageButton, api, onRestore }) {
+export function createTimeline({ container, newMessageButton, api, onRestore, onUploadAction }) {
   const messages = new Map();
+  const uploads = new Map();
   const appliedSequences = new Set();
   let lastSequence = 0;
   let nextBefore = null;
@@ -174,6 +175,145 @@ export function createTimeline({ container, newMessageButton, api, onRestore }) 
     return el;
   }
 
+  const uploadStatusLabels = {
+    queued: '等待上传',
+    uploading: '上传中',
+    paused: '已暂停',
+    verifying: '正在校验',
+    completing: '正在校验',
+    failed: '上传失败',
+    complete: '已完成',
+    completed: '已完成',
+    cancelled: '已取消',
+    expired: '已过期',
+    'needs-file': '等待重新选择原文件',
+  };
+
+  function formatBytes(size) {
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let value = Number(size) || 0;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit += 1;
+    }
+    const digits = unit === 0 ? 0 : 1;
+    return `${value.toFixed(digits)} ${units[unit]}`;
+  }
+
+  function formatDuration(seconds) {
+    if (!Number.isFinite(seconds)) return '计算中';
+    if (seconds < 60) return `${Math.ceil(seconds)} 秒`;
+    return `${Math.ceil(seconds / 60)} 分钟`;
+  }
+
+  function uploadActions(upload) {
+    const actions = [];
+    if (upload.isSourceDevice !== false) {
+      if (['queued', 'uploading'].includes(upload.status)) actions.push(['pause', '暂停']);
+      if (['paused', 'needs-file'].includes(upload.status)) actions.push(['resume', '继续']);
+      if (upload.status === 'failed') actions.push(['retry', '重试']);
+      if (upload.status === 'queued') actions.push(['prioritize', '优先上传']);
+    }
+    if (!['complete', 'completed', 'cancelled', 'expired'].includes(upload.status)) {
+      actions.push(['cancel', '取消']);
+    }
+    return actions;
+  }
+
+  function renderUpload(upload) {
+    const element = document.createElement('article');
+    element.className = `timeline-message upload-card upload-card-${upload.status || 'queued'}`;
+    element.dataset.uploadId = upload.uploadId;
+    element.dataset.clientRequestId = upload.clientRequestId || '';
+    element.dataset.createdAt = upload.createdAt || '';
+
+    const heading = document.createElement('div');
+    heading.className = 'upload-card-heading';
+    const name = document.createElement('strong');
+    name.className = 'upload-card-name';
+    name.textContent = upload.name || '未命名文件';
+    const status = document.createElement('span');
+    status.className = 'upload-card-status';
+    status.textContent = uploadStatusLabels[upload.status] || upload.status || '等待上传';
+    heading.append(name, status);
+    element.append(heading);
+
+    const progress = document.createElement('progress');
+    progress.className = 'upload-card-progress';
+    progress.max = 100;
+    progress.value = Math.max(0, Math.min(100, Math.round(upload.progressPercent || 0)));
+    progress.setAttribute('aria-label', `${name.textContent}上传进度`);
+    element.append(progress);
+
+    const metrics = document.createElement('p');
+    metrics.className = 'upload-card-metrics';
+    const confirmed = upload.confirmedBytes || 0;
+    const total = upload.sizeBytes || 0;
+    const parts = [`${Math.round(upload.progressPercent || 0)}%`, `${formatBytes(confirmed)} / ${formatBytes(total)}`];
+    if (upload.status === 'uploading' && upload.isSourceDevice !== false) {
+      parts.push(`${formatBytes(upload.speedBytesPerSecond || 0)}/s`);
+      parts.push(`剩余 ${formatDuration(upload.etaSeconds)}`);
+    }
+    metrics.textContent = parts.join(' · ');
+    element.append(metrics);
+
+    if (upload.errorMessage) {
+      const error = document.createElement('p');
+      error.className = 'upload-card-error';
+      error.textContent = upload.errorMessage;
+      element.append(error);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'upload-card-actions';
+    uploadActions(upload).forEach(([action, label]) => {
+      const button = document.createElement('button');
+      button.className = action === 'cancel' ? 'btn btn-danger' : 'btn btn-soft';
+      button.type = 'button';
+      button.dataset.uploadAction = action;
+      button.textContent = label;
+      button.addEventListener('click', () => onUploadAction?.({
+        action: button.dataset.uploadAction,
+        uploadId: button.closest('[data-upload-id]').dataset.uploadId,
+      }));
+      actions.append(button);
+    });
+    element.append(actions);
+    return element;
+  }
+
+  function upsertUpload(snapshot) {
+    if (!snapshot || !snapshot.uploadId) return;
+    const previous = uploads.get(snapshot.uploadId);
+    const upload = { ...previous, ...snapshot };
+    uploads.set(upload.uploadId, upload);
+    if (!container) return;
+    const existing = container.querySelector(`[data-upload-id="${upload.uploadId}"]`);
+    const element = renderUpload(upload);
+    if (existing) existing.replaceWith(element);
+    else container.append(element);
+  }
+
+  function removeUpload(uploadId) {
+    const upload = uploads.get(uploadId);
+    uploads.delete(uploadId);
+    if (container) container.querySelector(`[data-upload-id="${uploadId}"]`)?.remove();
+    return upload;
+  }
+
+  function getUpload(uploadId) {
+    return uploads.get(uploadId) || null;
+  }
+
+  function findUploadForMessage(message) {
+    if (message.upload_id && uploads.has(message.upload_id)) return uploads.get(message.upload_id);
+    if (!message.client_request_id) return null;
+    return Array.from(uploads.values()).find(
+      upload => upload.clientRequestId === message.client_request_id
+    ) || null;
+  }
+
   function showUndo(message) {
     if (!container) return;
     const existing = container.querySelector(
@@ -267,20 +407,13 @@ export function createTimeline({ container, newMessageButton, api, onRestore }) 
     switch (event.event_type) {
       case 'message.created': {
         const msg = { ...payload, id: event.entity_id };
-        messages.set(event.entity_id, msg);
-        if (container) {
-          const existing = container.querySelector(`[data-message-id="${event.entity_id}"]`);
-          if (!existing) {
-            const el = renderMessage(msg);
-            el.dataset.sequence = String(event.sequence);
-            const dateStr = getLocalDate(msg.created_at || Date.now());
-            insertDateSeparator(dateStr);
-            insertMessageSorted(el);
-            if (!atBottom) {
-              newCount++;
-              updateNewButton();
-            }
-          }
+        const existed = messages.has(event.entity_id);
+        upsertMessage(msg);
+        const existing = container?.querySelector(`[data-message-id="${event.entity_id}"]`);
+        if (existing) existing.dataset.sequence = String(event.sequence);
+        if (!existed && !atBottom) {
+          newCount++;
+          updateNewButton();
         }
         break;
       }
@@ -531,6 +664,16 @@ export function createTimeline({ container, newMessageButton, api, onRestore }) 
       return;
     }
 
+    const matchingUpload = findUploadForMessage(merged);
+    if (matchingUpload) {
+      const uploadElement = container.querySelector(`[data-upload-id="${matchingUpload.uploadId}"]`);
+      uploads.delete(matchingUpload.uploadId);
+      if (uploadElement) {
+        uploadElement.replaceWith(element);
+        return;
+      }
+    }
+
     insertDateSeparator(getLocalDate(merged.created_at || Date.now()));
     insertMessageSorted(element);
   }
@@ -545,5 +688,8 @@ export function createTimeline({ container, newMessageButton, api, onRestore }) 
     getLastSequence,
     setLastSequence,
     upsert: upsertMessage,
+    upsertUpload,
+    removeUpload,
+    getUpload,
   };
 }
