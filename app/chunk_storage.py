@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import stat
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
@@ -79,9 +80,9 @@ class ChunkStorage:
         _validate_key(upload_id, part_index)
         return self._session_dir(upload_id) / f"part-{part_index:06d}"
 
-    def incoming_path(self, upload_id: str, part_index: int) -> Path:
+    def _new_incoming_path(self, upload_id: str, part_index: int) -> Path:
         _validate_key(upload_id, part_index)
-        return self._session_dir(upload_id) / f"incoming-{part_index:06d}"
+        return self._session_dir(upload_id) / f"incoming-{part_index:06d}-{uuid4().hex}"
 
     async def write_part(
         self,
@@ -94,8 +95,7 @@ class ChunkStorage:
     ) -> StoredPart:
         if expected_size < 0:
             raise ValueError("expected_size must be non-negative")
-        incoming_base = self.incoming_path(upload_id, part_index)
-        incoming = incoming_base.with_name(f"{incoming_base.name}-{uuid4().hex}")
+        incoming = self._new_incoming_path(upload_id, part_index)
         confirmed = self.part_path(upload_id, part_index)
         await asyncio.to_thread(incoming.parent.mkdir, parents=True, exist_ok=True)
         if incoming.parent.is_symlink():
@@ -249,7 +249,26 @@ class ChunkStorage:
         )
 
     def discard_incoming(self, upload_id: str, part_index: int) -> None:
-        self.incoming_path(upload_id, part_index).unlink(missing_ok=True)
+        """Remove stale writers while holding the upload lock.
+
+        This batch cleanup is only safe for cancellation, recovery, or maintenance
+        paths that hold the upload lock and have established that no writer is active.
+        Active writers clean only their own UUID-derived incoming path.
+        """
+        _validate_key(upload_id, part_index)
+        session_dir = self._session_dir(upload_id)
+        if not session_dir.exists():
+            return
+        prefix = f"incoming-{part_index:06d}-"
+        for candidate in session_dir.iterdir():
+            if not candidate.name.startswith(prefix) or candidate.name == prefix:
+                continue
+            try:
+                mode = candidate.stat(follow_symlinks=False).st_mode
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(mode):
+                candidate.unlink(missing_ok=True)
 
     def discard_part(self, upload_id: str, part_index: int) -> None:
         self.part_path(upload_id, part_index).unlink(missing_ok=True)

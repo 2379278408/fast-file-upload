@@ -34,7 +34,7 @@ def test_write_part_streams_and_atomically_confirms(tmp_path: Path) -> None:
     assert stored.sha256 == sha256(b"abcd").hexdigest()
     assert stored.path.read_bytes() == b"abcd"
     assert observed == [2, 2]
-    assert not storage.incoming_path("a" * 32, 0).exists()
+    assert not list(stored.path.parent.glob("incoming-*"))
 
 
 @pytest.mark.parametrize(
@@ -64,7 +64,7 @@ def test_write_failure_removes_incoming_and_preserves_confirmed_parts(
         )
 
     assert confirmed.read_bytes() == b"kept"
-    assert not storage.incoming_path("b" * 32, 1).exists()
+    assert not list(confirmed.parent.glob("incoming-000001-*"))
 
 
 @pytest.mark.parametrize(
@@ -166,7 +166,7 @@ def test_reconcile_discards_incoming_and_preserves_confirmed_parts(tmp_path: Pat
     confirmed = storage.part_path(upload_id, 0)
     confirmed.parent.mkdir(parents=True)
     confirmed.write_bytes(b"kept")
-    incoming = storage.incoming_path(upload_id, 1)
+    incoming = confirmed.parent / "incoming-000001-stale"
     incoming.write_bytes(b"partial")
     missing_upload = "f" * 32
     orphan_upload = "1" * 32
@@ -180,6 +180,55 @@ def test_reconcile_discards_incoming_and_preserves_confirmed_parts(tmp_path: Pat
     assert not incoming.exists()
     assert result.missing_confirmed == {(missing_upload, 2)}
     assert result.orphan_sessions == {orphan_upload}
+
+
+def test_discard_incoming_removes_only_matching_regular_stale_writers(
+    tmp_path: Path,
+) -> None:
+    storage = ChunkStorage(tmp_path)
+    upload_id = "7" * 32
+    session_dir = storage.part_path(upload_id, 0).parent
+    session_dir.mkdir(parents=True)
+    stale = [
+        session_dir / "incoming-000003-first",
+        session_dir / "incoming-000003-second",
+    ]
+    for path in stale:
+        path.write_bytes(b"partial")
+    other_part = session_dir / "incoming-000004-other"
+    other_part.write_bytes(b"other")
+    confirmed = storage.part_path(upload_id, 3)
+    confirmed.write_bytes(b"confirmed")
+    assembled = session_dir / "final.uploading"
+    assembled.write_bytes(b"assembled")
+    child_dir = session_dir / "incoming-000003-directory"
+    child_dir.mkdir()
+    child_file = child_dir / "kept"
+    child_file.write_bytes(b"kept")
+
+    storage.discard_incoming(upload_id, 3)
+
+    assert all(not path.exists() for path in stale)
+    assert other_part.read_bytes() == b"other"
+    assert confirmed.read_bytes() == b"confirmed"
+    assert assembled.read_bytes() == b"assembled"
+    assert child_file.read_bytes() == b"kept"
+
+
+def test_discard_incoming_skips_symlink_and_preserves_target(tmp_path: Path) -> None:
+    storage = ChunkStorage(tmp_path)
+    upload_id = "8" * 32
+    session_dir = storage.part_path(upload_id, 0).parent
+    session_dir.mkdir(parents=True)
+    target = tmp_path / "outside"
+    target.write_bytes(b"kept")
+    symlink = session_dir / "incoming-000002-linked"
+    symlink.symlink_to(target)
+
+    storage.discard_incoming(upload_id, 2)
+
+    assert symlink.is_symlink()
+    assert target.read_bytes() == b"kept"
 
 
 def test_concurrent_different_part_cannot_overwrite_confirmed(tmp_path: Path) -> None:
