@@ -1,4 +1,5 @@
 import asyncio
+import re
 from hashlib import sha256
 from pathlib import Path
 
@@ -84,6 +85,19 @@ def test_storage_paths_require_strict_keys(
 
     with pytest.raises(ValueError, match="Invalid upload storage key"):
         storage.part_path(upload_id, part_index)
+
+
+def test_incoming_path_is_safe_unique_and_matches_writer_format(tmp_path: Path) -> None:
+    storage = ChunkStorage(tmp_path)
+    upload_id = "9" * 32
+
+    first = storage.incoming_path(upload_id, 12)
+    second = storage.incoming_path(upload_id, 12)
+
+    assert first != second
+    assert first.parent == storage.part_path(upload_id, 12).parent
+    assert re.fullmatch(r"incoming-000012-[0-9a-f]{32}", first.name)
+    assert re.fullmatch(r"incoming-000012-[0-9a-f]{32}", second.name)
 
 
 def test_assemble_streams_ordered_parts_and_computes_server_sha256(
@@ -190,8 +204,8 @@ def test_discard_incoming_removes_only_matching_regular_stale_writers(
     session_dir = storage.part_path(upload_id, 0).parent
     session_dir.mkdir(parents=True)
     stale = [
-        session_dir / "incoming-000003-first",
-        session_dir / "incoming-000003-second",
+        session_dir / f"incoming-000003-{'a' * 32}",
+        session_dir / f"incoming-000003-{'b' * 32}",
     ]
     for path in stale:
         path.write_bytes(b"partial")
@@ -205,6 +219,14 @@ def test_discard_incoming_removes_only_matching_regular_stale_writers(
     child_dir.mkdir()
     child_file = child_dir / "kept"
     child_file.write_bytes(b"kept")
+    pseudo_matches = [
+        session_dir / f"incoming-000003-{'c' * 32}.backup",
+        session_dir / "incoming-000003-deadbeef",
+        session_dir / f"incoming-000003-{'D' * 32}",
+        session_dir / f"incoming-000003-{'g' * 32}",
+    ]
+    for path in pseudo_matches:
+        path.write_bytes(b"preserved")
 
     storage.discard_incoming(upload_id, 3)
 
@@ -213,6 +235,7 @@ def test_discard_incoming_removes_only_matching_regular_stale_writers(
     assert confirmed.read_bytes() == b"confirmed"
     assert assembled.read_bytes() == b"assembled"
     assert child_file.read_bytes() == b"kept"
+    assert all(path.read_bytes() == b"preserved" for path in pseudo_matches)
 
 
 def test_discard_incoming_skips_symlink_and_preserves_target(tmp_path: Path) -> None:

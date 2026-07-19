@@ -80,7 +80,8 @@ class ChunkStorage:
         _validate_key(upload_id, part_index)
         return self._session_dir(upload_id) / f"part-{part_index:06d}"
 
-    def _new_incoming_path(self, upload_id: str, part_index: int) -> Path:
+    def incoming_path(self, upload_id: str, part_index: int) -> Path:
+        """Return a new validated UUID-scoped incoming path for one writer."""
         _validate_key(upload_id, part_index)
         return self._session_dir(upload_id) / f"incoming-{part_index:06d}-{uuid4().hex}"
 
@@ -95,7 +96,7 @@ class ChunkStorage:
     ) -> StoredPart:
         if expected_size < 0:
             raise ValueError("expected_size must be non-negative")
-        incoming = self._new_incoming_path(upload_id, part_index)
+        incoming = self.incoming_path(upload_id, part_index)
         confirmed = self.part_path(upload_id, part_index)
         await asyncio.to_thread(incoming.parent.mkdir, parents=True, exist_ok=True)
         if incoming.parent.is_symlink():
@@ -259,9 +260,11 @@ class ChunkStorage:
         session_dir = self._session_dir(upload_id)
         if not session_dir.exists():
             return
-        prefix = f"incoming-{part_index:06d}-"
+        incoming_pattern = re.compile(
+            rf"^incoming-{part_index:06d}-[0-9a-f]{{32}}$"
+        )
         for candidate in session_dir.iterdir():
-            if not candidate.name.startswith(prefix) or candidate.name == prefix:
+            if incoming_pattern.fullmatch(candidate.name) is None:
                 continue
             try:
                 mode = candidate.stat(follow_symlinks=False).st_mode
