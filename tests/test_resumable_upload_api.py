@@ -130,6 +130,71 @@ def test_progress_event_does_not_extend_upload_expiry(settings: Settings) -> Non
     assert after["expires_at"] == before["expires_at"]
 
 
+def test_part_completion_uses_only_coalesced_progress(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_app(settings)
+    client = authenticated_client(settings, app=app)
+    upload = create_upload(client)
+    forced: list[bool] = []
+    original_publish = app.state.progress_publisher.publish
+
+    async def capture_publish(upload_id, payload, force=False):
+        forced.append(force)
+        await original_publish(upload_id, payload, force)
+
+    monkeypatch.setattr(app.state.progress_publisher, "publish", capture_publish)
+    put_single_part(client, upload, b"data")
+
+    assert forced
+    assert not any(forced)
+
+
+def test_cancel_discards_pending_and_rejects_late_progress(settings: Settings) -> None:
+    app = create_app(settings)
+    client = authenticated_client(settings, app=app)
+    upload = create_upload(client)
+    upload_id = str(upload["upload_id"])
+
+    with client:
+        session = app.state.upload_repository.get(upload_id)
+
+        def payload(value: int) -> dict[str, object]:
+            return {
+                "upload_id": upload_id,
+                "status": session["status"],
+                "confirmed_bytes": session["confirmed_bytes"],
+                "in_flight_bytes": value,
+                "total_bytes": session["size_bytes"],
+                "source_device_id": session["source_device_id"],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
+        client.portal.call(app.state.progress_publisher.publish, upload_id, payload(1))
+        client.portal.call(app.state.progress_publisher.publish, upload_id, payload(2))
+        response = client.delete(f"/api/uploads/{upload_id}")
+        assert response.status_code == 200
+        client.portal.call(asyncio.sleep, 0.3)
+        client.portal.call(app.state.progress_publisher.publish, upload_id, payload(3))
+
+        events = MessageRepository(Database(settings.database_path)).events_after(0)
+        cancelled_sequence = next(
+            int(event["sequence"])
+            for event in events
+            if event["event_type"] == "upload.cancelled"
+        )
+        assert not any(
+            event["event_type"] == "upload.progress"
+            and int(event["sequence"]) > cancelled_sequence
+            for event in events
+        )
+        assert [
+            event["payload"]["in_flight_bytes"]
+            for event in events
+            if event["event_type"] == "upload.progress"
+        ] == [1]
+
+
 def test_complete_computes_server_hash_and_returns_one_permanent_message(
     settings: Settings,
 ) -> None:

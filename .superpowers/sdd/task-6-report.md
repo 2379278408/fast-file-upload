@@ -31,3 +31,13 @@ Completed.
 ## Considerations
 
 - The remaining warning originates from `fastapi.testclient` compatibility code and is unrelated to Task 6.
+
+## Important Follow-up
+
+- Removed forced progress publication when a part completes; in-flight and confirmed progress now share the per-upload cadence.
+- Added atomic `discard`, `mark_terminal`, and `reset` lifecycle APIs with generation invalidation and bounded terminal state.
+- Added session-status validation before delayed persistence so stale and terminal progress is dropped.
+- Serialized progress persistence and broadcast under one send lock; boundary discard waits the send barrier before state mutation proceeds.
+- Tracked timer and flush tasks, contained broadcast failures, preserved direct cancellation propagation, and made close await all active work.
+- Added real-timer cadence, rolling-window, discard race, terminal lateness, concurrent sequence, broadcast failure, cancellation, part cadence, and cancellation-boundary tests.
+- Follow-up verification: `180 passed` across events, resumable API, upload repository, and files; `git diff --check` clean.

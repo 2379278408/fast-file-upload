@@ -109,6 +109,187 @@ def test_progress_publisher_close_flushes_latest_pending_value() -> None:
     assert [event["payload"]["in_flight_bytes"] for event in sent] == [1, 3]
 
 
+def test_progress_publisher_timer_coalesces_latest_value() -> None:
+    sent: list[int] = []
+
+    def persist(upload_id: str, payload: dict[str, object]) -> dict[str, object]:
+        return {"sequence": len(sent) + 1, "payload": payload}
+
+    async def broadcast(event: dict[str, object]) -> None:
+        sent.append(int(event["payload"]["in_flight_bytes"]))
+
+    async def scenario() -> None:
+        publisher = UploadProgressPublisher(0.02, persist, broadcast)
+        await publisher.publish("a" * 32, {"in_flight_bytes": 1})
+        await publisher.publish("a" * 32, {"in_flight_bytes": 2})
+        await publisher.publish("a" * 32, {"in_flight_bytes": 3})
+        await asyncio.sleep(0.04)
+        await publisher.close()
+
+    asyncio.run(scenario())
+    assert sent == [1, 3]
+
+
+def test_progress_publisher_rolling_window_respects_cadence() -> None:
+    sent: list[tuple[float, int]] = []
+
+    def persist(upload_id: str, payload: dict[str, object]) -> dict[str, object]:
+        return {"sequence": len(sent) + 1, "payload": payload}
+
+    async def broadcast(event: dict[str, object]) -> None:
+        sent.append((asyncio.get_running_loop().time(), int(event["payload"]["value"])))
+
+    async def scenario() -> None:
+        publisher = UploadProgressPublisher(0.05, persist, broadcast)
+        for value in range(18):
+            await publisher.publish("a" * 32, {"value": value})
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.06)
+        await publisher.close()
+
+    asyncio.run(scenario())
+    assert sent[-1][1] == 17
+    assert len(sent) <= 5
+    assert all(
+        later[0] - earlier[0] >= 0.045
+        for earlier, later in zip(sent, sent[1:])
+    )
+
+
+def test_progress_publisher_discard_wins_timer_and_force_race() -> None:
+    sent: list[int] = []
+
+    def persist(upload_id: str, payload: dict[str, object]) -> dict[str, object]:
+        return {"sequence": len(sent) + 1, "payload": payload}
+
+    async def broadcast(event: dict[str, object]) -> None:
+        sent.append(int(event["payload"]["value"]))
+
+    async def scenario() -> None:
+        publisher = UploadProgressPublisher(0.02, persist, broadcast)
+        await publisher.publish("a" * 32, {"value": 1})
+        await publisher.publish("a" * 32, {"value": 2})
+        await asyncio.gather(
+            publisher.discard("a" * 32, terminal=True),
+            publisher.publish("a" * 32, {"value": 3}, force=True),
+        )
+        await asyncio.sleep(0.04)
+        await publisher.close()
+
+    asyncio.run(scenario())
+    assert sent == [1]
+
+
+def test_progress_force_argument_does_not_bypass_cadence() -> None:
+    sent: list[int] = []
+
+    def persist(upload_id: str, payload: dict[str, object]) -> dict[str, object]:
+        return {"sequence": len(sent) + 1, "payload": payload}
+
+    async def broadcast(event: dict[str, object]) -> None:
+        sent.append(int(event["payload"]["value"]))
+
+    async def scenario() -> None:
+        publisher = UploadProgressPublisher(60, persist, broadcast)
+        await publisher.publish("a" * 32, {"value": 1})
+        await publisher.publish("a" * 32, {"value": 2}, force=True)
+        assert sent == [1]
+        await publisher.close()
+
+    asyncio.run(scenario())
+    assert sent == [1, 2]
+
+
+def test_progress_publisher_drops_late_payload_after_terminal_status() -> None:
+    sent: list[int] = []
+    statuses = {"a" * 32: "uploading"}
+
+    def persist(upload_id: str, payload: dict[str, object]) -> dict[str, object]:
+        return {"sequence": len(sent) + 1, "payload": payload}
+
+    async def broadcast(event: dict[str, object]) -> None:
+        sent.append(int(event["payload"]["value"]))
+
+    async def scenario() -> None:
+        publisher = UploadProgressPublisher(
+            0.02,
+            persist,
+            broadcast,
+            status_lookup=statuses.get,
+        )
+        await publisher.publish("a" * 32, {"value": 1})
+        await publisher.publish("a" * 32, {"value": 2})
+        statuses["a" * 32] = "cancelled"
+        await asyncio.sleep(0.04)
+        await publisher.publish("a" * 32, {"value": 3})
+        await publisher.close()
+
+    asyncio.run(scenario())
+    assert sent == [1]
+
+
+def test_progress_publisher_serializes_persist_and_broadcast_sequence() -> None:
+    next_sequence = 0
+    sent: list[int] = []
+
+    def persist(upload_id: str, payload: dict[str, object]) -> dict[str, object]:
+        nonlocal next_sequence
+        next_sequence += 1
+        return {"sequence": next_sequence, "payload": payload}
+
+    async def broadcast(event: dict[str, object]) -> None:
+        await asyncio.sleep(0.003 if int(event["sequence"]) == 1 else 0)
+        sent.append(int(event["sequence"]))
+
+    async def scenario() -> None:
+        publisher = UploadProgressPublisher(0, persist, broadcast)
+        await asyncio.gather(
+            publisher.publish("a" * 32, {"value": 1}),
+            publisher.publish("b" * 32, {"value": 2}),
+        )
+        await publisher.close()
+
+    asyncio.run(scenario())
+    assert sent == [1, 2]
+
+
+def test_progress_publisher_reports_broadcast_failure_and_closes(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def persist(upload_id: str, payload: dict[str, object]) -> dict[str, object]:
+        return {"sequence": 1, "payload": payload}
+
+    async def broadcast(event: dict[str, object]) -> None:
+        raise RuntimeError("broadcast failed")
+
+    async def scenario() -> None:
+        publisher = UploadProgressPublisher(0.01, persist, broadcast)
+        await publisher.publish("a" * 32, {"value": 1})
+        await publisher.publish("a" * 32, {"value": 2})
+        await asyncio.sleep(0.02)
+        await publisher.close()
+
+    with caplog.at_level("ERROR", logger="transfer.events"):
+        asyncio.run(scenario())
+    assert caplog.messages.count("Failed to broadcast upload progress event") == 2
+
+
+def test_progress_publisher_propagates_direct_cancellation() -> None:
+    def persist(upload_id: str, payload: dict[str, object]) -> dict[str, object]:
+        return {"sequence": 1, "payload": payload}
+
+    async def broadcast(event: dict[str, object]) -> None:
+        raise asyncio.CancelledError
+
+    async def scenario() -> None:
+        publisher = UploadProgressPublisher(0, persist, broadcast)
+        with pytest.raises(asyncio.CancelledError):
+            await publisher.publish("a" * 32, {"value": 1})
+        await publisher.close()
+
+    asyncio.run(scenario())
+
+
 def test_unauthenticated_websocket_closed_with_4401(client: TestClient) -> None:
     with pytest.raises(Exception) as exc_info:
         with client.websocket_connect("/api/events") as ws:
