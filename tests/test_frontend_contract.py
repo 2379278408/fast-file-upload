@@ -2122,6 +2122,327 @@ def test_api_module_has_send_text_and_upload_file(client: TestClient) -> None:
     assert "AbortController" not in api_js or "signal" in api_js
 
 
+def test_resumable_api_constants_exports_and_raw_blob_xhr() -> None:
+    config = read_web("js/config.js")
+    for token in (
+        "UPLOAD_CHUNK_SIZE_BYTES = 8 * 1024 * 1024",
+        "MAX_UPLOAD_SIZE_BYTES = 512 * 1024 * 1024",
+        "MAX_ACTIVE_UPLOADS = 9",
+        "UPLOAD_RETRY_DELAYS = [500, 1000, 2000, 4000, 8000]",
+        "UPLOAD_SPEED_WINDOW_MS = 5000",
+        "UPLOAD_ETA_MIN_SAMPLE_MS = 2000",
+    ):
+        assert token in config
+
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.sentBody = null;
+      globalThis.requestHeaders = {};
+      globalThis.events = [];
+      window.dispatchEvent = event => events.push(event);
+      globalThis.XMLHttpRequest = class XMLHttpRequest {
+        constructor() { this.upload = {}; this.status = 200; this.responseText = '{"ok":true}'; }
+        open(method, path) { this.method = method; this.path = path; }
+        setRequestHeader(name, value) { requestHeaders[name] = value; }
+        send(body) { sentBody = body; this.onload(); }
+        abort() { this.onabort(); }
+      };
+      globalThis.rawBlob = { marker: 'raw-blob' };
+    """)
+    load_js_module(context, "./api.js", read_web("js/api.js"))
+    context.eval(r"""
+      globalThis.partResult = null;
+      __modules['./api.js'].uploadPart('upload/a', 2, rawBlob, {
+        start: 8, end: 11, total: 20, sha256: 'digest',
+      }).then(value => { partResult = value; });
+    """)
+    drain_jobs(context)
+    result = json.loads(context.eval(r"""JSON.stringify({
+      sameBody: sentBody === rawBlob,
+      method: XMLHttpRequest.prototype.method,
+      headers: requestHeaders,
+      value: partResult,
+    })"""))
+    assert result["sameBody"] is True
+    assert result["headers"] == {
+        "Content-Type": "application/octet-stream",
+        "Content-Range": "bytes 8-11/20",
+        "X-Chunk-SHA256": "digest",
+    }
+    assert result["value"] == {"ok": True}
+
+    context.eval(r"""
+      XMLHttpRequest = class XMLHttpRequest {
+        constructor() { this.upload = {}; this.status = 401; this.responseText = ''; }
+        open() {}
+        setRequestHeader() {}
+        send() { this.onload(); }
+      };
+      globalThis.rejectedStatus = 0;
+      __modules['./api.js'].uploadPart('expired', 0, rawBlob, {
+        start: 0, end: 0, total: 1, sha256: 'digest',
+      }).catch(error => { rejectedStatus = error.status; });
+    """)
+    drain_jobs(context)
+    assert context.eval("rejectedStatus") == 401
+    assert context.eval("events[0].type") == "session-expired"
+
+
+def test_file_identity_uses_three_versioned_64k_samples_and_metadata() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.digestInputLength = 0;
+      globalThis.cryptoObject = {
+        subtle: {
+          digest(_algorithm, bytes) {
+            digestInputLength = bytes.byteLength;
+            return Promise.resolve(new Uint8Array([0, 15, 16, 255]).buffer);
+          },
+        },
+      };
+      globalThis.file = {
+        name: 'sample.bin', size: 300000, lastModified: 42,
+        slice(start, end) {
+          return { arrayBuffer: () => Promise.resolve(new Uint8Array(end - start).buffer) };
+        },
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.identity = null;
+      globalThis.matches = null;
+      __modules['./upload-coordinator.js'].sampleFileIdentity(file, cryptoObject)
+        .then(value => {
+          identity = value;
+          return __modules['./upload-coordinator.js'].matchesFileIdentity(file, value, cryptoObject);
+        })
+        .then(value => { matches = value; });
+    """)
+    drain_jobs(context)
+    identity = json.loads(context.eval("JSON.stringify(identity)"))
+    assert identity == {
+        "name": "sample.bin",
+        "size": 300000,
+        "lastModified": 42,
+        "sampleSha256": "000f10ff",
+    }
+    assert context.eval("matches") is True
+    assert context.eval("digestInputLength") < 3 * 65536 + 256
+
+
+def test_upload_persistence_only_clones_metadata_and_optional_handle() -> None:
+    source = read_web("js/upload-persistence.js")
+    assert "personal-transfer-timeline" in source
+    assert "upload-tasks" in source
+    assert "file:" not in source
+    assert "blob:" not in source.lower()
+
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.stored = null;
+      globalThis.transaction = {
+        objectStore() {
+          return {
+            put(value) { stored = value; const request = {}; Promise.resolve().then(() => request.onsuccess()); return request; },
+            getAll() { const request = {}; Promise.resolve().then(() => { request.result = stored ? [stored] : []; request.onsuccess(); }); return request; },
+            delete() { const request = {}; Promise.resolve().then(() => request.onsuccess()); return request; },
+          };
+        },
+      };
+      globalThis.database = { transaction: () => transaction, close() {} };
+      globalThis.indexedDB = {
+        open() {
+          const request = {};
+          Promise.resolve().then(() => { request.result = database; request.onsuccess(); });
+          return request;
+        },
+      };
+    """)
+    load_js_module(context, "./upload-persistence.js", read_web("js/upload-persistence.js"))
+    context.eval(r"""
+      globalThis.persistence = __modules['./upload-persistence.js'].createUploadPersistence({ indexedDB });
+      persistence.put({
+        uploadId: 'u1', name: 'a.bin', status: 'paused', confirmedParts: [0],
+        file: { forbidden: true }, fileHandle: { kind: 'file' }, runtimeOnly: 9,
+      }).then(() => persistence.getAll()).then(value => { globalThis.persistedRows = value; });
+    """)
+    drain_jobs(context)
+    row = json.loads(context.eval("JSON.stringify(persistedRows[0])"))
+    assert "file" not in row
+    assert "runtimeOnly" not in row
+    assert row["fileHandle"] == {"kind": "file"}
+
+
+def test_upload_coordinator_limits_active_files_and_one_part_per_file() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.__modules['./api.js'] = {};
+      globalThis.__modules['./upload-persistence.js'] = {};
+      globalThis.activeParts = {};
+      globalThis.peakFiles = 0;
+      globalThis.duplicatePart = false;
+      globalThis.uuidIndex = 0;
+      globalThis.AbortController = class AbortController {
+        constructor() { this.signal = { aborted: false }; }
+        abort() { this.signal.aborted = true; }
+      };
+      globalThis.cryptoObject = {
+        randomUUID: () => `00000000-0000-4000-8000-${String(++uuidIndex).padStart(12, '0')}`,
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.api = {
+        createUploadSession: metadata => Promise.resolve({
+          upload_id: metadata.clientRequestId, status: 'queued', confirmed_parts: [],
+          confirmed_bytes: 0, chunk_size_bytes: 4,
+        }),
+        uploadPart: (id, index) => {
+          activeParts[id] = (activeParts[id] || 0) + 1;
+          duplicatePart = duplicatePart || activeParts[id] > 1;
+          peakFiles = Math.max(peakFiles, Object.keys(activeParts).filter(key => activeParts[key] > 0).length);
+          return Promise.resolve({ status: 'uploading', confirmed_parts: [index], confirmed_bytes: 4 })
+            .finally(() => { activeParts[id] -= 1; });
+        },
+        completeUpload: id => Promise.resolve({ id: `message-${id}`, upload_id: id }),
+        getUploadSession: id => Promise.resolve({ upload_id: id, confirmed_parts: [] }),
+        controlUpload: () => Promise.resolve({}), cancelUpload: () => Promise.resolve({}),
+      };
+      globalThis.persistence = { put: () => Promise.resolve(), getAll: () => Promise.resolve([]), remove: () => Promise.resolve(), close: () => {} };
+      globalThis.files = Array.from({ length: 11 }, (_, index) => ({
+        name: `file-${index}.txt`, size: 4, type: 'text/plain', lastModified: index,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array([1, 2, 3, 4]).buffer) }),
+      }));
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, now: () => Date.now(),
+        delay: () => Promise.resolve(), maxActive: 9, chunkSize: 4,
+      });
+      coordinator.enqueueFiles(files);
+    """)
+    drain_jobs(context)
+    assert context.eval("peakFiles") == 9
+    assert context.eval("duplicatePart") is False
+    assert context.eval("coordinator.getSnapshot().every(Object.isFrozen)") is True
+
+
+def test_upload_coordinator_controls_missing_retry_priority_size_and_eta() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.__modules['./api.js'] = {};
+      globalThis.__modules['./upload-persistence.js'] = {};
+      globalThis.AbortController = class AbortController {
+        constructor() { this.signal = { aborted: false }; }
+        abort() { this.signal.aborted = true; }
+      };
+      globalThis.clock = 0;
+      globalThis.created = [];
+      globalThis.sent = [];
+      globalThis.pending = [];
+      globalThis.delays = [];
+      globalThis.uuidIndex = 0;
+      globalThis.cryptoObject = {
+        randomUUID: () => `id-${++uuidIndex}`,
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.api = {
+        createUploadSession(metadata) {
+          created.push(metadata.name);
+          return Promise.resolve({ upload_id: metadata.clientRequestId, confirmed_parts: metadata.name === 'missing' ? [0] : [] });
+        },
+        uploadPart(id, index, _blob, _metadata, onProgress) {
+          sent.push([id, index]);
+          onProgress(2, 4);
+          if (id === 'id-4') return Promise.reject(new Error('offline'));
+          if (id === 'id-2') return new Promise((resolve, reject) => pending.push({ id, index, resolve, reject }));
+          clock += 2500;
+          return Promise.resolve({ confirmed_parts: id === 'id-3' ? [0, index] : [index], confirmed_bytes: (index + 1) * 4 });
+        },
+        completeUpload: id => Promise.resolve({ upload_id: id }),
+        getUploadSession: id => Promise.resolve({ upload_id: id, confirmed_parts: id === 'id-3' ? [0] : [] }),
+        controlUpload: () => Promise.resolve({}), cancelUpload: () => Promise.resolve({}),
+      };
+      globalThis.persistence = { put: () => Promise.resolve(), getAll: () => Promise.resolve([]), remove: () => Promise.resolve(), close: () => {} };
+      globalThis.makeFile = (name, size) => ({
+        name, size, type: '', lastModified: 1,
+        slice(start, end) { return { size: end - start, arrayBuffer: () => Promise.resolve(new Uint8Array(end - start).buffer) }; },
+      });
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, now: () => clock,
+        delay: ms => { delays.push(ms); return Promise.resolve(); }, maxActive: 1, chunkSize: 4,
+      });
+      coordinator.enqueueFiles([makeFile('oversized', 513 * 1024 * 1024)]);
+      coordinator.enqueueFiles([makeFile('blocked', 8), makeFile('missing', 8), makeFile('offline', 4)]);
+      coordinator.pause('id-2');
+    """)
+    drain_jobs(context)
+    assert "oversized" not in json.loads(context.eval("JSON.stringify(created)"))
+    assert context.eval("coordinator.getSnapshot()[0].errorCode") == "file-too-large"
+    assert context.eval("sent.some(item => item[0] === 'id-3' && item[1] === 0)") is False
+    assert context.eval("sent.some(item => item[0] === 'id-3' && item[1] === 1)") is True
+    assert context.eval("coordinator.getSnapshot().find(task => task.uploadId === 'id-3').etaSeconds !== null") is True
+    assert json.loads(context.eval("JSON.stringify(delays)"))[-5:] == [500, 1000, 2000, 4000, 8000]
+
+    context.eval(r"""
+      coordinator.resume('id-2');
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      coordinator.pause('id-2');
+      const blocked = pending.find(item => item.id === 'id-2');
+      if (blocked) blocked.resolve({ confirmed_parts: [0], confirmed_bytes: 4 });
+    """)
+    drain_jobs(context)
+    assert context.eval("sent.filter(item => item[0] === 'id-2').length") == 1
+    assert context.eval("coordinator.getSnapshot().find(task => task.uploadId === 'id-2').status") == "paused"
+
+
+def test_upload_coordinator_prioritize_reorders_queued_tasks_only() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.AbortController = class AbortController {
+        constructor() { this.signal = { aborted: false }; }
+        abort() { this.signal.aborted = true; }
+      };
+      globalThis.uuidIndex = 0;
+      globalThis.cryptoObject = {
+        randomUUID: () => `priority-${++uuidIndex}`,
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.firstPart = null;
+      globalThis.api = {
+        createUploadSession: metadata => Promise.resolve({ upload_id: metadata.clientRequestId, confirmed_parts: [] }),
+        uploadPart: id => id === 'priority-1'
+          ? new Promise(resolve => { firstPart = resolve; })
+          : Promise.resolve({ confirmed_parts: [0], confirmed_bytes: 4 }),
+        completeUpload: id => Promise.resolve({ upload_id: id }),
+        controlUpload: () => Promise.resolve({}), cancelUpload: () => Promise.resolve({}),
+      };
+      globalThis.persistence = { put: () => Promise.resolve(), getAll: () => Promise.resolve([]), remove: () => Promise.resolve(), close: () => {} };
+      globalThis.files = ['first', 'second', 'third'].map(name => ({
+        name, size: 4, type: '', lastModified: 1,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      }));
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, delay: () => Promise.resolve(), maxActive: 1, chunkSize: 4,
+      });
+      coordinator.enqueueFiles(files);
+    """)
+    drain_jobs(context)
+    context.eval("coordinator.prioritize('priority-3')")
+    order = json.loads(context.eval(
+        "JSON.stringify(coordinator.getSnapshot().filter(task => task.status === 'queued').map(task => task.uploadId))"
+    ))
+    assert order == ["priority-3", "priority-2"]
+    assert context.eval("coordinator.getSnapshot()[0].status") == "uploading"
+
+
 def test_app_imports_composer_module(client: TestClient) -> None:
     app_js = client.get("/js/app.js").text
     assert "createComposer" in app_js

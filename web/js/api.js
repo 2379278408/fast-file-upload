@@ -119,20 +119,17 @@ export async function sendText(body, clientRequestId) {
   });
 }
 
-export function uploadFile(file, clientRequestId, onProgress, signal) {
+function xhrJson({ method, path, body, headers = {}, onProgress, signal }) {
   return new Promise((resolve, reject) => {
     const abortError = () => {
       const error = new Error('Upload aborted');
       error.name = 'AbortError';
       return error;
     };
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('client_request_id', clientRequestId);
-
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/upload');
+    xhr.open(method, path);
     xhr.withCredentials = true;
+    Object.entries(headers).forEach(([name, value]) => xhr.setRequestHeader(name, value));
 
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable) return;
@@ -140,14 +137,14 @@ export function uploadFile(file, clientRequestId, onProgress, signal) {
     };
 
     xhr.onload = () => {
-      if (xhr.status === 200) {
+      if (xhr.status >= 200 && xhr.status < 300) {
         try {
           resolve(JSON.parse(xhr.responseText));
         } catch {
           resolve(null);
         }
       } else if (xhr.status === 401) {
-        window.dispatchEvent(new CustomEvent('session-expired', { detail: { path: '/api/upload' } }));
+        window.dispatchEvent(new CustomEvent('session-expired', { detail: { path } }));
         reject(new ApiError(401, { detail: 'Session expired' }));
       } else {
         let body;
@@ -170,6 +167,73 @@ export function uploadFile(file, clientRequestId, onProgress, signal) {
       }
       signal.addEventListener('abort', () => xhr.abort(), { once: true });
     }
-    xhr.send(formData);
+    xhr.send(body);
+  });
+}
+
+export function uploadFile(file, clientRequestId, onProgress, signal) {
+  const formData = new FormData();
+  formData.append('file', file);
+  formData.append('client_request_id', clientRequestId);
+  return xhrJson({ method: 'POST', path: '/api/upload', body: formData, onProgress, signal });
+}
+
+export function createUploadSession(metadata) {
+  const body = {
+    client_request_id: metadata.clientRequestId ?? metadata.client_request_id,
+    name: metadata.name,
+    size_bytes: metadata.sizeBytes ?? metadata.size_bytes,
+    mime_type: metadata.mimeType ?? metadata.mime_type,
+    last_modified_ms: metadata.lastModified ?? metadata.last_modified_ms,
+    chunk_size_bytes: metadata.chunkSize ?? metadata.chunk_size_bytes,
+    sample_sha256: metadata.sampleSha256 ?? metadata.sample_sha256,
+  };
+  return request('/api/uploads', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export function listActiveUploads() {
+  return request('/api/uploads/active');
+}
+
+export function getUploadSession(uploadId) {
+  return request(`/api/uploads/${encodeURIComponent(uploadId)}`);
+}
+
+export function uploadPart(uploadId, partIndex, blob, metadata, onProgress, signal) {
+  return xhrJson({
+    method: 'PUT',
+    path: `/api/uploads/${encodeURIComponent(uploadId)}/parts/${partIndex}`,
+    body: blob,
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'Content-Range': `bytes ${metadata.start}-${metadata.end}/${metadata.total}`,
+      'X-Chunk-SHA256': metadata.sha256,
+    },
+    onProgress,
+    signal,
+  });
+}
+
+export function controlUpload(uploadId, action) {
+  return request(`/api/uploads/${encodeURIComponent(uploadId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action }),
+  });
+}
+
+export function cancelUpload(uploadId) {
+  return request(`/api/uploads/${encodeURIComponent(uploadId)}`, { method: 'DELETE' });
+}
+
+export function completeUpload(uploadId) {
+  return request(`/api/uploads/${encodeURIComponent(uploadId)}/complete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
   });
 }
