@@ -38,7 +38,7 @@ from .chunk_storage import (
     PartIntegrityError,
 )
 from .database import Database
-from .events import EventHub
+from .events import EventHub, UploadProgressPublisher
 from .repository import (
     BatchDownloadSourceMissing,
     BatchDownloadTooLarge,
@@ -351,6 +351,7 @@ def create_app(settings: Settings) -> FastAPI:
         finally:
             stop_maintenance.set()
             await maintenance_task
+            await progress_publisher.close()
             if zip_cleanup_tasks:
                 await asyncio.gather(*tuple(zip_cleanup_tasks), return_exceptions=True)
 
@@ -382,6 +383,20 @@ def create_app(settings: Settings) -> FastAPI:
         for event in events:
             if isinstance(event, dict):
                 await hub.broadcast(event)
+
+    def upload_progress_payload(
+        session: dict[str, object], in_flight_bytes: int, now: datetime
+    ) -> dict[str, object]:
+        upload_id = str(session["upload_id"])
+        return {
+            "upload_id": upload_id,
+            "status": session["status"],
+            "confirmed_bytes": session["confirmed_bytes"],
+            "in_flight_bytes": in_flight_bytes,
+            "total_bytes": session["size_bytes"],
+            "source_device_id": session["source_device_id"],
+            "updated_at": now.isoformat(),
+        }
 
     def track_zip_cleanup(task: asyncio.Task[None]) -> None:
         zip_cleanup_tasks.add(task)
@@ -464,9 +479,18 @@ def create_app(settings: Settings) -> FastAPI:
     upload_service = UploadService(
         upload_repository, chunk_storage, settings, upload_locks, storage
     )
+    progress_publisher = UploadProgressPublisher(
+        interval_seconds=0.25,
+        persist=upload_repository.persist_progress,
+        broadcast=hub.broadcast,
+        max_pending_uploads=settings.client_request_lock_capacity,
+    )
+    chunk_handler_slots = asyncio.Semaphore(settings.max_concurrent_chunk_handlers)
     app.state.upload_repository = upload_repository
     app.state.chunk_storage = chunk_storage
     app.state.upload_service = upload_service
+    app.state.progress_publisher = progress_publisher
+    app.state.chunk_handler_slots = chunk_handler_slots
 
     def record_audit(action: str, file_id: str, name: str, size_bytes: int, **extra: object) -> None:
         audit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -513,7 +537,9 @@ def create_app(settings: Settings) -> FastAPI:
         now = monotonic()
         window_start = now - settings.rate_limit_window_seconds
         client = request.client.host if request.client else "unknown"
-        bucket_key = (client, request.url.path)
+        route = request.scope.get("route")
+        route_key = getattr(route, "path", request.url.path)
+        bucket_key = (client, route_key)
         bucket = [item for item in rate_buckets.get(bucket_key, []) if item >= window_start]
         if len(bucket) >= settings.rate_limit_count:
             rate_buckets[bucket_key] = bucket
@@ -524,6 +550,9 @@ def create_app(settings: Settings) -> FastAPI:
             stale_keys = [k for k, v in rate_buckets.items() if not v or v[-1] < window_start]
             for k in stale_keys[:len(stale_keys) // 2]:
                 del rate_buckets[k]
+            if len(rate_buckets) > RATE_BUCKETS_MAX:
+                oldest = min(rate_buckets, key=lambda key: rate_buckets[key][-1])
+                del rate_buckets[oldest]
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
@@ -901,13 +930,18 @@ def create_app(settings: Settings) -> FastAPI:
             source_device_name=session.device_name,
         )
         try:
-            return await upload_locks.run(
+            mutation = await upload_locks.run(
                 payload.client_request_id,
                 upload_service.create,
                 command,
                 session,
                 request.app.state.clock(),
             )
+            await broadcast_mutation(mutation)
+            result = mutation.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("Upload creation returned an invalid result")
+            return result
         except _KeyedLockCapacityExceeded as error:
             raise HTTPException(
                 status_code=503, detail="Too many active client requests"
@@ -952,8 +986,27 @@ def create_app(settings: Settings) -> FastAPI:
         session: SessionData = Depends(require_session),
         _: None = Depends(enforce_rate_limit),
     ) -> dict[str, object]:
+        if chunk_handler_slots.locked():
+            raise HTTPException(
+                status_code=503, detail="Too many concurrent chunk uploads"
+            )
+        await chunk_handler_slots.acquire()
+        in_flight_bytes = 0
+
+        async def publish_progress(piece_size: int) -> None:
+            nonlocal in_flight_bytes
+            in_flight_bytes += piece_size
+            current = upload_repository.get(upload_id)
+            if current is not None:
+                await progress_publisher.publish(
+                    upload_id,
+                    upload_progress_payload(
+                        current, in_flight_bytes, request.app.state.clock()
+                    ),
+                )
+
         try:
-            return await upload_service.put_part(
+            result = await upload_service.put_part(
                 upload_id,
                 part_index,
                 request.headers.get("content-range", ""),
@@ -961,7 +1014,14 @@ def create_app(settings: Settings) -> FastAPI:
                 request.stream(),
                 session,
                 request.app.state.clock(),
+                publish_progress,
             )
+            await progress_publisher.publish(
+                upload_id,
+                upload_progress_payload(result, 0, request.app.state.clock()),
+                force=True,
+            )
+            return result
         except UploadNotFound as error:
             raise HTTPException(status_code=404, detail="Upload not found") from error
         except InvalidUploadPart as error:
@@ -985,6 +1045,8 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(
                 status_code=503, detail="Too many active upload operations"
             ) from error
+        finally:
+            chunk_handler_slots.release()
 
     @app.patch("/api/uploads/{upload_id}")
     async def control_resumable_upload(
@@ -995,7 +1057,14 @@ def create_app(settings: Settings) -> FastAPI:
         _: None = Depends(enforce_rate_limit),
     ) -> dict[str, object]:
         try:
-            return await upload_locks.run(
+            current = upload_repository.get(upload_id)
+            if current is not None:
+                await progress_publisher.publish(
+                    upload_id,
+                    upload_progress_payload(current, 0, request.app.state.clock()),
+                    force=True,
+                )
+            mutation = await upload_locks.run(
                 upload_id,
                 upload_service.control,
                 upload_id,
@@ -1003,6 +1072,11 @@ def create_app(settings: Settings) -> FastAPI:
                 session,
                 request.app.state.clock(),
             )
+            await broadcast_mutation(mutation)
+            result = mutation.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("Upload control returned an invalid result")
+            return result
         except UploadNotFound as error:
             raise HTTPException(status_code=404, detail="Upload not found") from error
         except (UploadConflict, UploadStateConflict) as error:
@@ -1020,6 +1094,13 @@ def create_app(settings: Settings) -> FastAPI:
         _: None = Depends(enforce_rate_limit),
     ) -> dict[str, object]:
         try:
+            current = upload_repository.get(upload_id)
+            if current is not None:
+                await progress_publisher.publish(
+                    upload_id,
+                    upload_progress_payload(current, 0, request.app.state.clock()),
+                    force=True,
+                )
             mutation = await upload_service.complete(
                 upload_id, session, request.app.state.clock()
             )
@@ -1047,13 +1128,25 @@ def create_app(settings: Settings) -> FastAPI:
         _: None = Depends(enforce_rate_limit),
     ) -> dict[str, object]:
         try:
-            return await upload_locks.run(
+            current = upload_repository.get(upload_id)
+            if current is not None:
+                await progress_publisher.publish(
+                    upload_id,
+                    upload_progress_payload(current, 0, request.app.state.clock()),
+                    force=True,
+                )
+            mutation = await upload_locks.run(
                 upload_id,
                 upload_service.cancel,
                 upload_id,
                 session,
                 request.app.state.clock(),
             )
+            await broadcast_mutation(mutation)
+            result = mutation.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("Upload cancellation returned an invalid result")
+            return result
         except UploadNotFound as error:
             raise HTTPException(status_code=404, detail="Upload not found") from error
         except UploadStateConflict as error:

@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.config import Settings
 from app.auth import SessionData
-from app.events import EventHub
+from app.events import EventHub, UploadProgressPublisher
 from app.main import create_app
 
 
@@ -54,6 +54,59 @@ def create_text(client: TestClient, body: str, request_id: str) -> dict[str, obj
     )
     assert response.status_code == 200
     return response.json()
+
+
+def test_progress_publisher_emits_at_most_four_per_second() -> None:
+    sent: list[dict[str, object]] = []
+    ticks = iter([0.0, 0.05, 0.10, 0.24, 0.25])
+
+    def persist(upload_id: str, payload: dict[str, object]) -> dict[str, object]:
+        return {
+            "sequence": len(sent) + 1,
+            "event_type": "upload.progress",
+            "entity_id": upload_id,
+            "payload": payload,
+        }
+
+    async def broadcast(event: dict[str, object]) -> None:
+        sent.append(event)
+
+    publisher = UploadProgressPublisher(
+        interval_seconds=0.25,
+        persist=persist,
+        broadcast=broadcast,
+        monotonic_clock=lambda: next(ticks),
+    )
+
+    async def scenario() -> None:
+        for in_flight_bytes in [1, 2, 3, 4, 5]:
+            await publisher.publish(
+                "a" * 32,
+                {"in_flight_bytes": in_flight_bytes},
+            )
+
+    asyncio.run(scenario())
+    assert [event["payload"]["in_flight_bytes"] for event in sent] == [1, 5]
+
+
+def test_progress_publisher_close_flushes_latest_pending_value() -> None:
+    sent: list[dict[str, object]] = []
+
+    def persist(upload_id: str, payload: dict[str, object]) -> dict[str, object]:
+        return {"entity_id": upload_id, "payload": payload}
+
+    async def broadcast(event: dict[str, object]) -> None:
+        sent.append(event)
+
+    async def scenario() -> None:
+        publisher = UploadProgressPublisher(60, persist, broadcast)
+        await publisher.publish("a" * 32, {"in_flight_bytes": 1})
+        await publisher.publish("a" * 32, {"in_flight_bytes": 2})
+        await publisher.publish("a" * 32, {"in_flight_bytes": 3})
+        await publisher.close()
+
+    asyncio.run(scenario())
+    assert [event["payload"]["in_flight_bytes"] for event in sent] == [1, 3]
 
 
 def test_unauthenticated_websocket_closed_with_4401(client: TestClient) -> None:

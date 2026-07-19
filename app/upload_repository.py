@@ -106,8 +106,9 @@ class UploadRepository:
         return self._session(connection, row)
 
     def create_or_get(
-        self, command: UploadCreate, now: datetime, ttl_seconds: int, max_active: int
-    ) -> tuple[dict[str, object], bool]:
+        self, command: UploadCreate, now: datetime, ttl_seconds: int, max_active: int,
+        *, include_event: bool = False,
+    ) -> tuple[dict[str, object], bool] | dict[str, object]:
         with self.db.transaction() as connection:
             existing = connection.execute(
                 "SELECT * FROM upload_sessions WHERE client_request_id = ?",
@@ -116,7 +117,10 @@ class UploadRepository:
             if existing is not None:
                 if any(existing[key] != getattr(command, key) for key in CREATE_METADATA_KEYS):
                     raise UploadConflict(command.client_request_id)
-                return self._session(connection, existing), False
+                session = self._session(connection, existing)
+                if include_event:
+                    return {"result": session, "events": [], "changed": False}
+                return session, False
             if connection.execute(
                 "SELECT 1 FROM messages WHERE client_request_id = ? UNION ALL "
                 "SELECT 1 FROM upload_reservations WHERE client_request_id = ? LIMIT 1",
@@ -143,7 +147,13 @@ class UploadRepository:
                  command.chunk_size_bytes, timestamp, timestamp,
                  self._expiry(now, ttl_seconds)),
             )
-            return self._load(connection, upload_id), True
+            session = self._load(connection, upload_id)
+            event = self._append_event(
+                connection, "upload.created", upload_id, session, timestamp
+            )
+            if include_event:
+                return {"result": session, "events": [event], "changed": True}
+            return session, True
 
     def get_by_client_request(
         self, command: UploadCreate
@@ -273,7 +283,7 @@ class UploadRepository:
 
     def transition(
         self, upload_id: str, action: Literal["pause", "resume"],
-        source_device_id: str, now: datetime, ttl_seconds: int,
+        source_device_id: str, now: datetime, ttl_seconds: int, *, include_event: bool = False,
     ) -> dict[str, object]:
         with self.db.transaction() as connection:
             session = self._load(connection, upload_id)
@@ -286,14 +296,22 @@ class UploadRepository:
                 "UPDATE upload_sessions SET status = ?, error_code = NULL, updated_at = ?, expires_at = ? WHERE id = ?",
                 (target, now.isoformat(), self._expiry(now, ttl_seconds), upload_id),
             )
-            return self._load(connection, upload_id)
+            result = self._load(connection, upload_id)
+            if not include_event:
+                return result
+            event = self._append_event(
+                connection, "upload.state_changed", upload_id, result, now.isoformat()
+            )
+            return {"result": result, "events": [event], "changed": True}
 
     def cancel(
-        self, upload_id: str, now: datetime, ttl_seconds: int
-    ) -> tuple[dict[str, object], bool]:
+        self, upload_id: str, now: datetime, ttl_seconds: int, *, include_event: bool = False
+    ) -> tuple[dict[str, object], bool] | dict[str, object]:
         with self.db.transaction() as connection:
             session = self._load(connection, upload_id)
             if session["status"] == "cancelled":
+                if include_event:
+                    return {"result": session, "events": [], "changed": False}
                 return session, False
             if session["status"] in {"complete", "expired"}:
                 raise UploadStateConflict(f"{session['status']} uploads cannot be cancelled")
@@ -301,9 +319,17 @@ class UploadRepository:
                 "UPDATE upload_sessions SET status = 'cancelled', updated_at = ?, expires_at = ? WHERE id = ?",
                 (now.isoformat(), self._expiry(now, ttl_seconds), upload_id),
             )
-            return self._load(connection, upload_id), True
+            result = self._load(connection, upload_id)
+            event = self._append_event(
+                connection, "upload.cancelled", upload_id, result, now.isoformat()
+            )
+            if include_event:
+                return {"result": result, "events": [event], "changed": True}
+            return result, True
 
-    def begin_completion(self, upload_id: str, now: datetime, ttl_seconds: int) -> dict[str, object]:
+    def begin_completion(
+        self, upload_id: str, now: datetime, ttl_seconds: int, *, include_event: bool = False
+    ) -> dict[str, object]:
         with self.db.transaction() as connection:
             session = self._load(connection, upload_id)
             if session["status"] != "uploading":
@@ -323,7 +349,13 @@ class UploadRepository:
                 "UPDATE upload_sessions SET status = 'verifying', publication_state = 'assembling', updated_at = ?, expires_at = ? WHERE id = ?",
                 (now.isoformat(), self._expiry(now, ttl_seconds), upload_id),
             )
-            return self._load(connection, upload_id)
+            result = self._load(connection, upload_id)
+            if not include_event:
+                return result
+            event = self._append_event(
+                connection, "upload.state_changed", upload_id, result, now.isoformat()
+            )
+            return {"result": result, "events": [event], "changed": True}
 
     def set_publication_state(
         self, upload_id: str, state: Literal["assembling", "assembled", "file_published"],
@@ -356,6 +388,16 @@ class UploadRepository:
         )
         return {"sequence": int(insertion.lastrowid), "event_type": event_type,
                 "entity_id": entity_id, "payload": payload, "created_at": created_at}
+
+    def persist_progress(
+        self, upload_id: str, payload: dict[str, object]
+    ) -> dict[str, object]:
+        created_at = str(payload["updated_at"])
+        with self.db.transaction() as connection:
+            self._load(connection, upload_id)
+            return self._append_event(
+                connection, "upload.progress", upload_id, payload, created_at
+            )
 
     def finalize_publication(
         self, upload_id: str, pending: PendingFile, now: datetime

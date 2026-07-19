@@ -47,6 +47,13 @@ class UploadStorageExceeded(RuntimeError):
     pass
 
 
+class UploadStorageCapacityExceeded(UploadStorageExceeded):
+    def __init__(self, required_bytes: int, free_bytes: int) -> None:
+        super().__init__("Insufficient storage capacity")
+        self.required_bytes = required_bytes
+        self.free_bytes = free_bytes
+
+
 def parse_content_range(
     value: str, expected_total: int, part_index: int, chunk_size: int
 ) -> tuple[int, int, int]:
@@ -151,26 +158,30 @@ class UploadService:
         )
         replay = self.repository.get_by_client_request(effective)
         if replay is not None:
-            return self._result(replay)
+            return {"result": self._result(replay), "events": [], "changed": False}
         if command.size_bytes > self.settings.max_upload_size:
             raise UploadTooLarge("Upload exceeds the configured size limit")
         try:
             free_bytes = shutil.disk_usage(Path(self.settings.upload_dir)).free
         except OSError as error:
             raise UploadStorageExceeded("Storage capacity check failed") from error
-        if free_bytes - self.settings.upload_storage_reserve_bytes < command.size_bytes:
-            raise UploadStorageExceeded("Insufficient storage capacity")
+        required_bytes = command.size_bytes + self.settings.upload_storage_reserve_bytes
+        if free_bytes < required_bytes:
+            raise UploadStorageCapacityExceeded(required_bytes, free_bytes)
         extension = Path(sanitized_name).suffix.lower()
         if self.settings.allowed_extensions and extension not in self.settings.allowed_extensions:
             allowed = ", ".join(sorted(self.settings.allowed_extensions))
             raise ValueError(f"File type not allowed. Allowed types: {allowed}")
-        session, _ = self.repository.create_or_get(
+        mutation = self.repository.create_or_get(
             effective,
             now,
             self.settings.upload_session_ttl_seconds,
             self.settings.max_active_upload_sessions,
+            include_event=True,
         )
-        return self._result(session)
+        result = mutation["result"]
+        mutation["result"] = self._result(result)
+        return mutation
 
     async def put_part(
         self,
@@ -265,23 +276,28 @@ class UploadService:
         now: datetime,
     ) -> dict[str, object]:
         self._authorized(upload_id, device)
-        return self._result(
-            self.repository.transition(
-                upload_id,
-                action,
-                device.device_id,
-                now,
-                self.settings.upload_session_ttl_seconds,
-            )
+        mutation = self.repository.transition(
+            upload_id,
+            action,
+            device.device_id,
+            now,
+            self.settings.upload_session_ttl_seconds,
+            include_event=True,
         )
+        mutation["result"] = self._result(mutation["result"])
+        return mutation
 
     def cancel(
         self, upload_id: str, device: SessionData, now: datetime
     ) -> dict[str, object]:
         self._authorized(upload_id, device)
-        session, _ = self.repository.cancel(
-            upload_id, now, self.settings.upload_session_ttl_seconds
+        mutation = self.repository.cancel(
+            upload_id,
+            now,
+            self.settings.upload_session_ttl_seconds,
+            include_event=True,
         )
+        session = mutation["result"]
         try:
             self._discard_unpublished_final(session)
         except OSError as error:
@@ -291,7 +307,8 @@ class UploadService:
                 self.chunks.cleanup_session(upload_id)
             except OSError as error:
                 raise UploadStorageExceeded("Upload cleanup failed") from error
-        return self._result(session)
+        mutation["result"] = self._result(session)
+        return mutation
 
     def get(self, upload_id: str, device: SessionData) -> dict[str, object]:
         return self._result(self._authorized(upload_id, device))
@@ -314,9 +331,20 @@ class UploadService:
                         "events": [],
                         "changed": False,
                     }
-                session = self.repository.begin_completion(
-                    upload_id, now, self.settings.upload_session_ttl_seconds
+                try:
+                    free_bytes = shutil.disk_usage(Path(self.settings.upload_dir)).free
+                except OSError as error:
+                    raise UploadStorageExceeded("Storage capacity check failed") from error
+                required_bytes = int(session["size_bytes"]) + self.settings.upload_storage_reserve_bytes
+                if free_bytes < required_bytes:
+                    raise UploadStorageCapacityExceeded(required_bytes, free_bytes)
+                state_mutation = self.repository.begin_completion(
+                    upload_id,
+                    now,
+                    self.settings.upload_session_ttl_seconds,
+                    include_event=True,
                 )
+                session = state_mutation["result"]
                 parts = self.repository.list_parts(upload_id)
                 try:
                     pending = await self._assemble(session, parts)
@@ -346,6 +374,10 @@ class UploadService:
                 mutation = self.repository.finalize_publication(
                     upload_id, pending, now
                 )
+                mutation["events"] = [
+                    *state_mutation["events"],
+                    *mutation["events"],
+                ]
                 try:
                     await asyncio.to_thread(self.chunks.cleanup_session, upload_id)
                 except OSError:

@@ -17,6 +17,7 @@ from app.auth import SessionData
 from app.config import Settings
 from app.database import Database
 from app.main import create_app
+from app.repository import MessageRepository
 
 
 def authenticated_client(
@@ -87,6 +88,46 @@ def put_single_part(
     client: TestClient, upload: dict[str, object], content: bytes
 ) -> dict[str, object]:
     return put_part(client, upload, 0, content)
+
+
+def test_upload_events_share_strict_sequence_with_messages(settings: Settings) -> None:
+    client = authenticated_client(settings, device_id="source")
+    upload = create_upload(client)
+    put_single_part(client, upload, b"data")
+    response = client.post(f"/api/uploads/{upload['upload_id']}/complete", json={})
+    assert response.status_code == 200
+
+    events = MessageRepository(Database(settings.database_path)).events_after(0)
+    sequences = [int(event["sequence"]) for event in events]
+    event_types = {str(event["event_type"]) for event in events}
+    assert sequences == sorted(sequences)
+    assert len(sequences) == len(set(sequences))
+    assert {"upload.created", "upload.state_changed", "upload.completed"} <= event_types
+
+
+def test_progress_event_does_not_extend_upload_expiry(settings: Settings) -> None:
+    app = create_app(settings)
+    client = authenticated_client(settings, app=app)
+    upload = create_upload(client)
+    upload_id = str(upload["upload_id"])
+    before = app.state.upload_repository.get(upload_id)
+
+    app.state.upload_repository.persist_progress(
+        upload_id,
+        {
+            "upload_id": upload_id,
+            "status": before["status"],
+            "confirmed_bytes": before["confirmed_bytes"],
+            "in_flight_bytes": 1,
+            "total_bytes": before["size_bytes"],
+            "source_device_id": before["source_device_id"],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+    after = app.state.upload_repository.get(upload_id)
+    assert after["updated_at"] == before["updated_at"]
+    assert after["expires_at"] == before["expires_at"]
 
 
 def test_complete_computes_server_hash_and_returns_one_permanent_message(
@@ -944,6 +985,78 @@ def test_create_upload_maps_active_and_storage_capacity(
         },
     )
     assert storage.status_code == 507
+    assert not (settings.upload_dir / ".resumable").exists()
+
+
+def test_chunk_capacity_returns_503_before_creating_temporary_file(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings.max_concurrent_chunk_handlers = 1
+    app = create_app(settings)
+    client = authenticated_client(settings, app=app)
+    first = create_upload(client, request_id="chunk-capacity-1")
+    second = create_upload(client, request_id="chunk-capacity-2")
+    started = threading.Event()
+    release = threading.Event()
+    original_write = app.state.chunk_storage.write_part
+
+    async def blocked_write(*args, **kwargs):
+        started.set()
+        await asyncio.to_thread(release.wait)
+        return await original_write(*args, **kwargs)
+
+    monkeypatch.setattr(app.state.chunk_storage, "write_part", blocked_write)
+    responses: dict[str, object] = {}
+
+    def upload_first() -> None:
+        responses["first"] = client.put(
+            f"/api/uploads/{first['upload_id']}/parts/0",
+            content=b"data",
+            headers={
+                "Content-Range": "bytes 0-3/4",
+                "X-Chunk-SHA256": sha256(b"data").hexdigest(),
+            },
+        )
+
+    thread = threading.Thread(target=upload_first)
+    thread.start()
+    assert started.wait(timeout=2)
+    excess = client.put(
+        f"/api/uploads/{second['upload_id']}/parts/0",
+        content=b"data",
+        headers={
+            "Content-Range": "bytes 0-3/4",
+            "X-Chunk-SHA256": sha256(b"data").hexdigest(),
+        },
+    )
+    release.set()
+    thread.join(timeout=2)
+
+    assert excess.status_code == 503
+    assert excess.json()["detail"] == "Too many concurrent chunk uploads"
+    assert responses["first"].status_code == 200
+    assert not (settings.upload_dir / ".resumable" / str(second["upload_id"])).exists()
+
+
+def test_chunk_rate_limit_uses_normalized_route_key(settings: Settings) -> None:
+    app = create_app(settings)
+    client = authenticated_client(settings, app=app)
+    upload = create_upload(
+        client, request_id="normalized-rate", content=b"abcdefgh", chunk_size=4
+    )
+    settings.rate_limit_count = 1
+
+    put_part(client, upload, 0, b"abcd")
+    response = client.put(
+        f"/api/uploads/{upload['upload_id']}/parts/1",
+        content=b"efgh",
+        headers={
+            "Content-Range": "bytes 4-7/8",
+            "X-Chunk-SHA256": sha256(b"efgh").hexdigest(),
+        },
+    )
+
+    assert response.status_code == 429
 
 
 def test_create_upload_storage_check_error_returns_507(
