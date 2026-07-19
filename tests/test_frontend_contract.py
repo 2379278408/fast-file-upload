@@ -2636,6 +2636,39 @@ def test_upload_persistence_close_is_permanent_during_open_and_transaction() -> 
     assert context.eval("value === null") is True
 
 
+def test_upload_persistence_close_rejects_permanently_blocked_open() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.openCount = 0;
+      globalThis.openRequest = null;
+      globalThis.indexedDB = {
+        open() {
+          openCount += 1;
+          openRequest = {};
+          Promise.resolve().then(() => openRequest.onblocked && openRequest.onblocked());
+          return openRequest;
+        },
+      };
+    """)
+    load_js_module(context, "./upload-persistence.js", read_web("js/upload-persistence.js"))
+    context.eval(r"""
+      globalThis.failure = null;
+      globalThis.secondFailure = null;
+      globalThis.persistence = __modules['./upload-persistence.js'].createUploadPersistence({ indexedDB });
+      persistence.getAll().catch(error => { failure = [error.name, error.message]; });
+    """)
+    drain_jobs(context)
+    assert context.eval("failure === null") is True
+    context.eval(r"""
+      persistence.close();
+      persistence.getAll().catch(error => { secondFailure = [error.name, error.message]; });
+    """)
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(failure)"))[0] == "ClosedError"
+    assert json.loads(context.eval("JSON.stringify(secondFailure)"))[0] == "ClosedError"
+    assert context.eval("openCount") == 1
+
+
 def test_resumable_api_xhr_settles_once_and_removes_abort_listener() -> None:
     context = create_js_context()
     context.eval(r"""
@@ -2727,8 +2760,10 @@ def test_upload_coordinator_snapshot_hides_runtime_references_and_is_deep_frozen
     """)
     drain_jobs(context)
     context.eval("globalThis.snapshot = coordinator.getSnapshot()[0]")
-    assert context.eval("Object.prototype.hasOwnProperty.call(snapshot, 'file')") is False
-    assert context.eval("Object.prototype.hasOwnProperty.call(snapshot, 'fileHandle')") is False
+    assert context.eval("Object.prototype.hasOwnProperty.call(snapshot, 'file')") is True
+    assert context.eval("Object.prototype.hasOwnProperty.call(snapshot, 'fileHandle')") is True
+    assert context.eval("snapshot.file === null") is True
+    assert context.eval("snapshot.fileHandle === null") is True
     assert context.eval("Object.prototype.hasOwnProperty.call(snapshot, 'controller')") is False
     assert context.eval("Object.isFrozen(snapshot)") is True
     assert context.eval("Object.isFrozen(snapshot.confirmedParts)") is True
@@ -2799,6 +2834,83 @@ def test_upload_coordinator_unsubscribe_and_destroy_cleanup_listeners() -> None:
     """)
     assert context.eval("firstCalls") == 1
     assert context.eval("secondCalls") == 2
+
+
+@pytest.mark.parametrize("method", ["start", "reconcile"])
+def test_upload_coordinator_destroy_rejects_pending_public_operations(method: str) -> None:
+    context = create_js_context()
+    context.set("method", method)
+    context.eval(r"""
+      globalThis.closeCalls = 0;
+      globalThis.deferred = {};
+      globalThis.makePending = name => new Promise((resolve, reject) => { deferred[name] = { resolve, reject }; });
+      globalThis.api = {
+        listActiveUploads: () => makePending('reconcile'),
+      };
+      globalThis.persistence = {
+        getAll: () => makePending('start'), put: () => Promise.resolve(), remove: () => Promise.resolve(),
+        close: () => { closeCalls += 1; },
+      };
+      globalThis.cryptoObject = { randomUUID: () => 'race-id', subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) } };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.failure = null;
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({ api, persistence, cryptoObject });
+      coordinator[method]().catch(error => { failure = [error.name, error.message]; });
+      coordinator.destroy();
+    """)
+    drain_jobs(context)
+    failure = json.loads(context.eval("JSON.stringify(failure)"))
+    assert failure[0] == "CoordinatorDestroyedError"
+    assert context.eval("closeCalls") == 1
+
+    context.eval(r"""
+      globalThis.lateHandled = true;
+      deferred[method].reject(new Error('late external rejection'));
+    """)
+    drain_jobs(context)
+    assert context.eval("lateHandled") is True
+
+
+def test_upload_coordinator_destroy_rejects_pending_retry_and_releases_task_payload() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.AbortController = class AbortController { constructor() { this.signal = {}; } abort() {} };
+      globalThis.getReject = null;
+      globalThis.cryptoObject = {
+        randomUUID: () => 'retry-race',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'retry-race.bin', size: 4, type: '', lastModified: 1,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      };
+      globalThis.api = {
+        createUploadSession: () => Promise.resolve({ upload_id: 'retry-race', confirmed_parts: [] }),
+        uploadPart: () => Promise.reject(new Error('offline')),
+        getUploadSession: () => new Promise((_resolve, reject) => { getReject = reject; }),
+        controlUpload: () => Promise.resolve({}), cancelUpload: () => Promise.resolve({}),
+      };
+      globalThis.persistence = { put: () => Promise.resolve(), getAll: () => Promise.resolve([]), remove: () => Promise.resolve(), close: () => {} };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.failure = null;
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, delay: () => Promise.resolve(), maxActive: 1, chunkSize: 4,
+      });
+      coordinator.enqueueFiles([file]);
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      coordinator.retry('retry-race').catch(error => { failure = error.name; });
+      coordinator.destroy();
+    """)
+    drain_jobs(context)
+    assert context.eval("failure") == "CoordinatorDestroyedError"
+    context.eval("getReject(new Error('late retry rejection'))")
+    drain_jobs(context)
 
 
 @pytest.mark.parametrize("stage", ["identity", "create", "part", "complete", "reconcile"])

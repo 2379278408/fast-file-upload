@@ -24,7 +24,18 @@ export function createUploadPersistence({ indexedDB }) {
     if (closed) return Promise.reject(closedError());
     if (databasePromise) return databasePromise;
     databasePromise = new Promise((resolve, reject) => {
+      let settled = false;
       const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
+      const finish = callback => value => {
+        if (settled) return;
+        settled = true;
+        pendingRejects.delete(rejectClosed);
+        callback(value);
+      };
+      const resolveOnce = finish(resolve);
+      const rejectOnce = finish(reject);
+      const rejectClosed = () => rejectOnce(closedError());
+      pendingRejects.add(rejectClosed);
       request.onupgradeneeded = () => {
         const database = request.result;
         if (!database.objectStoreNames.contains(STORE_NAME)) {
@@ -34,13 +45,13 @@ export function createUploadPersistence({ indexedDB }) {
       request.onsuccess = () => {
         if (closed) {
           request.result.close();
-          reject(closedError());
+          rejectClosed();
           return;
         }
         database = request.result;
-        resolve(database);
+        resolveOnce(database);
       };
-      request.onerror = () => reject(request.error || new Error('IndexedDB open failed'));
+      request.onerror = () => rejectOnce(request.error || new Error('IndexedDB open failed'));
     });
     return databasePromise;
   };

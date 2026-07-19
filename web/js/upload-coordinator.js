@@ -69,10 +69,18 @@ function deepFreeze(value) {
   return Object.freeze(value);
 }
 
+function coordinatorDestroyedError() {
+  const error = new Error('Upload coordinator is destroyed');
+  error.name = 'CoordinatorDestroyedError';
+  return error;
+}
+
 function publicTask(task) {
   return deepFreeze({
     uploadId: task.uploadId,
     clientRequestId: task.clientRequestId,
+    file: null,
+    fileHandle: null,
     identity: task.identity ? { ...task.identity } : null,
     name: task.name,
     sizeBytes: task.sizeBytes,
@@ -131,9 +139,19 @@ export function createUploadCoordinator({
   let pumping = false;
   let generation = 0;
   let persistenceClosed = false;
+  let resolveDestroy;
+  const destroyPromise = new Promise(resolve => { resolveDestroy = resolve; });
+  const pendingWorkers = new Set();
 
   const snapshot = () => Object.freeze(tasks.map(publicTask));
   const isCurrent = token => !destroyed && token === generation;
+  const raceWithDestroy = promise => {
+    if (destroyed) return Promise.reject(coordinatorDestroyedError());
+    return Promise.race([
+      Promise.resolve(promise),
+      destroyPromise.then(error => { throw error; }),
+    ]);
+  };
   const notify = (token = generation) => {
     if (!isCurrent(token)) return;
     const value = snapshot();
@@ -144,7 +162,7 @@ export function createUploadCoordinator({
   };
   const persist = (task, token = generation) => {
     if (!isCurrent(token)) return Promise.resolve();
-    return persistence.put(persistedTask(task)).catch(() => {});
+    return raceWithDestroy(persistence.put(persistedTask(task))).catch(() => {});
   };
   const updateProgress = task => {
     const transferred = Math.min(task.sizeBytes, task.confirmedBytes + task.inFlightBytes);
@@ -219,9 +237,9 @@ export function createUploadCoordinator({
   };
 
   async function hashPart(blob, token) {
-    const bytes = await blob.arrayBuffer();
+    const bytes = await raceWithDestroy(blob.arrayBuffer());
     if (!isCurrent(token)) return null;
-    const digest = await cryptoObject.subtle.digest('SHA-256', bytes);
+    const digest = await raceWithDestroy(cryptoObject.subtle.digest('SHA-256', bytes));
     if (!isCurrent(token)) return null;
     return toHex(digest);
   }
@@ -233,12 +251,12 @@ export function createUploadCoordinator({
       task.status = 'completing';
       notify(token);
       try {
-        await api.completeUpload(task.uploadId);
+        await raceWithDestroy(api.completeUpload(task.uploadId));
         if (!isCurrent(token)) return;
         task.status = 'completed';
         task.progressPercent = 100;
         task.etaSeconds = 0;
-        await persistence.remove(task.uploadId);
+        await raceWithDestroy(persistence.remove(task.uploadId));
         if (!isCurrent(token)) return;
       } catch (error) {
         if (!isCurrent(token)) return;
@@ -263,7 +281,7 @@ export function createUploadCoordinator({
       try {
         const sha256 = await hashPart(blob, token);
         if (!isCurrent(token) || task.status !== 'uploading') break;
-        const response = await api.uploadPart(
+        const response = await raceWithDestroy(api.uploadPart(
           task.uploadId,
           partIndex,
           blob,
@@ -275,7 +293,7 @@ export function createUploadCoordinator({
             notify(token);
           },
           task.controller.signal,
-        );
+        ));
         if (!isCurrent(token)) return;
         applyServerState(task, response);
         if (task.status === 'uploading') task.status = 'queued';
@@ -296,7 +314,7 @@ export function createUploadCoordinator({
           notify(token);
           break;
         }
-        await delay(UPLOAD_RETRY_DELAYS[attempt]);
+        await raceWithDestroy(delay(UPLOAD_RETRY_DELAYS[attempt]));
         if (!isCurrent(token)) return;
         attempt += 1;
       }
@@ -318,11 +336,14 @@ export function createUploadCoordinator({
           && task.isSourceDevice && !task.worker).slice(0, available);
         if (!ready.length) break;
         ready.forEach(task => {
-          task.worker = uploadOne(task, token).finally(() => {
-            if (!isCurrent(token)) return;
+          const worker = uploadOne(task, token).finally(() => {
             task.worker = null;
+            pendingWorkers.delete(worker);
+            if (!isCurrent(token)) return;
             pump();
           });
+          task.worker = worker;
+          pendingWorkers.add(worker);
         });
         await Promise.resolve();
         if (!isCurrent(token)) return;
@@ -355,9 +376,9 @@ export function createUploadCoordinator({
       return;
     }
     try {
-      task.identity = await sampleFileIdentity(task.file, cryptoObject);
+      task.identity = await raceWithDestroy(sampleFileIdentity(task.file, cryptoObject));
       if (!isCurrent(token) || task.status === 'cancelled') return;
-      const response = await api.createUploadSession({
+      const response = await raceWithDestroy(api.createUploadSession({
         clientRequestId: task.clientRequestId,
         name: task.name,
         sizeBytes: task.sizeBytes,
@@ -365,21 +386,23 @@ export function createUploadCoordinator({
         lastModified: task.identity.lastModified,
         chunkSize,
         sampleSha256: task.identity.sampleSha256,
-      });
+      }));
       if (!isCurrent(token)) return;
       task.uploadId = response.upload_id || response.uploadId || task.uploadId;
       task.sessionReady = true;
       task.sourceDeviceId = response.source_device_id || response.sourceDeviceId || null;
       applyServerState(task, response, { authoritative: true });
       if (task.status === 'cancelled') {
-        await api.cancelUpload(task.uploadId).catch(() => {});
+        await raceWithDestroy(api.cancelUpload(task.uploadId)).catch(() => {});
         if (!isCurrent(token)) return;
-        await persistence.remove(task.uploadId).catch(() => {});
+        await raceWithDestroy(persistence.remove(task.uploadId)).catch(() => {});
         if (!isCurrent(token)) return;
         return;
       }
       task.status = task.status === 'paused' || response.status === 'paused' ? 'paused' : 'queued';
-      if (task.status === 'paused') await api.controlUpload(task.uploadId, 'pause').catch(() => {});
+      if (task.status === 'paused') {
+        await raceWithDestroy(api.controlUpload(task.uploadId, 'pause')).catch(() => {});
+      }
       if (!isCurrent(token)) return;
       await persist(task, token);
       if (!isCurrent(token)) return;
@@ -406,9 +429,9 @@ export function createUploadCoordinator({
     };
     if (task.fileHandle && task.isSourceDevice) {
       try {
-        const file = await task.fileHandle.getFile();
+        const file = await raceWithDestroy(task.fileHandle.getFile());
         if (!isCurrent(token)) return;
-        const matches = await matchesFileIdentity(file, task.identity, cryptoObject);
+        const matches = await raceWithDestroy(matchesFileIdentity(file, task.identity, cryptoObject));
         if (!isCurrent(token)) return;
         if (matches) task.file = file;
       } catch {}
@@ -420,15 +443,15 @@ export function createUploadCoordinator({
   const coordinator = {
     async start() {
       const token = generation;
-      if (!isCurrent(token)) return snapshot();
-      const records = await persistence.getAll();
-      if (!isCurrent(token)) return snapshot();
+      if (!isCurrent(token)) throw coordinatorDestroyedError();
+      const records = await raceWithDestroy(persistence.getAll());
+      if (!isCurrent(token)) throw coordinatorDestroyedError();
       for (const record of records) {
         await restore(record, token);
-        if (!isCurrent(token)) return snapshot();
+        if (!isCurrent(token)) throw coordinatorDestroyedError();
       }
       await coordinator.reconcile();
-      if (!isCurrent(token)) return snapshot();
+      if (!isCurrent(token)) throw coordinatorDestroyedError();
       pump();
       notify(token);
       return snapshot();
@@ -453,7 +476,7 @@ export function createUploadCoordinator({
       task.inFlightBytes = 0;
       task.controller?.abort();
       persist(task);
-      if (task.sessionReady) api.controlUpload(task.uploadId, 'pause').catch(() => {});
+      if (task.sessionReady) raceWithDestroy(api.controlUpload(task.uploadId, 'pause')).catch(() => {});
       notify();
     },
     resume(uploadId) {
@@ -463,7 +486,7 @@ export function createUploadCoordinator({
       task.status = 'queued';
       task.errorCode = null;
       task.errorMessage = null;
-      if (task.sessionReady) api.controlUpload(task.uploadId, 'resume').catch(() => {});
+      if (task.sessionReady) raceWithDestroy(api.controlUpload(task.uploadId, 'resume')).catch(() => {});
       persist(task);
       notify();
       pump();
@@ -475,18 +498,18 @@ export function createUploadCoordinator({
       task.status = 'cancelled';
       task.inFlightBytes = 0;
       task.controller?.abort();
-      if (task.sessionReady) api.cancelUpload(task.uploadId).catch(() => {});
-      persistence.remove(task.uploadId).catch(() => {});
+      if (task.sessionReady) raceWithDestroy(api.cancelUpload(task.uploadId)).catch(() => {});
+      raceWithDestroy(persistence.remove(task.uploadId)).catch(() => {});
       notify();
     },
     async retry(uploadId) {
       const token = generation;
-      if (!isCurrent(token)) return;
+      if (!isCurrent(token)) throw coordinatorDestroyedError();
       const task = findTask(uploadId);
       if (!task || !task.file || !task.isSourceDevice) return;
       try {
-        const response = await api.getUploadSession(task.uploadId);
-        if (!isCurrent(token)) return;
+        const response = await raceWithDestroy(api.getUploadSession(task.uploadId));
+        if (!isCurrent(token)) throw coordinatorDestroyedError();
         if (task.worker || task.inFlightBytes || task.status === 'uploading') return;
         applyServerState(task, response, { authoritative: true });
         task.status = 'queued';
@@ -496,7 +519,8 @@ export function createUploadCoordinator({
         notify(token);
         pump();
       } catch (error) {
-        if (!isCurrent(token)) return;
+        if (error.name === 'CoordinatorDestroyedError') throw error;
+        if (!isCurrent(token)) throw coordinatorDestroyedError();
         task.errorMessage = error.message;
         notify();
       }
@@ -516,9 +540,9 @@ export function createUploadCoordinator({
     cancelAll() { tasks.forEach(task => coordinator.cancel(task.uploadId)); },
     async reconcile() {
       const token = generation;
-      if (!isCurrent(token)) return snapshot();
-      const remote = await api.listActiveUploads?.() || [];
-      if (!isCurrent(token)) return snapshot();
+      if (!isCurrent(token)) throw coordinatorDestroyedError();
+      const remote = api.listActiveUploads ? await raceWithDestroy(api.listActiveUploads()) : [];
+      if (!isCurrent(token)) throw coordinatorDestroyedError();
       remote.forEach(event => {
         if (!isCurrent(token)) return;
         const data = event.upload || event.data || event;
@@ -576,7 +600,13 @@ export function createUploadCoordinator({
       if (destroyed) return;
       destroyed = true;
       generation += 1;
+      resolveDestroy(coordinatorDestroyedError());
       tasks.forEach(task => task.controller?.abort());
+      tasks.forEach(task => {
+        task.file = null;
+        task.fileHandle = null;
+        task.controller = null;
+      });
       listeners.clear();
       if (!persistenceClosed) {
         persistenceClosed = true;
