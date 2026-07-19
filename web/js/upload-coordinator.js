@@ -59,18 +59,26 @@ function serverParts(response, fallback) {
   return Array.isArray(value) ? Array.from(new Set(value)).sort((left, right) => left - right) : fallback;
 }
 
+function unionParts(current, incoming) {
+  return Array.from(new Set([...current, ...incoming])).sort((left, right) => left - right);
+}
+
+function deepFreeze(value) {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  Object.keys(value).forEach(key => deepFreeze(value[key]));
+  return Object.freeze(value);
+}
+
 function publicTask(task) {
-  return Object.freeze({
+  return deepFreeze({
     uploadId: task.uploadId,
     clientRequestId: task.clientRequestId,
-    file: task.file,
-    fileHandle: task.fileHandle,
-    identity: task.identity ? Object.freeze({ ...task.identity }) : null,
+    identity: task.identity ? { ...task.identity } : null,
     name: task.name,
     sizeBytes: task.sizeBytes,
     mimeType: task.mimeType,
     status: task.status,
-    confirmedParts: Object.freeze([...task.confirmedParts]),
+    confirmedParts: [...task.confirmedParts],
     confirmedBytes: task.confirmedBytes,
     inFlightBytes: task.inFlightBytes,
     progressPercent: task.progressPercent,
@@ -82,6 +90,29 @@ function publicTask(task) {
     errorMessage: task.errorMessage,
     createdAt: task.createdAt,
   });
+}
+
+function persistedTask(task) {
+  return {
+    uploadId: task.uploadId,
+    clientRequestId: task.clientRequestId,
+    fileHandle: task.fileHandle,
+    identity: task.identity ? { ...task.identity } : null,
+    name: task.name,
+    sizeBytes: task.sizeBytes,
+    mimeType: task.mimeType,
+    status: task.status,
+    confirmedParts: [...task.confirmedParts],
+    confirmedBytes: task.confirmedBytes,
+    sourceDeviceId: task.sourceDeviceId,
+    isSourceDevice: task.isSourceDevice,
+    errorCode: task.errorCode,
+    errorMessage: task.errorMessage,
+    createdAt: task.createdAt,
+    serverSequence: task.serverSequence,
+    serverUpdatedAt: task.serverUpdatedAt,
+    serverVersion: task.serverVersion,
+  };
 }
 
 export function createUploadCoordinator({
@@ -98,13 +129,23 @@ export function createUploadCoordinator({
   const listeners = new Set();
   let destroyed = false;
   let pumping = false;
+  let generation = 0;
+  let persistenceClosed = false;
 
   const snapshot = () => Object.freeze(tasks.map(publicTask));
-  const notify = () => {
+  const isCurrent = token => !destroyed && token === generation;
+  const notify = (token = generation) => {
+    if (!isCurrent(token)) return;
     const value = snapshot();
-    listeners.forEach(listener => listener(value));
+    for (const listener of listeners) {
+      if (!isCurrent(token)) break;
+      listener(value);
+    }
   };
-  const persist = task => persistence.put(publicTask(task)).catch(() => {});
+  const persist = (task, token = generation) => {
+    if (!isCurrent(token)) return Promise.resolve();
+    return persistence.put(persistedTask(task)).catch(() => {});
+  };
   const updateProgress = task => {
     const transferred = Math.min(task.sizeBytes, task.confirmedBytes + task.inFlightBytes);
     task.progressPercent = task.sizeBytes ? Math.min(100, transferred * 100 / task.sizeBytes) : 100;
@@ -124,12 +165,48 @@ export function createUploadCoordinator({
       ? Math.max(0, (task.sizeBytes - transferred) / task.speedBytesPerSecond)
       : null;
   };
-  const applyServerState = (task, response) => {
-    task.confirmedParts = serverParts(response, task.confirmedParts);
-    task.confirmedBytes = response && (response.confirmed_bytes ?? response.confirmedBytes) !== undefined
+  const confirmedPartBytes = (task, parts) => parts.reduce((total, partIndex) => {
+    const start = partIndex * chunkSize;
+    return total + Math.max(0, Math.min(chunkSize, task.sizeBytes - start));
+  }, 0);
+  const recordServerRevision = (task, response) => {
+    if (!response) return;
+    const sequence = response.sequence ?? response.server_sequence ?? response.serverSequence;
+    const updatedAt = response.updated_at ?? response.updatedAt;
+    const version = response.version ?? response.server_version ?? response.serverVersion;
+    if (sequence !== undefined && (task.serverSequence === null || task.serverSequence === undefined
+        || Number(sequence) > Number(task.serverSequence))) task.serverSequence = sequence;
+    if (updatedAt !== undefined && (!task.serverUpdatedAt || String(updatedAt) > String(task.serverUpdatedAt))) {
+      task.serverUpdatedAt = updatedAt;
+    }
+    if (version !== undefined && (task.serverVersion === null || task.serverVersion === undefined
+        || Number(version) > Number(task.serverVersion))) task.serverVersion = version;
+  };
+  const isFreshEvent = (task, response) => {
+    const sequence = response.sequence ?? response.server_sequence ?? response.serverSequence;
+    if (sequence !== undefined && task.serverSequence !== null && task.serverSequence !== undefined) {
+      return Number(sequence) > Number(task.serverSequence);
+    }
+    const updatedAt = response.updated_at ?? response.updatedAt;
+    if (updatedAt !== undefined && task.serverUpdatedAt) return String(updatedAt) > String(task.serverUpdatedAt);
+    const version = response.version ?? response.server_version ?? response.serverVersion;
+    if (version !== undefined && task.serverVersion !== null && task.serverVersion !== undefined) {
+      return Number(version) > Number(task.serverVersion);
+    }
+    return true;
+  };
+  const applyServerState = (task, response, { authoritative = false } = {}) => {
+    const incomingParts = serverParts(response, []);
+    task.confirmedParts = authoritative ? incomingParts : unionParts(task.confirmedParts, incomingParts);
+    const serverBytes = response && (response.confirmed_bytes ?? response.confirmedBytes) !== undefined
       ? (response.confirmed_bytes ?? response.confirmedBytes)
-      : Math.min(task.sizeBytes, task.confirmedParts.length * chunkSize);
+      : 0;
+    const partBytes = confirmedPartBytes(task, task.confirmedParts);
+    task.confirmedBytes = authoritative
+      ? Math.max(serverBytes, partBytes)
+      : Math.max(task.confirmedBytes, serverBytes, partBytes);
     task.inFlightBytes = 0;
+    recordServerRevision(task, response);
     updateProgress(task);
   };
   const findTask = uploadId => tasks.find(task => task.uploadId === uploadId || task.clientRequestId === uploadId);
@@ -141,29 +218,36 @@ export function createUploadCoordinator({
     return null;
   };
 
-  async function hashPart(blob) {
-    return toHex(await cryptoObject.subtle.digest('SHA-256', await blob.arrayBuffer()));
+  async function hashPart(blob, token) {
+    const bytes = await blob.arrayBuffer();
+    if (!isCurrent(token)) return null;
+    const digest = await cryptoObject.subtle.digest('SHA-256', bytes);
+    if (!isCurrent(token)) return null;
+    return toHex(digest);
   }
 
-  async function uploadOne(task) {
-    if (task.status !== 'queued' || !task.file || !task.isSourceDevice) return;
+  async function uploadOne(task, token) {
+    if (!isCurrent(token) || task.status !== 'queued' || !task.file || !task.isSourceDevice) return;
     const partIndex = nextMissingPart(task);
     if (partIndex === null) {
       task.status = 'completing';
-      notify();
+      notify(token);
       try {
         await api.completeUpload(task.uploadId);
+        if (!isCurrent(token)) return;
         task.status = 'completed';
         task.progressPercent = 100;
         task.etaSeconds = 0;
         await persistence.remove(task.uploadId);
+        if (!isCurrent(token)) return;
       } catch (error) {
+        if (!isCurrent(token)) return;
         task.status = 'failed';
         task.errorCode = 'complete-failed';
         task.errorMessage = error.message;
-        persist(task);
+        persist(task, token);
       }
-      notify();
+      notify(token);
       return;
     }
 
@@ -174,54 +258,59 @@ export function createUploadCoordinator({
     const endExclusive = Math.min(task.sizeBytes, start + chunkSize);
     const blob = task.file.slice(start, endExclusive);
     let attempt = 0;
-    notify();
-    while (task.status === 'uploading') {
+    notify(token);
+    while (isCurrent(token) && task.status === 'uploading') {
       try {
-        const sha256 = await hashPart(blob);
-        if (task.status !== 'uploading') break;
+        const sha256 = await hashPart(blob, token);
+        if (!isCurrent(token) || task.status !== 'uploading') break;
         const response = await api.uploadPart(
           task.uploadId,
           partIndex,
           blob,
           { start, end: endExclusive - 1, total: task.sizeBytes, sha256 },
           loaded => {
-            if (task.status !== 'uploading') return;
+            if (!isCurrent(token) || task.status !== 'uploading') return;
             task.inFlightBytes = Math.min(blob.size ?? endExclusive - start, loaded);
             updateProgress(task);
-            notify();
+            notify(token);
           },
           task.controller.signal,
         );
+        if (!isCurrent(token)) return;
         applyServerState(task, response);
         if (task.status === 'uploading') task.status = 'queued';
         task.errorCode = null;
         task.errorMessage = null;
-        persist(task);
-        notify();
+        persist(task, token);
+        notify(token);
         break;
       } catch (error) {
+        if (!isCurrent(token)) return;
         task.inFlightBytes = 0;
         if (task.status === 'paused' || task.status === 'cancelled' || error.name === 'AbortError') break;
         if (attempt >= UPLOAD_RETRY_DELAYS.length) {
           task.status = 'failed';
           task.errorCode = 'upload-failed';
           task.errorMessage = error.message;
-          persist(task);
-          notify();
+          persist(task, token);
+          notify(token);
           break;
         }
         await delay(UPLOAD_RETRY_DELAYS[attempt]);
+        if (!isCurrent(token)) return;
         attempt += 1;
       }
     }
-    task.controller = null;
+    if (isCurrent(token)) task.controller = null;
   }
 
   function pump() {
     if (destroyed || pumping) return;
+    const token = generation;
     pumping = true;
     Promise.resolve().then(async () => {
-      while (!destroyed) {
+      if (!isCurrent(token)) return;
+      while (isCurrent(token)) {
         const active = tasks.filter(task => task.worker).length;
         const available = maxActive - active;
         if (available <= 0) break;
@@ -229,14 +318,16 @@ export function createUploadCoordinator({
           && task.isSourceDevice && !task.worker).slice(0, available);
         if (!ready.length) break;
         ready.forEach(task => {
-          task.worker = uploadOne(task).finally(() => {
+          task.worker = uploadOne(task, token).finally(() => {
+            if (!isCurrent(token)) return;
             task.worker = null;
             pump();
           });
         });
         await Promise.resolve();
+        if (!isCurrent(token)) return;
       }
-      pumping = false;
+      if (isCurrent(token)) pumping = false;
     });
   }
 
@@ -250,20 +341,22 @@ export function createUploadCoordinator({
       sourceDeviceId: null, isSourceDevice: true, errorCode: null, errorMessage: null,
       createdAt: now(), samples: [], controller: null, worker: null,
       sessionReady: false,
+      serverSequence: null, serverUpdatedAt: null, serverVersion: null,
     };
   }
 
-  async function prepare(task) {
+  async function prepare(task, token) {
+    if (!isCurrent(token)) return;
     if (task.sizeBytes > MAX_UPLOAD_SIZE_BYTES) {
       task.status = 'failed';
       task.errorCode = 'file-too-large';
       task.errorMessage = '文件大小超过 512 MiB 限制';
-      notify();
+      notify(token);
       return;
     }
     try {
       task.identity = await sampleFileIdentity(task.file, cryptoObject);
-      if (task.status === 'cancelled') return;
+      if (!isCurrent(token) || task.status === 'cancelled') return;
       const response = await api.createUploadSession({
         clientRequestId: task.clientRequestId,
         name: task.name,
@@ -273,28 +366,35 @@ export function createUploadCoordinator({
         chunkSize,
         sampleSha256: task.identity.sampleSha256,
       });
+      if (!isCurrent(token)) return;
       task.uploadId = response.upload_id || response.uploadId || task.uploadId;
       task.sessionReady = true;
       task.sourceDeviceId = response.source_device_id || response.sourceDeviceId || null;
-      applyServerState(task, response);
+      applyServerState(task, response, { authoritative: true });
       if (task.status === 'cancelled') {
         await api.cancelUpload(task.uploadId).catch(() => {});
+        if (!isCurrent(token)) return;
         await persistence.remove(task.uploadId).catch(() => {});
+        if (!isCurrent(token)) return;
         return;
       }
       task.status = task.status === 'paused' || response.status === 'paused' ? 'paused' : 'queued';
       if (task.status === 'paused') await api.controlUpload(task.uploadId, 'pause').catch(() => {});
-      await persist(task);
+      if (!isCurrent(token)) return;
+      await persist(task, token);
+      if (!isCurrent(token)) return;
     } catch (error) {
+      if (!isCurrent(token)) return;
       task.status = 'failed';
       task.errorCode = 'session-create-failed';
       task.errorMessage = error.message;
     }
-    notify();
+    notify(token);
     pump();
   }
 
-  async function restore(record) {
+  async function restore(record, token) {
+    if (!isCurrent(token)) return;
     const task = {
       ...record, file: null, fileHandle: record.fileHandle || null,
       identity: record.identity || null, confirmedParts: record.confirmedParts || [],
@@ -307,33 +407,46 @@ export function createUploadCoordinator({
     if (task.fileHandle && task.isSourceDevice) {
       try {
         const file = await task.fileHandle.getFile();
-        if (await matchesFileIdentity(file, task.identity, cryptoObject)) task.file = file;
+        if (!isCurrent(token)) return;
+        const matches = await matchesFileIdentity(file, task.identity, cryptoObject);
+        if (!isCurrent(token)) return;
+        if (matches) task.file = file;
       } catch {}
     }
     if (!task.file && task.isSourceDevice && !['completed', 'cancelled'].includes(task.status)) task.status = 'needs-file';
-    tasks.push(task);
+    if (isCurrent(token)) tasks.push(task);
   }
 
   const coordinator = {
     async start() {
+      const token = generation;
+      if (!isCurrent(token)) return snapshot();
       const records = await persistence.getAll();
-      for (const record of records) await restore(record);
+      if (!isCurrent(token)) return snapshot();
+      for (const record of records) {
+        await restore(record, token);
+        if (!isCurrent(token)) return snapshot();
+      }
       await coordinator.reconcile();
+      if (!isCurrent(token)) return snapshot();
       pump();
-      notify();
+      notify(token);
       return snapshot();
     },
     enqueueFiles(files) {
+      if (destroyed) return snapshot();
+      const token = generation;
       Array.from(files).forEach(item => {
         const file = item.file || item;
         const task = newTask(file, item.fileHandle);
         tasks.push(task);
-        prepare(task);
+        prepare(task, token);
       });
-      notify();
+      notify(token);
       return snapshot();
     },
     pause(uploadId) {
+      if (destroyed) return;
       const task = findTask(uploadId);
       if (!task || ['completed', 'cancelled'].includes(task.status)) return;
       task.status = 'paused';
@@ -344,6 +457,7 @@ export function createUploadCoordinator({
       notify();
     },
     resume(uploadId) {
+      if (destroyed) return;
       const task = findTask(uploadId);
       if (!task || !task.file || !task.isSourceDevice) return;
       task.status = 'queued';
@@ -355,6 +469,7 @@ export function createUploadCoordinator({
       pump();
     },
     cancel(uploadId) {
+      if (destroyed) return;
       const task = findTask(uploadId);
       if (!task) return;
       task.status = 'cancelled';
@@ -365,22 +480,29 @@ export function createUploadCoordinator({
       notify();
     },
     async retry(uploadId) {
+      const token = generation;
+      if (!isCurrent(token)) return;
       const task = findTask(uploadId);
       if (!task || !task.file || !task.isSourceDevice) return;
       try {
-        applyServerState(task, await api.getUploadSession(task.uploadId));
+        const response = await api.getUploadSession(task.uploadId);
+        if (!isCurrent(token)) return;
+        if (task.worker || task.inFlightBytes || task.status === 'uploading') return;
+        applyServerState(task, response, { authoritative: true });
         task.status = 'queued';
         task.errorCode = null;
         task.errorMessage = null;
-        persist(task);
-        notify();
+        persist(task, token);
+        notify(token);
         pump();
       } catch (error) {
+        if (!isCurrent(token)) return;
         task.errorMessage = error.message;
         notify();
       }
     },
     prioritize(uploadId) {
+      if (destroyed) return;
       const index = tasks.findIndex(task => task.uploadId === uploadId || task.clientRequestId === uploadId);
       if (index < 1 || tasks[index].status !== 'queued') return;
       const [task] = tasks.splice(index, 1);
@@ -393,11 +515,29 @@ export function createUploadCoordinator({
     resumeAll() { tasks.forEach(task => coordinator.resume(task.uploadId)); },
     cancelAll() { tasks.forEach(task => coordinator.cancel(task.uploadId)); },
     async reconcile() {
+      const token = generation;
+      if (!isCurrent(token)) return snapshot();
       const remote = await api.listActiveUploads?.() || [];
-      remote.forEach(event => coordinator.applyRemoteEvent(event));
+      if (!isCurrent(token)) return snapshot();
+      remote.forEach(event => {
+        if (!isCurrent(token)) return;
+        const data = event.upload || event.data || event;
+        const task = findTask(data.upload_id || data.uploadId);
+        if (!task) {
+          coordinator.applyRemoteEvent(data);
+          return;
+        }
+        if (!task.worker && !task.inFlightBytes && task.status !== 'uploading') {
+          applyServerState(task, data, { authoritative: true });
+          if (data.status && task.status !== 'paused') task.status = data.status;
+          persist(task, token);
+          notify(token);
+        }
+      });
       return snapshot();
     },
     applyRemoteEvent(event) {
+      if (destroyed) return false;
       const data = event.upload || event.data || event;
       let task = findTask(data.upload_id || data.uploadId);
       if (!task) {
@@ -414,8 +554,11 @@ export function createUploadCoordinator({
           errorCode: null, errorMessage: null,
           createdAt: data.created_at || data.createdAt || now(), samples: [], controller: null,
           worker: null, sessionReady: true,
+          serverSequence: null, serverUpdatedAt: null, serverVersion: null,
         };
         tasks.push(task);
+      } else if (!isFreshEvent(task, data)) {
+        return false;
       }
       applyServerState(task, data);
       if (data.status && task.status !== 'paused') task.status = data.status;
@@ -423,16 +566,22 @@ export function createUploadCoordinator({
       return true;
     },
     subscribe(listener) {
+      if (destroyed) return () => {};
       listeners.add(listener);
       listener(snapshot());
       return () => listeners.delete(listener);
     },
     getSnapshot: snapshot,
     destroy() {
+      if (destroyed) return;
       destroyed = true;
+      generation += 1;
       tasks.forEach(task => task.controller?.abort());
       listeners.clear();
-      persistence.close();
+      if (!persistenceClosed) {
+        persistenceClosed = true;
+        persistence.close();
+      }
     },
   };
   return coordinator;

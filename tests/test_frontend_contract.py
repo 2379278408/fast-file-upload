@@ -2243,9 +2243,9 @@ def test_upload_persistence_only_clones_metadata_and_optional_handle() -> None:
       globalThis.transaction = {
         objectStore() {
           return {
-            put(value) { stored = value; const request = {}; Promise.resolve().then(() => request.onsuccess()); return request; },
-            getAll() { const request = {}; Promise.resolve().then(() => { request.result = stored ? [stored] : []; request.onsuccess(); }); return request; },
-            delete() { const request = {}; Promise.resolve().then(() => request.onsuccess()); return request; },
+                put(value) { stored = value; const request = {}; Promise.resolve().then(() => { request.onsuccess(); transaction.oncomplete(); }); return request; },
+                getAll() { const request = {}; Promise.resolve().then(() => { request.result = stored ? [stored] : []; request.onsuccess(); transaction.oncomplete(); }); return request; },
+                delete() { const request = {}; Promise.resolve().then(() => { request.onsuccess(); transaction.oncomplete(); }); return request; },
           };
         },
       };
@@ -2441,6 +2441,433 @@ def test_upload_coordinator_prioritize_reorders_queued_tasks_only() -> None:
     ))
     assert order == ["priority-3", "priority-2"]
     assert context.eval("coordinator.getSnapshot()[0].status") == "uploading"
+
+
+def test_upload_persistence_waits_for_commit_and_rejects_abort_or_error() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.transactions = [];
+      globalThis.mode = 'success';
+      globalThis.database = {
+        transaction() {
+          const transaction = {
+            error: null,
+            objectStore() {
+              return {
+                getAll() {
+                  const request = {};
+                  Promise.resolve().then(() => {
+                    request.result = [{ uploadId: 'cached' }];
+                    request.onsuccess();
+                  });
+                  return request;
+                },
+              };
+            },
+          };
+          transactions.push(transaction);
+          return transaction;
+        },
+        close() {},
+      };
+      globalThis.indexedDB = {
+        open() {
+          const request = {};
+          Promise.resolve().then(() => { request.result = database; request.onsuccess(); });
+          return request;
+        },
+      };
+    """)
+    load_js_module(context, "./upload-persistence.js", read_web("js/upload-persistence.js"))
+    context.eval(r"""
+      globalThis.persistence = __modules['./upload-persistence.js'].createUploadPersistence({ indexedDB });
+      globalThis.rows = null;
+      globalThis.failure = null;
+      persistence.getAll().then(value => { rows = value; }).catch(error => { failure = error.message; });
+    """)
+    drain_jobs(context)
+    assert context.eval("rows === null") is True
+    context.eval("transactions[0].oncomplete()")
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(rows)")) == [{"uploadId": "cached"}]
+
+    context.eval(r"""
+      rows = null; failure = null;
+      persistence.getAll().then(value => { rows = value; }).catch(error => { failure = error.message; });
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      transactions[1].error = new Error('transaction aborted');
+      transactions[1].onabort();
+    """)
+    drain_jobs(context)
+    assert context.eval("failure") == "transaction aborted"
+
+    context.eval(r"""
+      failure = null;
+      persistence.getAll().catch(error => { failure = error.message; });
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      transactions[2].error = new Error('transaction error');
+      transactions[2].onerror();
+    """)
+    drain_jobs(context)
+    assert context.eval("failure") == "transaction error"
+
+
+def test_upload_persistence_clone_fallback_starts_after_failed_transaction() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.transactions = [];
+      globalThis.records = [];
+      globalThis.database = {
+        transaction() {
+          const index = transactions.length;
+          const transaction = {
+            error: null,
+            objectStore() {
+              return {
+                put(record) {
+                  records.push({ ...record });
+                  const request = {};
+                  Promise.resolve().then(() => {
+                    if (index === 0) {
+                      request.onerror && request.onerror();
+                      transaction.error = { name: 'DataCloneError', message: 'cannot clone handle' };
+                      transaction.onabort();
+                    } else {
+                      request.result = record.uploadId;
+                      request.onsuccess();
+                      transaction.oncomplete();
+                    }
+                  });
+                  return request;
+                },
+              };
+            },
+          };
+          transactions.push(transaction);
+          return transaction;
+        },
+        close() {},
+      };
+      globalThis.indexedDB = { open() { const request = {}; Promise.resolve().then(() => { request.result = database; request.onsuccess(); }); return request; } };
+    """)
+    load_js_module(context, "./upload-persistence.js", read_web("js/upload-persistence.js"))
+    context.eval(r"""
+      globalThis.result = null;
+      const persistence = __modules['./upload-persistence.js'].createUploadPersistence({ indexedDB });
+      persistence.put({ uploadId: 'clone', name: 'x', fileHandle: { kind: 'file' } })
+        .then(value => { result = value; });
+    """)
+    drain_jobs(context)
+    assert context.eval("transactions.length") == 2
+    assert context.eval("records[0].fileHandle.kind") == "file"
+    assert context.eval("Object.prototype.hasOwnProperty.call(records[1], 'fileHandle')") is False
+    assert context.eval("result") == "clone"
+
+
+def test_upload_persistence_close_is_permanent_during_open_and_transaction() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.openCount = 0;
+      globalThis.openRequest = null;
+      globalThis.transactionCount = 0;
+      globalThis.databaseClosed = 0;
+      globalThis.transaction = null;
+      globalThis.database = {
+        transaction() {
+          transactionCount += 1;
+          transaction = {
+            objectStore() {
+              return { getAll() { const request = {}; Promise.resolve().then(() => { request.result = []; request.onsuccess(); }); return request; } };
+            },
+          };
+          return transaction;
+        },
+        close() { databaseClosed += 1; },
+      };
+      globalThis.indexedDB = { open() { openCount += 1; openRequest = {}; return openRequest; } };
+    """)
+    load_js_module(context, "./upload-persistence.js", read_web("js/upload-persistence.js"))
+    context.eval(r"""
+      globalThis.persistence = __modules['./upload-persistence.js'].createUploadPersistence({ indexedDB });
+      globalThis.firstError = null;
+      globalThis.secondError = null;
+      persistence.getAll().catch(error => { firstError = [error.name, error.message]; });
+      persistence.close();
+      openRequest.result = database;
+      openRequest.onsuccess();
+      persistence.getAll().catch(error => { secondError = [error.name, error.message]; });
+    """)
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(firstError)"))[0] == "ClosedError"
+    assert json.loads(context.eval("JSON.stringify(secondError)"))[0] == "ClosedError"
+    assert context.eval("openCount") == 1
+    assert context.eval("transactionCount") == 0
+    assert context.eval("databaseClosed") == 1
+
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.transaction = null;
+      globalThis.database = {
+        transaction() {
+          transaction = {
+            objectStore() { return { getAll() { const request = {}; Promise.resolve().then(() => { request.result = ['late']; request.onsuccess(); }); return request; } }; },
+          };
+          return transaction;
+        },
+        close() {},
+      };
+      globalThis.indexedDB = { open() { const request = {}; Promise.resolve().then(() => { request.result = database; request.onsuccess(); }); return request; } };
+    """)
+    load_js_module(context, "./upload-persistence.js", read_web("js/upload-persistence.js"))
+    context.eval(r"""
+      globalThis.failure = null;
+      globalThis.value = null;
+      globalThis.persistence = __modules['./upload-persistence.js'].createUploadPersistence({ indexedDB });
+      persistence.getAll().then(result => { value = result; }).catch(error => { failure = error.name; });
+    """)
+    drain_jobs(context)
+    context.eval("persistence.close(); transaction.oncomplete();")
+    drain_jobs(context)
+    assert context.eval("failure") == "ClosedError"
+    assert context.eval("value === null") is True
+
+
+def test_resumable_api_xhr_settles_once_and_removes_abort_listener() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.added = 0;
+      globalThis.removed = 0;
+      globalThis.abortHandler = null;
+      globalThis.signal = {
+        aborted: false,
+        addEventListener(_type, handler) { added += 1; abortHandler = handler; },
+        removeEventListener(_type, handler) { if (handler === abortHandler) removed += 1; },
+      };
+      globalThis.XMLHttpRequest = class XMLHttpRequest {
+        constructor() { this.upload = {}; this.status = 200; this.responseText = '{}'; globalThis.xhr = this; }
+        open() {}
+        setRequestHeader() {}
+        send() { this.onload(); }
+        abort() { this.onabort(); }
+      };
+    """)
+    load_js_module(context, "./api.js", read_web("js/api.js"))
+    context.eval(r"""
+      globalThis.settles = 0;
+      __modules['./api.js'].uploadPart('u', 0, {}, { start: 0, end: 0, total: 1, sha256: 'x' }, null, signal)
+        .then(() => { settles += 1; }, () => { settles += 1; });
+    """)
+    drain_jobs(context)
+    context.eval("xhr.onerror(); xhr.onabort();")
+    drain_jobs(context)
+    assert context.eval("added") == 1
+    assert context.eval("removed") == 1
+    assert context.eval("settles") == 1
+
+
+def test_upload_coordinator_unions_out_of_order_confirmations_and_rejects_stale_events() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.AbortController = class AbortController { constructor() { this.signal = {}; } abort() {} };
+      globalThis.lateProgress = null;
+      globalThis.cryptoObject = {
+        randomUUID: () => 'union-id',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'union.bin', size: 8, type: '', lastModified: 1,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      };
+      globalThis.api = {
+        createUploadSession: () => Promise.resolve({ upload_id: 'union-id', confirmed_parts: [1], confirmed_bytes: 4, updated_at: '2026-07-19T10:00:00Z', version: 1 }),
+        uploadPart(_id, _index, _blob, _metadata, onProgress) {
+          lateProgress = onProgress;
+          return Promise.resolve({ confirmed_parts: [0], confirmed_bytes: 4, updated_at: '2026-07-19T10:00:01Z', version: 2 });
+        },
+        completeUpload: () => new Promise(() => {}),
+        controlUpload: () => Promise.resolve({}), cancelUpload: () => Promise.resolve({}),
+      };
+      globalThis.persistence = { put: () => Promise.resolve(), getAll: () => Promise.resolve([]), remove: () => Promise.resolve(), close: () => {} };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, delay: () => Promise.resolve(), maxActive: 1, chunkSize: 4,
+      });
+      coordinator.enqueueFiles([file]);
+    """)
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(coordinator.getSnapshot()[0].confirmedParts)")) == [0, 1]
+    context.eval("lateProgress(1, 4)")
+    assert json.loads(context.eval("JSON.stringify(coordinator.getSnapshot()[0].confirmedParts)")) == [0, 1]
+    context.eval(r"""
+      coordinator.applyRemoteEvent({ upload_id: 'union-id', confirmed_parts: [0, 1], sequence: 10, updated_at: '2026-07-19T10:00:10Z', version: 10 });
+      coordinator.applyRemoteEvent({ upload_id: 'union-id', confirmed_parts: [0], sequence: 9, updated_at: '2026-07-19T10:00:09Z', version: 9 });
+    """)
+    assert json.loads(context.eval("JSON.stringify(coordinator.getSnapshot()[0].confirmedParts)")) == [0, 1]
+
+
+def test_upload_coordinator_snapshot_hides_runtime_references_and_is_deep_frozen() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.cryptoObject = { randomUUID: () => 'snapshot-id', subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) } };
+      globalThis.file = { name: 'private.bin', size: 4, type: '', lastModified: 1, slice() {} };
+      globalThis.handle = { kind: 'file', mutable: true };
+      globalThis.api = { createUploadSession: () => new Promise(() => {}) };
+      globalThis.persistence = { put: () => Promise.resolve(), getAll: () => Promise.resolve([]), remove: () => Promise.resolve(), close: () => {} };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({ api, persistence, cryptoObject });
+      coordinator.enqueueFiles([{ file, fileHandle: handle }]);
+    """)
+    drain_jobs(context)
+    context.eval("globalThis.snapshot = coordinator.getSnapshot()[0]")
+    assert context.eval("Object.prototype.hasOwnProperty.call(snapshot, 'file')") is False
+    assert context.eval("Object.prototype.hasOwnProperty.call(snapshot, 'fileHandle')") is False
+    assert context.eval("Object.prototype.hasOwnProperty.call(snapshot, 'controller')") is False
+    assert context.eval("Object.isFrozen(snapshot)") is True
+    assert context.eval("Object.isFrozen(snapshot.confirmedParts)") is True
+    assert context.eval("Object.isFrozen(snapshot.identity)") is True
+
+
+def test_upload_coordinator_retry_uses_authoritative_missing_snapshot() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.AbortController = class AbortController { constructor() { this.signal = {}; } abort() {} };
+      globalThis.phase = 'fail';
+      globalThis.sent = [];
+      globalThis.cryptoObject = {
+        randomUUID: () => 'retry-authority',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'retry.bin', size: 8, type: '', lastModified: 1,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      };
+      globalThis.api = {
+        createUploadSession: () => Promise.resolve({ upload_id: 'retry-authority', confirmed_parts: [0], confirmed_bytes: 4 }),
+        uploadPart(_id, index) {
+          sent.push(index);
+          return phase === 'fail'
+            ? Promise.reject(new Error('offline'))
+            : Promise.resolve({ confirmed_parts: [index], confirmed_bytes: 8 });
+        },
+        getUploadSession: () => Promise.resolve({ confirmed_parts: [1], confirmed_bytes: 4, updated_at: '2026-07-19T11:00:00Z', version: 5 }),
+        completeUpload: () => new Promise(() => {}),
+        controlUpload: () => Promise.resolve({}), cancelUpload: () => Promise.resolve({}),
+      };
+      globalThis.persistence = { put: () => Promise.resolve(), getAll: () => Promise.resolve([]), remove: () => Promise.resolve(), close: () => {} };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, delay: () => Promise.resolve(), maxActive: 1, chunkSize: 4,
+      });
+      coordinator.enqueueFiles([file]);
+    """)
+    drain_jobs(context)
+    assert context.eval("coordinator.getSnapshot()[0].status") == "failed"
+    context.eval("phase = 'success'; sent = []; coordinator.retry('retry-authority')")
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(sent)"))[0] == 0
+
+
+def test_upload_coordinator_unsubscribe_and_destroy_cleanup_listeners() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.cryptoObject = { randomUUID: () => 'listener-id', subtle: { digest: () => new Promise(() => {}) } };
+      globalThis.api = {};
+      globalThis.persistence = { put: () => Promise.resolve(), getAll: () => Promise.resolve([]), remove: () => Promise.resolve(), close: () => {} };
+      globalThis.file = { name: 'listener.bin', size: 4, type: '', lastModified: 1 };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.firstCalls = 0;
+      globalThis.secondCalls = 0;
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({ api, persistence, cryptoObject });
+      const unsubscribe = coordinator.subscribe(() => { firstCalls += 1; });
+      coordinator.subscribe(() => { secondCalls += 1; });
+      unsubscribe();
+      coordinator.enqueueFiles([file]);
+      coordinator.destroy();
+      coordinator.enqueueFiles([file]);
+    """)
+    assert context.eval("firstCalls") == 1
+    assert context.eval("secondCalls") == 2
+
+
+@pytest.mark.parametrize("stage", ["identity", "create", "part", "complete", "reconcile"])
+def test_upload_coordinator_destroy_blocks_each_late_await_stage(stage: str) -> None:
+    context = create_js_context()
+    context.set("stage", stage)
+    context.eval(r"""
+      globalThis.deferred = {};
+      globalThis.makeDeferred = name => {
+        let resolve;
+        const promise = new Promise(done => { resolve = done; });
+        deferred[name] = { promise, resolve };
+        return promise;
+      };
+      globalThis.persistCalls = 0;
+      globalThis.closeCalls = 0;
+      globalThis.notifications = 0;
+      globalThis.AbortController = class AbortController { constructor() { this.signal = {}; } abort() {} };
+      globalThis.cryptoObject = {
+        randomUUID: () => 'destroy-id',
+        subtle: { digest: () => stage === 'identity' ? makeDeferred('identity') : Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'destroy.bin', size: stage === 'complete' ? 0 : 4, type: '', lastModified: 1,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      };
+      globalThis.api = {
+        createUploadSession: () => stage === 'create' ? makeDeferred('create') : Promise.resolve({ upload_id: 'destroy-id', confirmed_parts: [] }),
+        uploadPart: () => stage === 'part' ? makeDeferred('part') : Promise.resolve({ confirmed_parts: [0], confirmed_bytes: 4 }),
+        completeUpload: () => stage === 'complete' ? makeDeferred('complete') : new Promise(() => {}),
+        listActiveUploads: () => stage === 'reconcile' ? makeDeferred('reconcile') : Promise.resolve([]),
+        controlUpload: () => Promise.resolve({}), cancelUpload: () => Promise.resolve({}),
+      };
+      globalThis.persistence = {
+        put: () => { persistCalls += 1; return Promise.resolve(); },
+        getAll: () => Promise.resolve([]), remove: () => Promise.resolve(),
+        close: () => { closeCalls += 1; },
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, delay: () => Promise.resolve(), maxActive: 1, chunkSize: 4,
+      });
+      coordinator.subscribe(() => { notifications += 1; });
+      if (stage === 'reconcile') coordinator.start(); else coordinator.enqueueFiles([file]);
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      coordinator.destroy();
+      coordinator.destroy();
+      globalThis.afterDestroyPersist = persistCalls;
+      globalThis.afterDestroyNotifications = notifications;
+      if (deferred[stage]) {
+        const values = {
+          identity: new Uint8Array(32).buffer,
+          create: { upload_id: 'destroy-id', confirmed_parts: [] },
+          part: { confirmed_parts: [0], confirmed_bytes: 4 },
+          complete: { upload_id: 'destroy-id' },
+          reconcile: [{ upload_id: 'remote', confirmed_parts: [] }],
+        };
+        deferred[stage].resolve(values[stage]);
+      }
+    """)
+    drain_jobs(context)
+    assert context.eval("closeCalls") == 1
+    assert context.eval("persistCalls") == context.eval("afterDestroyPersist")
+    assert context.eval("notifications") == context.eval("afterDestroyNotifications")
+    assert context.eval("coordinator.getSnapshot().some(task => task.uploadId === 'remote')") is False
 
 
 def test_app_imports_composer_module(client: TestClient) -> None:

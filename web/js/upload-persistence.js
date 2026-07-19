@@ -5,18 +5,23 @@ const PERSISTED_FIELDS = [
   'uploadId', 'clientRequestId', 'fileHandle', 'identity', 'name', 'sizeBytes',
   'mimeType', 'status', 'confirmedParts', 'confirmedBytes', 'sourceDeviceId',
   'isSourceDevice', 'errorCode', 'errorMessage', 'createdAt',
+  'serverSequence', 'serverUpdatedAt', 'serverVersion',
 ];
 
-function requestPromise(request) {
-  return new Promise((resolve, reject) => {
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error || new Error('IndexedDB request failed'));
-  });
+function closedError() {
+  const error = new Error('Upload persistence is closed');
+  error.name = 'ClosedError';
+  return error;
 }
 
 export function createUploadPersistence({ indexedDB }) {
-  let databasePromise;
+  let databasePromise = null;
+  let database = null;
+  let closed = false;
+  const pendingRejects = new Set();
+
   const open = () => {
+    if (closed) return Promise.reject(closedError());
     if (databasePromise) return databasePromise;
     databasePromise = new Promise((resolve, reject) => {
       const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
@@ -26,12 +31,59 @@ export function createUploadPersistence({ indexedDB }) {
           database.createObjectStore(STORE_NAME, { keyPath: 'uploadId' });
         }
       };
-      request.onsuccess = () => resolve(request.result);
+      request.onsuccess = () => {
+        if (closed) {
+          request.result.close();
+          reject(closedError());
+          return;
+        }
+        database = request.result;
+        resolve(database);
+      };
       request.onerror = () => reject(request.error || new Error('IndexedDB open failed'));
     });
     return databasePromise;
   };
-  const store = async mode => (await open()).transaction(STORE_NAME, mode).objectStore(STORE_NAME);
+
+  const transact = async (mode, operation) => {
+    if (closed) throw closedError();
+    const openedDatabase = await open();
+    if (closed) throw closedError();
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let result;
+      let requestError = null;
+      const transaction = openedDatabase.transaction(STORE_NAME, mode);
+      const finish = callback => value => {
+        if (settled) return;
+        settled = true;
+        pendingRejects.delete(rejectClosed);
+        callback(value);
+      };
+      const resolveOnce = finish(resolve);
+      const rejectOnce = finish(reject);
+      const rejectClosed = () => rejectOnce(closedError());
+      pendingRejects.add(rejectClosed);
+      transaction.oncomplete = () => {
+        if (closed) rejectClosed();
+        else resolveOnce(result);
+      };
+      const rejectTransaction = () => rejectOnce(
+        transaction.error || requestError || new Error('IndexedDB transaction failed'),
+      );
+      transaction.onabort = rejectTransaction;
+      transaction.onerror = rejectTransaction;
+      try {
+        const request = operation(transaction.objectStore(STORE_NAME));
+        request.onsuccess = () => { result = request.result; };
+        request.onerror = () => {
+          requestError = request.error || new Error('IndexedDB request failed');
+        };
+      } catch (error) {
+        rejectOnce(error);
+      }
+    });
+  };
 
   return {
     async put(task) {
@@ -43,22 +95,26 @@ export function createUploadPersistence({ indexedDB }) {
         record.fileHandle = task.fileHandle;
       }
       try {
-        return await requestPromise((await store('readwrite')).put(record));
+        return await transact('readwrite', store => store.put(record));
       } catch (error) {
-        if (!Object.prototype.hasOwnProperty.call(record, 'fileHandle')) throw error;
+        if (closed || error.name !== 'DataCloneError'
+            || !Object.prototype.hasOwnProperty.call(record, 'fileHandle')) throw error;
         delete record.fileHandle;
-        return requestPromise((await store('readwrite')).put(record));
+        return transact('readwrite', store => store.put(record));
       }
     },
     async getAll() {
-      return requestPromise((await store('readonly')).getAll());
+      return transact('readonly', store => store.getAll());
     },
     async remove(uploadId) {
-      return requestPromise((await store('readwrite')).delete(uploadId));
+      return transact('readwrite', store => store.delete(uploadId));
     },
     close() {
-      if (databasePromise) databasePromise.then(database => database.close());
-      databasePromise = null;
+      if (closed) return;
+      closed = true;
+      Array.from(pendingRejects).forEach(reject => reject());
+      pendingRejects.clear();
+      if (database) database.close();
     },
   };
 }

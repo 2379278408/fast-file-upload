@@ -121,31 +121,43 @@ export async function sendText(body, clientRequestId) {
 
 function xhrJson({ method, path, body, headers = {}, onProgress, signal }) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let abortHandler = null;
     const abortError = () => {
       const error = new Error('Upload aborted');
       error.name = 'AbortError';
       return error;
     };
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      if (signal && abortHandler && typeof signal.removeEventListener === 'function') {
+        signal.removeEventListener('abort', abortHandler);
+      }
+      callback(value);
+    };
+    const resolveOnce = value => settle(resolve, value);
+    const rejectOnce = error => settle(reject, error);
     const xhr = new XMLHttpRequest();
     xhr.open(method, path);
     xhr.withCredentials = true;
     Object.entries(headers).forEach(([name, value]) => xhr.setRequestHeader(name, value));
 
     xhr.upload.onprogress = (event) => {
-      if (!event.lengthComputable) return;
+      if (settled || !event.lengthComputable) return;
       if (onProgress) onProgress(event.loaded, event.total);
     };
 
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
-          resolve(JSON.parse(xhr.responseText));
+          resolveOnce(JSON.parse(xhr.responseText));
         } catch {
-          resolve(null);
+          resolveOnce(null);
         }
       } else if (xhr.status === 401) {
         window.dispatchEvent(new CustomEvent('session-expired', { detail: { path } }));
-        reject(new ApiError(401, { detail: 'Session expired' }));
+        rejectOnce(new ApiError(401, { detail: 'Session expired' }));
       } else {
         let body;
         try {
@@ -153,21 +165,26 @@ function xhrJson({ method, path, body, headers = {}, onProgress, signal }) {
         } catch {
           body = { detail: 'Upload failed' };
         }
-        reject(new ApiError(xhr.status, body));
+        rejectOnce(new ApiError(xhr.status, body));
       }
     };
 
-    xhr.onerror = () => reject(new Error('网络错误'));
-    xhr.onabort = () => reject(abortError());
+    xhr.onerror = () => rejectOnce(new Error('网络错误'));
+    xhr.onabort = () => rejectOnce(abortError());
     if (signal) {
       if (signal.aborted) {
-        reject(abortError());
+        rejectOnce(abortError());
         xhr.abort();
         return;
       }
-      signal.addEventListener('abort', () => xhr.abort(), { once: true });
+      abortHandler = () => xhr.abort();
+      signal.addEventListener('abort', abortHandler, { once: true });
     }
-    xhr.send(body);
+    try {
+      xhr.send(body);
+    } catch (error) {
+      rejectOnce(error);
+    }
   });
 }
 
