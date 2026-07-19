@@ -144,6 +144,73 @@ def test_resumable_upload_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.upload_progress_interval_seconds == 0.25
 
 
+def test_resumable_upload_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("UPLOAD_TOKEN", "secret")
+    monkeypatch.setenv("UPLOAD_CHUNK_SIZE_BYTES", "4096")
+    monkeypatch.setenv("UPLOAD_SESSION_TTL_SECONDS", "7200")
+    monkeypatch.setenv("UPLOAD_STORAGE_RESERVE_BYTES", "1024")
+    monkeypatch.setenv("MAX_ACTIVE_UPLOAD_SESSIONS", "32")
+    monkeypatch.setenv("MAX_CONCURRENT_CHUNK_HANDLERS", "4")
+    monkeypatch.setenv("UPLOAD_PROGRESS_INTERVAL_SECONDS", "0.5")
+
+    settings = Settings.from_env("uploads")
+
+    assert settings.upload_chunk_size_bytes == 4096
+    assert settings.upload_session_ttl_seconds == 7200
+    assert settings.upload_storage_reserve_bytes == 1024
+    assert settings.max_active_upload_sessions == 32
+    assert settings.max_concurrent_chunk_handlers == 4
+    assert settings.upload_progress_interval_seconds == 0.5
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "UPLOAD_CHUNK_SIZE_BYTES",
+        "UPLOAD_SESSION_TTL_SECONDS",
+        "MAX_ACTIVE_UPLOAD_SESSIONS",
+        "MAX_CONCURRENT_CHUNK_HANDLERS",
+    ],
+)
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_resumable_upload_positive_integer_settings_reject_non_positive_values(
+    monkeypatch: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    monkeypatch.setenv("UPLOAD_TOKEN", "secret")
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ConfigurationError, match=name):
+        Settings.from_env("uploads")
+
+
+def test_upload_storage_reserve_accepts_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("UPLOAD_TOKEN", "secret")
+    monkeypatch.setenv("UPLOAD_STORAGE_RESERVE_BYTES", "0")
+
+    assert Settings.from_env("uploads").upload_storage_reserve_bytes == 0
+
+
+def test_upload_storage_reserve_rejects_negative_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("UPLOAD_TOKEN", "secret")
+    monkeypatch.setenv("UPLOAD_STORAGE_RESERVE_BYTES", "-1")
+
+    with pytest.raises(ConfigurationError, match="UPLOAD_STORAGE_RESERVE_BYTES"):
+        Settings.from_env("uploads")
+
+
+@pytest.mark.parametrize("value", ["0", "-0.25", "nan", "Infinity", "-Infinity"])
+def test_upload_progress_interval_rejects_non_positive_and_non_finite_values(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("UPLOAD_TOKEN", "secret")
+    monkeypatch.setenv("UPLOAD_PROGRESS_INTERVAL_SECONDS", value)
+
+    with pytest.raises(ConfigurationError, match="UPLOAD_PROGRESS_INTERVAL_SECONDS"):
+        Settings.from_env("uploads")
+
+
 @pytest.mark.parametrize("token", [None, "", "   "])
 def test_settings_reject_missing_or_blank_upload_token_in_every_environment(
     monkeypatch: pytest.MonkeyPatch, token: str | None

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from hashlib import sha256
+from math import isfinite
 from pathlib import Path
 
 
@@ -83,7 +84,10 @@ class Settings:
             raise ConfigurationError("MAX_ACTIVE_UPLOAD_SESSIONS must be at least 1")
         if self.max_concurrent_chunk_handlers < 1:
             raise ConfigurationError("MAX_CONCURRENT_CHUNK_HANDLERS must be at least 1")
-        if self.upload_progress_interval_seconds <= 0:
+        if (
+            not isfinite(self.upload_progress_interval_seconds)
+            or self.upload_progress_interval_seconds <= 0
+        ):
             raise ConfigurationError("UPLOAD_PROGRESS_INTERVAL_SECONDS must be positive")
 
     @classmethod
