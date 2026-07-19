@@ -178,6 +178,11 @@ class MessageRepository:
         message_id = new_sortable_id()
         created_at = utc_now().isoformat()
         with self.db.transaction() as connection:
+            if connection.execute(
+                "SELECT 1 FROM upload_sessions WHERE client_request_id = ?",
+                (client_request_id,),
+            ).fetchone() is not None:
+                raise IdempotencyConflict(client_request_id)
             insertion = connection.execute(
                 "INSERT INTO messages "
                 "(id, kind, body, file_id, client_request_id, device_id, device_name, "
@@ -485,6 +490,11 @@ class MessageRepository:
     ) -> bool:
         owner_token = uuid4().hex
         with self.db.transaction() as connection:
+            if connection.execute(
+                "SELECT 1 FROM upload_sessions WHERE client_request_id = ?",
+                (client_request_id,),
+            ).fetchone() is not None:
+                return False
             insertion = connection.execute(
                 "INSERT INTO upload_reservations "
                 "(client_request_id, file_id, original_name, storage_name, mime_type, "

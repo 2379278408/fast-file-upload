@@ -74,6 +74,10 @@ SESSION_KEYS = (
     "status", "confirmed_bytes", "file_sha256", "message_id", "error_code",
     "publication_state", "created_at", "updated_at", "expires_at",
 )
+CREATE_METADATA_KEYS = (
+    "client_request_id", "source_device_id", "source_device_name", "original_name", "mime_type",
+    "size_bytes", "last_modified_ms", "sample_sha256", "chunk_size_bytes",
+)
 
 
 class UploadRepository:
@@ -103,17 +107,13 @@ class UploadRepository:
     def create_or_get(
         self, command: UploadCreate, now: datetime, ttl_seconds: int, max_active: int
     ) -> tuple[dict[str, object], bool]:
-        metadata = (
-            "client_request_id", "source_device_id", "source_device_name", "original_name", "mime_type",
-            "size_bytes", "last_modified_ms", "sample_sha256", "chunk_size_bytes",
-        )
         with self.db.transaction() as connection:
             existing = connection.execute(
                 "SELECT * FROM upload_sessions WHERE client_request_id = ?",
                 (command.client_request_id,),
             ).fetchone()
             if existing is not None:
-                if any(existing[key] != getattr(command, key) for key in metadata):
+                if any(existing[key] != getattr(command, key) for key in CREATE_METADATA_KEYS):
                     raise UploadConflict(command.client_request_id)
                 return self._session(connection, existing), False
             if connection.execute(
@@ -143,6 +143,20 @@ class UploadRepository:
                  self._expiry(now, ttl_seconds)),
             )
             return self._load(connection, upload_id), True
+
+    def get_by_client_request(
+        self, command: UploadCreate
+    ) -> dict[str, object] | None:
+        with self.db.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM upload_sessions WHERE client_request_id = ?",
+                (command.client_request_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            if any(row[key] != getattr(command, key) for key in CREATE_METADATA_KEYS):
+                raise UploadConflict(command.client_request_id)
+            return self._session(connection, row)
 
     def get(self, upload_id: str) -> dict[str, object] | None:
         with self.db.connect() as connection:

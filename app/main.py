@@ -122,6 +122,19 @@ class _KeyedLockCapacityExceeded(RuntimeError):
     pass
 
 
+class _KeyedLockLease:
+    def __init__(self, entry: _LockEntry) -> None:
+        self._entry = entry
+
+    @asynccontextmanager
+    async def hold(self):
+        await self._entry.lock.acquire()
+        try:
+            yield
+        finally:
+            self._entry.lock.release()
+
+
 class _KeyedLockPool:
     def __init__(self, max_entries: int = 1024) -> None:
         if max_entries < 1:
@@ -142,7 +155,7 @@ class _KeyedLockPool:
                 )
 
     @asynccontextmanager
-    async def hold(self, key: str):
+    async def reserve(self, key: str):
         self._bind_running_loop()
         entry = self._entries.get(key)
         if entry is None:
@@ -151,20 +164,21 @@ class _KeyedLockPool:
             entry = _LockEntry()
             self._entries[key] = entry
         entry.users += 1
-        acquired = False
         try:
-            await entry.lock.acquire()
-            acquired = True
-            yield
+            yield _KeyedLockLease(entry)
         finally:
-            if acquired:
-                entry.lock.release()
             entry.users -= 1
             if entry.users == 0 and self._entries.get(key) is entry:
                 del self._entries[key]
                 if not self._entries:
                     with self._binding_guard:
                         self._loop = None
+
+    @asynccontextmanager
+    async def hold(self, key: str):
+        async with self.reserve(key) as lease:
+            async with lease.hold():
+                yield
 
     async def run(self, key: str, operation, *args):
         async with self.hold(key):
@@ -930,12 +944,15 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(error)) from error
         except (ChunkSizeMismatch, ChunkDigestMismatch) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
+        except UploadStorageExceeded as error:
+            raise HTTPException(status_code=507, detail=str(error)) from error
         except OSError as error:
-            if error.errno == errno.ENOSPC:
-                raise HTTPException(
-                    status_code=507, detail="Insufficient storage capacity"
-                ) from error
-            raise
+            detail = (
+                "Insufficient storage capacity"
+                if error.errno == errno.ENOSPC
+                else "Upload storage operation failed"
+            )
+            raise HTTPException(status_code=507, detail=detail) from error
         except (UploadConflict, PartConflict) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         except UploadStateConflict as error:
@@ -993,6 +1010,8 @@ def create_app(settings: Settings) -> FastAPI:
             if detail == "complete uploads cannot be cancelled":
                 detail = "Completed uploads cannot be cancelled"
             raise HTTPException(status_code=409, detail=detail) from error
+        except UploadStorageExceeded as error:
+            raise HTTPException(status_code=507, detail=str(error)) from error
         except _KeyedLockCapacityExceeded as error:
             raise HTTPException(
                 status_code=503, detail="Too many active upload operations"

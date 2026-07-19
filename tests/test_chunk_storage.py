@@ -254,6 +254,30 @@ def test_discard_incoming_skips_symlink_and_preserves_target(tmp_path: Path) -> 
     assert target.read_bytes() == b"kept"
 
 
+def test_discard_and_cleanup_tolerate_file_not_found_races(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = ChunkStorage(tmp_path)
+    upload_id = "a" * 32
+    session_dir = storage.part_path(upload_id, 0).parent
+    session_dir.mkdir(parents=True)
+    part_path = storage.part_path(upload_id, 0)
+    part_path.write_bytes(b"data")
+    original_unlink = Path.unlink
+
+    def racing_unlink(path: Path, *args, **kwargs) -> None:
+        original_unlink(path, *args, **kwargs)
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(Path, "unlink", racing_unlink)
+    storage.discard_part(upload_id, 0)
+
+    child = session_dir / f"incoming-000000-{'b' * 32}"
+    child.write_bytes(b"data")
+    storage.cleanup_session(upload_id)
+    storage.cleanup_session(upload_id)
+
+
 def test_concurrent_different_part_cannot_overwrite_confirmed(tmp_path: Path) -> None:
     storage = ChunkStorage(tmp_path, buffer_size=2)
     upload_id = "2" * 32

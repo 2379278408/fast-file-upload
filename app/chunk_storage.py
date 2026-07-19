@@ -67,7 +67,6 @@ class ChunkStorage:
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         if self.resumable_dir.is_symlink():
             raise ValueError("Resumable storage cannot be a symbolic link")
-        self.resumable_dir.mkdir(exist_ok=True)
 
     def _session_dir(self, upload_id: str) -> Path:
         _validate_key(upload_id, 0)
@@ -274,17 +273,28 @@ class ChunkStorage:
                 candidate.unlink(missing_ok=True)
 
     def discard_part(self, upload_id: str, part_index: int) -> None:
-        self.part_path(upload_id, part_index).unlink(missing_ok=True)
+        try:
+            self.part_path(upload_id, part_index).unlink(missing_ok=True)
+        except FileNotFoundError:
+            pass
 
     def cleanup_session(self, upload_id: str) -> None:
         session_dir = self._session_dir(upload_id)
-        if not session_dir.exists():
+        try:
+            children = list(session_dir.iterdir())
+        except FileNotFoundError:
             return
-        for child in session_dir.iterdir():
+        for child in children:
             if child.is_dir() and not child.is_symlink():
                 raise ValueError("Unexpected directory in upload session")
-            child.unlink()
-        session_dir.rmdir()
+            try:
+                child.unlink()
+            except FileNotFoundError:
+                pass
+        try:
+            session_dir.rmdir()
+        except FileNotFoundError:
+            pass
 
     def reconcile(
         self,
@@ -297,6 +307,8 @@ class ChunkStorage:
             _validate_key(upload_id, part_index)
 
         orphan_sessions: set[str] = set()
+        if not self.resumable_dir.exists():
+            return StorageReconcileResult(set(confirmed), set())
         for session_dir in self.resumable_dir.iterdir():
             if session_dir.is_symlink() or not session_dir.is_dir():
                 continue

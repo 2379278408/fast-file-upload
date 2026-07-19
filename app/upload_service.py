@@ -29,6 +29,7 @@ CONTENT_RANGE_PATTERN = re.compile(r"^bytes ([0-9]+)-([0-9]+)/([0-9]+)$")
 
 class UploadLockPool(Protocol):
     def hold(self, key: str): ...
+    def reserve(self, key: str): ...
 
 
 class InvalidUploadPart(ValueError):
@@ -76,6 +77,7 @@ class UploadService:
         self.chunks = chunks
         self.settings = settings
         self.upload_locks = upload_locks
+        self._writers: dict[str, int] = {}
 
     def _result(self, session: dict[str, object]) -> dict[str, object]:
         result = dict(session)
@@ -98,21 +100,36 @@ class UploadService:
     def create(
         self, command: UploadCreate, device: SessionData, now: datetime
     ) -> dict[str, object]:
-        if command.size_bytes > self.settings.max_upload_size:
-            raise UploadTooLarge("Upload exceeds the configured size limit")
-        free_bytes = shutil.disk_usage(Path(self.settings.upload_dir)).free
-        if free_bytes - self.settings.upload_storage_reserve_bytes < command.size_bytes:
-            raise UploadStorageExceeded("Insufficient storage capacity")
-        extension = Path(sanitize_filename(command.original_name)).suffix.lower()
-        if self.settings.allowed_extensions and extension not in self.settings.allowed_extensions:
-            allowed = ", ".join(sorted(self.settings.allowed_extensions))
-            raise ValueError(f"File type not allowed. Allowed types: {allowed}")
+        sanitized_name = sanitize_filename(command.original_name)
+        if (
+            not command.original_name.strip()
+            or (
+                sanitized_name == "unnamed-file"
+                and command.original_name.strip() != "unnamed-file"
+            )
+        ):
+            raise ValueError("Upload name must contain valid filename characters")
         effective = replace(
             command,
-            original_name=sanitize_filename(command.original_name),
+            original_name=sanitized_name,
             source_device_id=device.device_id,
             source_device_name=device.device_name,
         )
+        replay = self.repository.get_by_client_request(effective)
+        if replay is not None:
+            return self._result(replay)
+        if command.size_bytes > self.settings.max_upload_size:
+            raise UploadTooLarge("Upload exceeds the configured size limit")
+        try:
+            free_bytes = shutil.disk_usage(Path(self.settings.upload_dir)).free
+        except OSError as error:
+            raise UploadStorageExceeded("Storage capacity check failed") from error
+        if free_bytes - self.settings.upload_storage_reserve_bytes < command.size_bytes:
+            raise UploadStorageExceeded("Insufficient storage capacity")
+        extension = Path(sanitized_name).suffix.lower()
+        if self.settings.allowed_extensions and extension not in self.settings.allowed_extensions:
+            allowed = ", ".join(sorted(self.settings.allowed_extensions))
+            raise ValueError(f"File type not allowed. Allowed types: {allowed}")
         session, _ = self.repository.create_or_get(
             effective,
             now,
@@ -134,44 +151,77 @@ class UploadService:
     ) -> dict[str, object]:
         if SHA256_PATTERN.fullmatch(chunk_sha256) is None:
             raise InvalidUploadPart("Invalid chunk SHA-256")
-        async with self.upload_locks.hold(upload_id):
-            session = self._authorized(upload_id, device, source_only=True)
-            start, end, size = parse_content_range(
-                content_range,
-                int(session["size_bytes"]),
-                part_index,
-                int(session["chunk_size_bytes"]),
-            )
-            lease = self.repository.begin_part(
-                upload_id, part_index, start, end, size, chunk_sha256
-            )
-            if isinstance(lease, dict):
-                return self._result(lease)
+        async with self.upload_locks.reserve(upload_id) as reservation:
+            writer_registered = False
+            cancelled_conflict = False
+            try:
+                async with reservation.hold():
+                    session = self._authorized(upload_id, device, source_only=True)
+                    start, end, size = parse_content_range(
+                        content_range,
+                        int(session["size_bytes"]),
+                        part_index,
+                        int(session["chunk_size_bytes"]),
+                    )
+                    lease = self.repository.begin_part(
+                        upload_id, part_index, start, end, size, chunk_sha256
+                    )
+                    if isinstance(lease, dict):
+                        return self._result(lease)
+                    self._writers[upload_id] = self._writers.get(upload_id, 0) + 1
+                    writer_registered = True
 
-        stored = await self.chunks.write_part(
-            upload_id, part_index, chunks, size, chunk_sha256, on_bytes
-        )
+                stored = await self.chunks.write_part(
+                    upload_id, part_index, chunks, size, chunk_sha256, on_bytes
+                )
 
-        async with self.upload_locks.hold(upload_id):
-            current = self.repository.get(upload_id)
-            if current is None or current["status"] in {"cancelled", "expired"}:
-                await asyncio.to_thread(self.chunks.discard_part, upload_id, part_index)
-                raise UploadStateConflict("Upload no longer accepts chunks")
-            confirmed = self.repository.confirm_part(
-                lease,
-                PartRecord(
-                    upload_id,
-                    part_index,
-                    start,
-                    end,
-                    stored.size_bytes,
-                    stored.sha256,
-                    now.isoformat(),
-                ),
-                now,
-                self.settings.upload_session_ttl_seconds,
-            )
-            return self._result(confirmed)
+                async with reservation.hold():
+                    current = self.repository.get(upload_id)
+                    if current is None or current["status"] in {"cancelled", "expired"}:
+                        cancelled_conflict = True
+                        try:
+                            await asyncio.to_thread(
+                                self.chunks.discard_part, upload_id, part_index
+                            )
+                        except OSError:
+                            pass
+                        raise UploadStateConflict("Upload no longer accepts chunks")
+                    confirmed = self.repository.confirm_part(
+                        lease,
+                        PartRecord(
+                            upload_id,
+                            part_index,
+                            start,
+                            end,
+                            stored.size_bytes,
+                            stored.sha256,
+                            now.isoformat(),
+                        ),
+                        now,
+                        self.settings.upload_session_ttl_seconds,
+                    )
+                    return self._result(confirmed)
+            except OSError as error:
+                raise UploadStorageExceeded("Upload storage operation failed") from error
+            finally:
+                if writer_registered:
+                    async with reservation.hold():
+                        remaining = self._writers[upload_id] - 1
+                        if remaining:
+                            self._writers[upload_id] = remaining
+                        else:
+                            del self._writers[upload_id]
+                            current = self.repository.get(upload_id)
+                            if current is not None and current["status"] == "cancelled":
+                                try:
+                                    await asyncio.to_thread(
+                                        self.chunks.cleanup_session, upload_id
+                                    )
+                                except OSError as error:
+                                    if not cancelled_conflict:
+                                        raise UploadStorageExceeded(
+                                            "Upload cleanup failed"
+                                        ) from error
 
     def control(
         self,
@@ -195,11 +245,14 @@ class UploadService:
         self, upload_id: str, device: SessionData, now: datetime
     ) -> dict[str, object]:
         self._authorized(upload_id, device)
-        session, changed = self.repository.cancel(
+        session, _ = self.repository.cancel(
             upload_id, now, self.settings.upload_session_ttl_seconds
         )
-        if changed:
-            self.chunks.cleanup_session(upload_id)
+        if self._writers.get(upload_id, 0) == 0:
+            try:
+                self.chunks.cleanup_session(upload_id)
+            except OSError as error:
+                raise UploadStorageExceeded("Upload cleanup failed") from error
         return self._result(session)
 
     def get(self, upload_id: str, device: SessionData) -> dict[str, object]:

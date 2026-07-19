@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import errno
+import time
 import threading
 from hashlib import sha256
 
@@ -186,6 +188,166 @@ def test_create_upload_maps_active_and_storage_capacity(
     assert storage.status_code == 507
 
 
+def test_create_upload_storage_check_error_returns_507(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = authenticated_client(settings)
+
+    def failed_capacity_check(path) -> None:
+        raise OSError(errno.EIO, "Storage failure")
+
+    monkeypatch.setattr("app.upload_service.shutil.disk_usage", failed_capacity_check)
+    response = client.post(
+        "/api/uploads",
+        json={
+            "client_request_id": "storage-error",
+            "name": "report.txt",
+            "size_bytes": 4,
+            "mime_type": "text/plain",
+            "last_modified_ms": 1,
+            "chunk_size_bytes": settings.upload_chunk_size_bytes,
+            "sample_sha256": sha256(b"sample").hexdigest(),
+        },
+    )
+    assert response.status_code == 507
+
+
+def test_create_upload_replay_precedes_current_storage_and_extension_policy(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = authenticated_client(settings)
+    created = create_upload(client)
+    settings.allowed_extensions = {".md"}
+    monkeypatch.setattr(
+        "app.upload_service.shutil.disk_usage",
+        lambda _: type("Usage", (), {"free": 0})(),
+    )
+    replay = create_upload(client)
+    assert replay == created
+
+
+@pytest.mark.parametrize("name", ["report.exe", "   ", "@@@"])
+def test_create_upload_rejects_extension_or_empty_sanitized_name(
+    settings: Settings, name: str
+) -> None:
+    client = authenticated_client(settings)
+    response = client.post(
+        "/api/uploads",
+        json={
+            "client_request_id": "invalid-name",
+            "name": name,
+            "size_bytes": 4,
+            "mime_type": "text/plain",
+            "last_modified_ms": 1,
+            "chunk_size_bytes": settings.upload_chunk_size_bytes,
+            "sample_sha256": sha256(b"sample").hexdigest(),
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_resumable_and_legacy_uploads_conflict_in_both_orders(settings: Settings) -> None:
+    first_app = create_app(settings)
+    first = authenticated_client(settings, app=first_app)
+    create_upload(first, request_id="resumable-first")
+    legacy_conflict = first.post(
+        "/api/upload",
+        data={"client_request_id": "resumable-first"},
+        files={"file": ("report.txt", b"data", "text/plain")},
+    )
+    assert legacy_conflict.status_code == 409
+
+    second_settings = Settings(
+        **{
+            field: getattr(settings, field)
+            for field in settings.__dataclass_fields__
+            if field not in {"upload_dir", "database_path"}
+        },
+        upload_dir=settings.upload_dir.parent / "legacy-first",
+        database_path=settings.database_path.parent / "legacy-first.sqlite3",
+    )
+    second = authenticated_client(second_settings)
+    legacy = second.post(
+        "/api/upload",
+        data={"client_request_id": "legacy-first"},
+        files={"file": ("report.txt", b"data", "text/plain")},
+    )
+    assert legacy.status_code == 200
+    resumable_conflict = second.post(
+        "/api/uploads",
+        json={
+            "client_request_id": "legacy-first",
+            "name": "report.txt",
+            "size_bytes": 4,
+            "mime_type": "text/plain",
+            "last_modified_ms": 1,
+            "chunk_size_bytes": second_settings.upload_chunk_size_bytes,
+            "sample_sha256": sha256(b"sample").hexdigest(),
+        },
+    )
+    assert resumable_conflict.status_code == 409
+
+
+def test_resumable_and_legacy_uploads_serialize_concurrent_request_id(
+    settings: Settings,
+) -> None:
+    app = create_app(settings)
+    original_stage = app.state.storage.stage_upload
+    staged = threading.Event()
+    release = threading.Event()
+
+    def blocked_stage(*args, **kwargs):
+        pending = original_stage(*args, **kwargs)
+        staged.set()
+        assert release.wait(timeout=2)
+        return pending
+
+    app.state.storage.stage_upload = blocked_stage
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/session",
+            json={
+                "access_token": settings.auth_token,
+                "device_id": "source",
+                "device_name": "source",
+            },
+        ).status_code == 200
+        results: dict[str, object] = {}
+
+        def legacy_request() -> None:
+            results["legacy"] = client.post(
+                "/api/upload",
+                data={"client_request_id": "concurrent"},
+                files={"file": ("report.txt", b"data", "text/plain")},
+            )
+
+        def resumable_request() -> None:
+            results["resumable"] = client.post(
+                "/api/uploads",
+                json={
+                    "client_request_id": "concurrent",
+                    "name": "report.txt",
+                    "size_bytes": 4,
+                    "mime_type": "text/plain",
+                    "last_modified_ms": 1,
+                    "chunk_size_bytes": settings.upload_chunk_size_bytes,
+                    "sample_sha256": sha256(b"sample").hexdigest(),
+                },
+            )
+
+        legacy_thread = threading.Thread(target=legacy_request)
+        resumable_thread = threading.Thread(target=resumable_request)
+        legacy_thread.start()
+        assert staged.wait(timeout=2)
+        resumable_thread.start()
+        time.sleep(0.05)
+        release.set()
+        legacy_thread.join(timeout=2)
+        resumable_thread.join(timeout=2)
+    assert results["legacy"].status_code == 200
+    assert results["resumable"].status_code == 409
+
+
 def test_first_confirmed_chunk_changes_queued_to_uploading(settings: Settings) -> None:
     client = authenticated_client(settings, device_id="source")
     upload = create_upload(client)
@@ -243,13 +405,16 @@ def test_chunk_rejects_body_size_and_digest_mismatch(settings: Settings) -> None
     assert wrong_digest.status_code == 400
 
 
-def test_chunk_storage_capacity_error_returns_507(settings: Settings) -> None:
+@pytest.mark.parametrize("error_number", [errno.ENOSPC, errno.EIO])
+def test_chunk_storage_errors_return_507(
+    settings: Settings, error_number: int
+) -> None:
     app = create_app(settings)
     client = authenticated_client(settings, app=app)
     upload = create_upload(client)
 
     async def storage_full(*args, **kwargs):
-        raise OSError(errno.ENOSPC, "No space left on device")
+        raise OSError(error_number, "Storage failure")
 
     app.state.upload_service.chunks.write_part = storage_full
     response = client.put(
@@ -354,6 +519,25 @@ def test_cancel_is_idempotent_and_missing_upload_is_404(settings: Settings) -> N
     assert missing.status_code == 404
 
 
+def test_cancel_cleanup_storage_error_returns_507_after_persisting_state(
+    settings: Settings,
+) -> None:
+    app = create_app(settings)
+    client = authenticated_client(settings, app=app)
+    upload = create_upload(client)
+    original_cleanup = app.state.upload_service.chunks.cleanup_session
+
+    def cleanup_failure(upload_id: str) -> None:
+        raise OSError(errno.EIO, "Storage failure")
+
+    app.state.upload_service.chunks.cleanup_session = cleanup_failure
+    response = client.delete(f"/api/uploads/{upload['upload_id']}")
+    assert response.status_code == 507
+    assert app.state.upload_repository.get(str(upload["upload_id"]))["status"] == "cancelled"
+    app.state.upload_service.chunks.cleanup_session = original_cleanup
+    assert client.delete(f"/api/uploads/{upload['upload_id']}").status_code == 200
+
+
 def test_active_uploads_are_visible_to_observer(settings: Settings) -> None:
     app = create_app(settings)
     source = authenticated_client(settings, app=app, device_id="source")
@@ -381,38 +565,47 @@ def test_upload_cors_preflight_allows_put_and_patch(settings: Settings) -> None:
 
 def test_pause_can_win_while_chunk_body_streams(settings: Settings) -> None:
     app = create_app(settings)
-    source = authenticated_client(settings, app=app)
-    upload = create_upload(source)
     started = threading.Event()
     release = threading.Event()
     original_write = app.state.upload_service.chunks.write_part
 
     async def blocked_write(*args, **kwargs):
         started.set()
-        assert release.wait(timeout=2)
+        while not release.is_set():
+            await asyncio.sleep(0.001)
         return await original_write(*args, **kwargs)
 
     app.state.upload_service.chunks.write_part = blocked_write
     result: dict[str, object] = {}
-
-    def upload_part() -> None:
-        result["response"] = source.put(
-            f"/api/uploads/{upload['upload_id']}/parts/0",
-            content=b"data",
-            headers={
-                "Content-Range": "bytes 0-3/4",
-                "X-Chunk-SHA256": sha256(b"data").hexdigest(),
+    with TestClient(app) as source:
+        assert source.post(
+            "/api/session",
+            json={
+                "access_token": settings.auth_token,
+                "device_id": "source",
+                "device_name": "source",
             },
-        )
+        ).status_code == 200
+        upload = create_upload(source)
 
-    thread = threading.Thread(target=upload_part)
-    thread.start()
-    assert started.wait(timeout=2)
-    paused = source.patch(
-        f"/api/uploads/{upload['upload_id']}", json={"action": "pause"}
-    )
-    release.set()
-    thread.join(timeout=2)
+        def upload_part() -> None:
+            result["response"] = source.put(
+                f"/api/uploads/{upload['upload_id']}/parts/0",
+                content=b"data",
+                headers={
+                    "Content-Range": "bytes 0-3/4",
+                    "X-Chunk-SHA256": sha256(b"data").hexdigest(),
+                },
+            )
+
+        thread = threading.Thread(target=upload_part)
+        thread.start()
+        assert started.wait(timeout=2)
+        paused = source.patch(
+            f"/api/uploads/{upload['upload_id']}", json={"action": "pause"}
+        )
+        release.set()
+        thread.join(timeout=2)
     assert paused.status_code == 200
     assert result["response"].status_code == 200
     assert result["response"].json()["status"] == "paused"
@@ -421,42 +614,83 @@ def test_pause_can_win_while_chunk_body_streams(settings: Settings) -> None:
 def test_cancel_can_win_while_chunk_body_streams_and_discards_part(
     settings: Settings,
 ) -> None:
+    settings.client_request_lock_capacity = 1
     app = create_app(settings)
-    source = authenticated_client(settings, app=app)
-    upload = create_upload(source)
     started = threading.Event()
     release = threading.Event()
     original_write = app.state.upload_service.chunks.write_part
 
-    async def blocked_write(*args, **kwargs):
-        started.set()
-        assert release.wait(timeout=2)
-        return await original_write(*args, **kwargs)
+    async def blocked_write(
+        upload_id, part_index, chunks, expected_size, expected_sha256, on_bytes=None
+    ):
+        async def after_real_write(count: int) -> None:
+            assert list(
+                app.state.upload_service.chunks
+                .part_path(upload_id, part_index)
+                .parent.glob("incoming-*")
+            )
+            started.set()
+            while not release.is_set():
+                await asyncio.sleep(0.001)
+
+        return await original_write(
+            upload_id,
+            part_index,
+            chunks,
+            expected_size,
+            expected_sha256,
+            after_real_write,
+        )
 
     app.state.upload_service.chunks.write_part = blocked_write
     result: dict[str, object] = {}
+    with TestClient(app, raise_server_exceptions=False) as source:
+        assert source.post(
+            "/api/session",
+            json={
+                "access_token": settings.auth_token,
+                "device_id": "source",
+                "device_name": "source",
+            },
+        ).status_code == 200
+        upload = create_upload(source)
 
-    def upload_part() -> None:
-        result["response"] = source.put(
-            f"/api/uploads/{upload['upload_id']}/parts/0",
-            content=b"data",
-            headers={
-                "Content-Range": "bytes 0-3/4",
-                "X-Chunk-SHA256": sha256(b"data").hexdigest(),
+        def upload_part() -> None:
+            result["response"] = source.put(
+                f"/api/uploads/{upload['upload_id']}/parts/0",
+                content=b"data",
+                headers={
+                    "Content-Range": "bytes 0-3/4",
+                    "X-Chunk-SHA256": sha256(b"data").hexdigest(),
+                },
+            )
+
+        thread = threading.Thread(target=upload_part)
+        thread.start()
+        assert started.wait(timeout=2)
+        session_dir = app.state.upload_service.chunks.part_path(
+            str(upload["upload_id"]), 0
+        ).parent
+        assert list(session_dir.glob("incoming-*"))
+        capacity = source.post(
+            "/api/uploads",
+            json={
+                "client_request_id": "other-key",
+                "name": "other.txt",
+                "size_bytes": 4,
+                "mime_type": "text/plain",
+                "last_modified_ms": 1,
+                "chunk_size_bytes": settings.upload_chunk_size_bytes,
+                "sample_sha256": sha256(b"sample").hexdigest(),
             },
         )
-
-    thread = threading.Thread(target=upload_part)
-    thread.start()
-    assert started.wait(timeout=2)
-    cancelled = source.delete(f"/api/uploads/{upload['upload_id']}")
-    release.set()
-    thread.join(timeout=2)
+        cancelled = source.delete(f"/api/uploads/{upload['upload_id']}")
+        release.set()
+        thread.join(timeout=2)
     assert cancelled.status_code == 200
+    assert capacity.status_code == 503
     assert result["response"].status_code == 409
-    assert not app.state.upload_service.chunks.part_path(
-        str(upload["upload_id"]), 0
-    ).exists()
+    assert not session_dir.exists()
 
 
 def test_complete_upload_cancellation_returns_409(settings: Settings) -> None:

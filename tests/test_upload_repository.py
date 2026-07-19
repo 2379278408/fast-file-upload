@@ -78,6 +78,18 @@ def test_create_payload_id_and_metadata_replay(repository, upload_command, clock
     }
 
 
+def test_get_by_client_request_validates_replay_metadata(
+    repository, upload_command, clock
+) -> None:
+    session, _ = repository.create_or_get(upload_command, clock(), 86_400, 128)
+    assert repository.get_by_client_request(upload_command) == session
+    assert repository.get_by_client_request(
+        replace(upload_command, client_request_id="missing")
+    ) is None
+    with pytest.raises(UploadConflict):
+        repository.get_by_client_request(replace(upload_command, size_bytes=9))
+
+
 def test_create_metadata_and_cross_table_conflicts(repository, upload_command, clock) -> None:
     repository.create_or_get(upload_command, clock(), 86_400, 128)
     with pytest.raises(UploadConflict):
