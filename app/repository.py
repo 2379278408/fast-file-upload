@@ -82,8 +82,14 @@ class MessageRepository:
             "device_name": row["device_name"],
             "created_at": row["created_at"],
             "deleted_at": row["deleted_at"],
+            "upload_id": None,
             "file": None,
         }
+        upload_row = connection.execute(
+            "SELECT id FROM upload_sessions WHERE message_id = ?", (row["id"],)
+        ).fetchone()
+        if upload_row is not None:
+            payload["upload_id"] = upload_row["id"]
         if row["file_id"] is not None:
             file_row = connection.execute(
                 "SELECT * FROM files WHERE id = ?", (row["file_id"],)
@@ -847,6 +853,9 @@ class MessageRepository:
             "sha256": file_row["sha256"],
             "created_at": file_row["created_at"],
             "purged_at": file_row["purged_at"],
+            "purge_state": file_row["purge_state"],
+            "purge_claimed_at": file_row["purge_claimed_at"],
+            "purge_claim_token": file_row["purge_claim_token"],
             "name": file_row["original_name"],
             "size": format_size(file_row["size_bytes"]),
             "media_kind": "image" if extension in IMAGE_EXTENSIONS else "document",
@@ -1082,7 +1091,8 @@ class MessageRepository:
         self._validate_limit(limit)
         with self.db.connect() as connection:
             rows = connection.execute(
-                "SELECT m.* FROM messages AS m "
+                "SELECT m.*, u.id AS upload_id FROM messages AS m "
+                "LEFT JOIN upload_sessions AS u ON u.message_id = m.id "
                 "WHERE m.deleted_at IS NULL "
                 "AND (? IS NULL OR (m.created_at, m.id) < "
                 "(SELECT created_at, id FROM messages WHERE id = ?)) "
@@ -1112,6 +1122,7 @@ class MessageRepository:
             "device_name": row["device_name"],
             "created_at": row["created_at"],
             "deleted_at": row["deleted_at"],
+            "upload_id": row["upload_id"],
             "file": None,
         }
         if row["file_id"] is not None:
@@ -1133,8 +1144,9 @@ class MessageRepository:
         pattern = f"%{self._escape_like(normalized)}%"
         with self.db.connect() as connection:
             rows = connection.execute(
-                "SELECT m.* FROM messages AS m "
+                "SELECT m.*, u.id AS upload_id FROM messages AS m "
                 "LEFT JOIN files AS f ON f.id = m.file_id "
+                "LEFT JOIN upload_sessions AS u ON u.message_id = m.id "
                 "WHERE m.deleted_at IS NULL "
                 "AND (m.body LIKE ? ESCAPE '\\' OR f.original_name LIKE ? ESCAPE '\\') "
                 "AND (? IS NULL OR (m.created_at, m.id) < "

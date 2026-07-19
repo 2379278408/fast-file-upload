@@ -4,6 +4,7 @@ import asyncio
 import errno
 import time
 import threading
+from datetime import datetime, timezone
 from hashlib import sha256
 
 import pytest
@@ -11,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.config import Settings
+from app.database import Database
 from app.main import create_app
 
 
@@ -38,12 +40,13 @@ def create_upload(
     request_id: str = "request-1",
     content: bytes = b"data",
     chunk_size: int = 8 * 1024 * 1024,
+    name: str = "report.txt",
 ) -> dict[str, object]:
     response = client.post(
         "/api/uploads",
         json={
             "client_request_id": request_id,
-            "name": "report.txt",
+            "name": name,
             "size_bytes": len(content),
             "mime_type": "text/plain",
             "last_modified_ms": 1_784_412_345_000,
@@ -81,6 +84,443 @@ def put_single_part(
     client: TestClient, upload: dict[str, object], content: bytes
 ) -> dict[str, object]:
     return put_part(client, upload, 0, content)
+
+
+def test_complete_computes_server_hash_and_returns_one_permanent_message(
+    settings: Settings,
+) -> None:
+    client = authenticated_client(settings, device_id="source")
+    content = b"abcdefgh"
+    upload = create_upload(
+        client, request_id="complete-1", content=content, chunk_size=4
+    )
+    put_part(client, upload, 0, content[:4])
+    put_part(client, upload, 1, content[4:])
+
+    first = client.post(f"/api/uploads/{upload['upload_id']}/complete", json={})
+    replay = client.post(f"/api/uploads/{upload['upload_id']}/complete", json={})
+
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert first.json()["file"]["sha256"] == sha256(content).hexdigest()
+    assert first.json()["upload_id"] == upload["upload_id"]
+    messages = client.get("/api/messages?limit=50").json()["items"]
+    assert messages.count(first.json()) == 1
+
+
+def test_complete_preserves_sanitized_filename_metadata(settings: Settings) -> None:
+    client = authenticated_client(settings, device_id="source")
+    content = b"filename"
+    upload = create_upload(client, content=content, name="my  report.txt")
+    put_single_part(client, upload, content)
+
+    response = client.post(f"/api/uploads/{upload['upload_id']}/complete", json={})
+
+    assert response.status_code == 200
+    assert response.json()["file"]["original_name"] == "my  report.txt"
+
+
+def test_restart_recovers_file_published_session_without_duplicate_message(
+    settings: Settings,
+) -> None:
+    content = b"recover-me"
+    upload_id = "d" * 32
+    now = datetime(2026, 7, 19, tzinfo=timezone.utc)
+    settings.upload_dir.mkdir(parents=True)
+    (settings.upload_dir / f"{upload_id}_report.txt").write_bytes(content)
+    database = Database(settings.database_path)
+    database.initialize()
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO upload_sessions "
+            "(id, client_request_id, source_device_id, source_device_name, original_name, mime_type, size_bytes, "
+            "last_modified_ms, sample_sha256, chunk_size_bytes, status, confirmed_bytes, "
+            "file_sha256, message_id, error_code, publication_state, created_at, updated_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)",
+            (
+                upload_id,
+                "recover-request",
+                "source",
+                "Source device",
+                "report.txt",
+                "text/plain",
+                len(content),
+                1_784_412_345_000,
+                sha256(b"sample").hexdigest(),
+                8 * 1024 * 1024,
+                "verifying",
+                len(content),
+                sha256(content).hexdigest(),
+                "file_published",
+                now.isoformat(),
+                now.isoformat(),
+                "2026-07-20T00:00:00+00:00",
+            ),
+        )
+
+    app = create_app(settings)
+    app.state.clock = lambda: now
+    with authenticated_client(
+        settings, app=app, device_id="source"
+    ) as client:
+        active = client.get("/api/uploads/active").json()
+        messages = client.get("/api/messages?limit=50").json()["items"]
+
+    assert active == []
+    assert len([item for item in messages if item.get("upload_id")]) == 1
+
+
+def test_published_file_is_unavailable_until_database_finalization(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_app(settings)
+    client = TestClient(app, raise_server_exceptions=False)
+    assert client.post(
+        "/api/session",
+        json={
+            "access_token": settings.auth_token,
+            "device_id": "source",
+            "device_name": "source",
+        },
+    ).status_code == 200
+    upload = create_upload(client, content=b"data")
+    put_single_part(client, upload, b"data")
+
+    def fail_finalize(*args, **kwargs):
+        raise RuntimeError("injected database finalization failure")
+
+    monkeypatch.setattr(
+        app.state.upload_repository, "finalize_publication", fail_finalize
+    )
+    response = client.post(
+        f"/api/uploads/{upload['upload_id']}/complete", json={}
+    )
+
+    assert response.status_code == 500
+    assert client.get(f"/download/{upload['upload_id']}").status_code == 404
+    assert app.state.upload_repository.get(str(upload["upload_id"]))[
+        "publication_state"
+    ] == "file_published"
+
+
+@pytest.mark.parametrize(
+    "failure_point, expected_state",
+    (
+        ("assembled", "assembled"),
+        ("renamed", "assembled"),
+        ("database", "file_published"),
+    ),
+)
+def test_restart_recovers_each_publication_failure_to_one_message(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+    expected_state: str,
+) -> None:
+    content = f"failure-{failure_point}".encode()
+    app = create_app(settings)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert client.post(
+            "/api/session",
+            json={
+                "access_token": settings.auth_token,
+                "device_id": "source",
+                "device_name": "source",
+            },
+        ).status_code == 200
+        upload = create_upload(
+            client,
+            request_id=f"failure-{failure_point}",
+            content=content,
+            chunk_size=4,
+        )
+        for index in range(0, len(content), 4):
+            put_part(client, upload, index // 4, content[index : index + 4])
+
+        if failure_point == "assembled":
+            original = app.state.upload_repository.set_publication_state
+
+            def fail_after_assembled(upload_id, state, digest, now, ttl):
+                result = original(upload_id, state, digest, now, ttl)
+                if state == "assembled":
+                    raise RuntimeError("injected failure after assembly")
+                return result
+
+            monkeypatch.setattr(
+                app.state.upload_repository,
+                "set_publication_state",
+                fail_after_assembled,
+            )
+        elif failure_point == "renamed":
+            original_publish = app.state.upload_service.storage.publish
+
+            def fail_after_rename(pending):
+                original_publish(pending)
+                raise RuntimeError("injected failure after final rename")
+
+            monkeypatch.setattr(
+                app.state.upload_service.storage, "publish", fail_after_rename
+            )
+        else:
+            monkeypatch.setattr(
+                app.state.upload_repository,
+                "finalize_publication",
+                lambda *args, **kwargs: (_ for _ in ()).throw(
+                    RuntimeError("injected database finalization failure")
+                ),
+            )
+
+        failed = client.post(
+            f"/api/uploads/{upload['upload_id']}/complete", json={}
+        )
+        assert failed.status_code == 500
+        assert client.get(f"/download/{upload['upload_id']}").status_code == 404
+        assert app.state.upload_repository.get(str(upload["upload_id"]))[
+            "publication_state"
+        ] == expected_state
+
+    monkeypatch.undo()
+    recovered_app = create_app(settings)
+    with authenticated_client(
+        settings, app=recovered_app, device_id="source"
+    ) as recovered:
+        messages = recovered.get("/api/messages?limit=50").json()["items"]
+        linked = [
+            item
+            for item in messages
+            if item.get("upload_id") == upload["upload_id"]
+        ]
+        assert len(linked) == 1
+        assert recovered.get(f"/download/{upload['upload_id']}").content == content
+        replay = recovered.post(
+            f"/api/uploads/{upload['upload_id']}/complete", json={}
+        )
+        assert replay.status_code == 200
+        assert replay.json() == linked[0]
+
+
+def test_restart_reconciles_missing_confirmed_part(settings: Settings) -> None:
+    app = create_app(settings)
+    client = authenticated_client(settings, app=app)
+    upload = create_upload(client, content=b"data")
+    put_single_part(client, upload, b"data")
+    app.state.chunk_storage.part_path(str(upload["upload_id"]), 0).unlink()
+
+    restarted = create_app(settings)
+    with authenticated_client(settings, app=restarted) as recovered:
+        session = recovered.get(f"/api/uploads/{upload['upload_id']}").json()
+
+    assert session["status"] == "failed"
+    assert session["error_code"] == "missing_part"
+    assert session["confirmed_bytes"] == 0
+    assert session["confirmed_parts"] == []
+
+
+def test_restart_uses_file_published_state_when_confirmed_part_is_missing(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"durable-final"
+    app = create_app(settings)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert client.post(
+            "/api/session",
+            json={
+                "access_token": settings.auth_token,
+                "device_id": "source",
+                "device_name": "source",
+            },
+        ).status_code == 200
+        upload = create_upload(client, content=content)
+        put_single_part(client, upload, content)
+        monkeypatch.setattr(
+            app.state.upload_repository,
+            "finalize_publication",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("injected database finalization failure")
+            ),
+        )
+        assert client.post(
+            f"/api/uploads/{upload['upload_id']}/complete", json={}
+        ).status_code == 500
+        app.state.chunk_storage.part_path(str(upload["upload_id"]), 0).unlink()
+
+    monkeypatch.undo()
+    with authenticated_client(
+        settings, app=create_app(settings), device_id="source"
+    ) as recovered:
+        messages = recovered.get("/api/messages?limit=50").json()["items"]
+
+    linked = [item for item in messages if item.get("upload_id") == upload["upload_id"]]
+    assert len(linked) == 1
+    assert linked[0]["file"]["sha256"] == sha256(content).hexdigest()
+
+
+def test_expired_unrecoverable_assembled_session_becomes_expired(
+    settings: Settings,
+) -> None:
+    app = create_app(settings)
+    client = authenticated_client(settings, app=app)
+    content = b"missing-assembled"
+    upload = create_upload(client, content=content)
+    put_single_part(client, upload, content)
+    upload_id = str(upload["upload_id"])
+    now = datetime(2026, 7, 21, tzinfo=timezone.utc)
+    with app.state.database.transaction() as connection:
+        connection.execute(
+            "UPDATE upload_sessions SET status = 'verifying', publication_state = 'assembled', "
+            "file_sha256 = ?, expires_at = ? WHERE id = ?",
+            (sha256(content).hexdigest(), "2026-07-20T00:00:00+00:00", upload_id),
+        )
+
+    mutations = app.state.upload_service.expire(now)
+
+    assert len(mutations) == 1
+    assert app.state.upload_repository.get(upload_id)["status"] == "expired"
+
+
+def test_cancel_file_published_session_removes_unavailable_final_file(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"cancel-published"
+    app = create_app(settings)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert client.post(
+            "/api/session",
+            json={
+                "access_token": settings.auth_token,
+                "device_id": "source",
+                "device_name": "source",
+            },
+        ).status_code == 200
+        upload = create_upload(client, content=content)
+        put_single_part(client, upload, content)
+        monkeypatch.setattr(
+            app.state.upload_repository,
+            "finalize_publication",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("injected database finalization failure")
+            ),
+        )
+        assert client.post(
+            f"/api/uploads/{upload['upload_id']}/complete", json={}
+        ).status_code == 500
+        final_path = settings.upload_dir / (
+            f"{upload['upload_id']}_{upload['original_name']}"
+        )
+        assert final_path.is_file()
+
+        assert client.delete(f"/api/uploads/{upload['upload_id']}").status_code == 200
+
+    assert not final_path.exists()
+
+
+def test_restart_finishes_cancelled_file_published_cleanup(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"restart-cancel-cleanup"
+    app = create_app(settings)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert client.post(
+            "/api/session",
+            json={
+                "access_token": settings.auth_token,
+                "device_id": "source",
+                "device_name": "source",
+            },
+        ).status_code == 200
+        upload = create_upload(client, content=content)
+        put_single_part(client, upload, content)
+        monkeypatch.setattr(
+            app.state.upload_repository,
+            "finalize_publication",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("injected database finalization failure")
+            ),
+        )
+        assert client.post(
+            f"/api/uploads/{upload['upload_id']}/complete", json={}
+        ).status_code == 500
+        final_path = settings.upload_dir / (
+            f"{upload['upload_id']}_{upload['original_name']}"
+        )
+        original_purge = app.state.upload_service.storage.purge_file
+        monkeypatch.setattr(
+            app.state.upload_service.storage,
+            "purge_file",
+            lambda storage_name: (_ for _ in ()).throw(OSError("injected cleanup failure")),
+        )
+        assert client.delete(f"/api/uploads/{upload['upload_id']}").status_code == 507
+        assert final_path.is_file()
+
+    monkeypatch.setattr(
+        app.state.upload_service.storage, "purge_file", original_purge
+    )
+    with authenticated_client(settings, app=create_app(settings)):
+        pass
+
+    assert not final_path.exists()
+
+
+def test_expire_returns_recovery_mutation_for_maintenance_broadcast(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"maintenance-recovery"
+    app = create_app(settings)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert client.post(
+            "/api/session",
+            json={
+                "access_token": settings.auth_token,
+                "device_id": "source",
+                "device_name": "source",
+            },
+        ).status_code == 200
+        upload = create_upload(client, content=content)
+        put_single_part(client, upload, content)
+        monkeypatch.setattr(
+            app.state.upload_repository,
+            "finalize_publication",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("injected database finalization failure")
+            ),
+        )
+        assert client.post(
+            f"/api/uploads/{upload['upload_id']}/complete", json={}
+        ).status_code == 500
+
+    monkeypatch.undo()
+    mutations = app.state.upload_service.expire(
+        datetime(2026, 7, 19, tzinfo=timezone.utc)
+    )
+
+    assert len(mutations) == 1
+    assert mutations[0]["result"]["status"] == "complete"
+    assert any(
+        event["event_type"] == "message.created" for event in mutations[0]["events"]
+    )
+
+
+def test_expire_cleans_temporary_parts_and_emits_event(settings: Settings) -> None:
+    app = create_app(settings)
+    client = authenticated_client(settings, app=app)
+    upload = create_upload(client, content=b"data")
+    put_single_part(client, upload, b"data")
+    upload_id = str(upload["upload_id"])
+    session_dir = app.state.chunk_storage.part_path(upload_id, 0).parent
+    now = datetime(2026, 7, 21, tzinfo=timezone.utc)
+    with app.state.database.transaction() as connection:
+        connection.execute(
+            "UPDATE upload_sessions SET expires_at = ? WHERE id = ?",
+            ("2026-07-20T00:00:00+00:00", upload_id),
+        )
+
+    mutations = app.state.upload_service.expire(now)
+
+    assert len(mutations) == 1
+    assert mutations[0]["events"][0]["event_type"] == "upload.expired"
+    assert app.state.upload_repository.get(upload_id)["status"] == "expired"
+    assert not session_dir.exists()
 
 
 def test_create_upload_requires_signed_session(settings: Settings) -> None:

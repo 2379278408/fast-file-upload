@@ -30,7 +30,13 @@ from .auth import (
     require_session,
 )
 from .config import SESSION_DAYS, Settings
-from .chunk_storage import ChunkDigestMismatch, ChunkSizeMismatch, ChunkStorage, PartConflict
+from .chunk_storage import (
+    ChunkDigestMismatch,
+    ChunkSizeMismatch,
+    ChunkStorage,
+    PartConflict,
+    PartIntegrityError,
+)
 from .database import Database
 from .events import EventHub
 from .repository import (
@@ -278,6 +284,11 @@ def create_app(settings: Settings) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(lifespan_app: FastAPI) -> AsyncIterator[None]:
+        upload_mutations = await asyncio.to_thread(
+            upload_service.recover, lifespan_app.state.clock()
+        )
+        for mutation in upload_mutations:
+            await broadcast_mutation(mutation)
         recovered = await asyncio.to_thread(messages.recover_upload_reservations, storage)
         if recovered:
             logger.info("Recovered %d interrupted uploads", len(recovered))
@@ -319,8 +330,24 @@ def create_app(settings: Settings) -> FastAPI:
                         await run_purge()
                     except Exception:
                         logger.exception("Periodic purge failed")
+                    try:
+                        expired = await asyncio.to_thread(
+                            upload_service.expire, lifespan_app.state.clock()
+                        )
+                        for mutation in expired:
+                            await broadcast_mutation(mutation)
+                    except Exception:
+                        logger.exception("Periodic upload expiry failed")
 
         await run_purge()
+        try:
+            expired = await asyncio.to_thread(
+                upload_service.expire, lifespan_app.state.clock()
+            )
+            for mutation in expired:
+                await broadcast_mutation(mutation)
+        except Exception:
+            logger.exception("Startup upload expiry failed")
         maintenance_task = asyncio.create_task(maintenance_worker())
         lifespan_app.state.maintenance_task = maintenance_task
         try:
@@ -439,9 +466,10 @@ def create_app(settings: Settings) -> FastAPI:
     upload_repository = UploadRepository(database)
     chunk_storage = ChunkStorage(settings.upload_dir)
     upload_service = UploadService(
-        upload_repository, chunk_storage, settings, upload_locks
+        upload_repository, chunk_storage, settings, upload_locks, storage
     )
     app.state.upload_repository = upload_repository
+    app.state.chunk_storage = chunk_storage
     app.state.upload_service = upload_service
 
     def record_audit(action: str, file_id: str, name: str, size_bytes: int, **extra: object) -> None:
@@ -987,6 +1015,32 @@ def create_app(settings: Settings) -> FastAPI:
             raise HTTPException(
                 status_code=503, detail="Too many active upload operations"
             ) from error
+
+    @app.post("/api/uploads/{upload_id}/complete")
+    async def complete_resumable_upload(
+        upload_id: str,
+        request: Request,
+        session: SessionData = Depends(require_session),
+        _: None = Depends(enforce_rate_limit),
+    ) -> dict[str, object]:
+        sequence = await asyncio.to_thread(messages.latest_sequence)
+        try:
+            result = await upload_service.complete(
+                upload_id, session, request.app.state.clock()
+            )
+        except UploadNotFound as error:
+            raise HTTPException(status_code=404, detail="Upload not found") from error
+        except (UploadConflict, UploadStateConflict, PartIntegrityError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except UploadStorageExceeded as error:
+            raise HTTPException(status_code=507, detail=str(error)) from error
+        except OSError as error:
+            raise HTTPException(
+                status_code=507, detail="Upload storage operation failed"
+            ) from error
+        for event in await asyncio.to_thread(messages.events_after, sequence):
+            await hub.broadcast(event)
+        return result
 
     @app.delete("/api/uploads/{upload_id}")
     async def cancel_resumable_upload(

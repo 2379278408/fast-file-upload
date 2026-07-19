@@ -235,7 +235,6 @@ class ChunkStorage:
             raise
 
         safe_name = sanitize_filename(str(session["original_name"]))
-        safe_name = " ".join(safe_name.split()) or "unnamed-file"
         return PendingFile(
             file_id=upload_id,
             original_name=safe_name,
@@ -247,6 +246,46 @@ class ChunkStorage:
             size_bytes=written,
             sha256=digest.hexdigest(),
         )
+
+    def pending_from_session(
+        self, session: Mapping[str, object], *, published: bool
+    ) -> PendingFile:
+        upload_id = str(session["upload_id"])
+        safe_name = sanitize_filename(str(session["original_name"]))
+        storage_name = f"{upload_id}_{safe_name}"
+        temporary_path = self._session_dir(upload_id) / "final.uploading"
+        final_path = self.upload_dir / storage_name
+        source_path = final_path if published else temporary_path
+        if source_path.is_symlink():
+            raise PartIntegrityError("Assembled upload cannot be a symbolic link")
+        digest = sha256()
+        size_bytes = 0
+        try:
+            with source_path.open("rb") as source:
+                while chunk := source.read(self.buffer_size):
+                    size_bytes += len(chunk)
+                    digest.update(chunk)
+        except FileNotFoundError as exc:
+            raise PartIntegrityError("Assembled upload is missing") from exc
+        actual_sha256 = digest.hexdigest()
+        if size_bytes != int(session["size_bytes"]):
+            raise PartIntegrityError("Assembled upload size differs from its session")
+        if actual_sha256 != session["file_sha256"]:
+            raise PartIntegrityError("Assembled upload SHA-256 differs from its session")
+        return PendingFile(
+            file_id=upload_id,
+            original_name=safe_name,
+            storage_name=storage_name,
+            temporary_path=temporary_path,
+            final_path=final_path,
+            mime_type=str(session["mime_type"]),
+            extension=Path(safe_name).suffix.lower(),
+            size_bytes=size_bytes,
+            sha256=actual_sha256,
+        )
+
+    def discard_assembled(self, upload_id: str) -> None:
+        (self._session_dir(upload_id) / "final.uploading").unlink(missing_ok=True)
 
     def discard_incoming(self, upload_id: str, part_index: int) -> None:
         """Remove stale writers while holding the upload lock.

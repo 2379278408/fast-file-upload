@@ -8,6 +8,7 @@ from typing import Literal
 from uuid import uuid4
 
 from .database import Database
+from .repository import MessageRepository
 from .storage import PendingFile, sanitize_filename
 
 
@@ -173,6 +174,20 @@ class UploadRepository:
                 ACTIVE_STATUSES,
             ).fetchall()
             return [self._session(connection, row) for row in rows]
+
+    def list_sessions(self) -> list[dict[str, object]]:
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM upload_sessions ORDER BY created_at, id"
+            ).fetchall()
+            return [self._session(connection, row) for row in rows]
+
+    def confirmed_part_keys(self) -> set[tuple[str, int]]:
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                "SELECT upload_id, part_index FROM upload_parts"
+            ).fetchall()
+            return {(str(row["upload_id"]), int(row["part_index"])) for row in rows}
 
     def list_parts(self, upload_id: str) -> list[PartRecord]:
         with self.db.connect() as connection:
@@ -383,21 +398,104 @@ class UploadRepository:
                 "UPDATE upload_sessions SET status = 'complete', publication_state = 'published', message_id = ?, file_sha256 = ?, error_code = NULL, updated_at = ? WHERE id = ?",
                 (message_id, pending.sha256, timestamp, upload_id),
             )
-            result = self._load(connection, upload_id)
-            message_payload = {"id": message_id, "kind": "file", "file_id": pending.file_id,
-                               "client_request_id": session["client_request_id"],
-                               "device_id": device_id, "device_name": device_name,
-                               "created_at": timestamp}
+            completed_session = self._load(connection, upload_id)
+            message_row = connection.execute(
+                "SELECT * FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            message_payload = MessageRepository(self.db)._message_payload(
+                connection, message_row
+            )
             file_payload = {"id": pending.file_id, "original_name": pending.original_name,
                             "storage_name": pending.storage_name, "mime_type": pending.mime_type,
                             "extension": pending.extension, "size_bytes": pending.size_bytes,
                             "sha256": pending.sha256, "created_at": timestamp}
             events = [
-                self._append_event(connection, "upload.completed", upload_id, result, timestamp),
+                self._append_event(connection, "upload.completed", upload_id, completed_session, timestamp),
                 self._append_event(connection, "message.created", message_id, message_payload, timestamp),
                 self._append_event(connection, "file.finalized", pending.file_id, file_payload, timestamp),
             ]
-            return {"result": result, "events": events, "changed": True}
+            return {"result": completed_session, "events": events, "changed": True}
+
+    def get_completed_message(self, upload_id: str) -> dict[str, object]:
+        with self.db.connect() as connection:
+            session = self._load(connection, upload_id)
+            if session["status"] != "complete" or session["message_id"] is None:
+                raise UploadStateConflict(str(session["status"]))
+            message = MessageRepository(self.db).get_message(
+                str(session["message_id"]), connection
+            )
+            if message is None:
+                raise UploadStateConflict("Completed upload message is missing")
+            return message
+
+    def reset_assembling(self, upload_id: str, now: datetime) -> dict[str, object]:
+        with self.db.transaction() as connection:
+            session = self._load(connection, upload_id)
+            if session["status"] == "verifying" and session["publication_state"] == "assembling":
+                connection.execute(
+                    "UPDATE upload_sessions SET status = 'uploading', publication_state = 'none', "
+                    "file_sha256 = NULL, updated_at = ? WHERE id = ?",
+                    (now.isoformat(), upload_id),
+                )
+            return self._load(connection, upload_id)
+
+    def reconcile_missing_parts(
+        self, missing: set[tuple[str, int]], now: datetime, ttl_seconds: int
+    ) -> list[dict[str, object]]:
+        if not missing:
+            return []
+        changed: list[dict[str, object]] = []
+        with self.db.transaction() as connection:
+            for upload_id in sorted({key[0] for key in missing}):
+                session = self._load(connection, upload_id)
+                if session["publication_state"] in {
+                    "assembled",
+                    "file_published",
+                    "published",
+                }:
+                    continue
+                indexes = [key[1] for key in missing if key[0] == upload_id]
+                placeholders = ", ".join("?" for _ in indexes)
+                connection.execute(
+                    f"DELETE FROM upload_parts WHERE upload_id = ? AND part_index IN ({placeholders})",
+                    (upload_id, *indexes),
+                )
+                confirmed_bytes = connection.execute(
+                    "SELECT COALESCE(SUM(size_bytes), 0) FROM upload_parts WHERE upload_id = ?",
+                    (upload_id,),
+                ).fetchone()[0]
+                connection.execute(
+                    "UPDATE upload_sessions SET status = 'failed', error_code = 'missing_part', "
+                    "publication_state = 'none', file_sha256 = NULL, confirmed_bytes = ?, "
+                    "updated_at = ?, expires_at = ? WHERE id = ? AND status NOT IN ('complete', 'cancelled', 'expired')",
+                    (confirmed_bytes, now.isoformat(), self._expiry(now, ttl_seconds), upload_id),
+                )
+                changed.append(self._load(connection, upload_id))
+        return changed
+
+    def expired_ids(self, now: datetime, limit: int = 100) -> set[str]:
+        placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
+        with self.db.connect() as connection:
+            rows = connection.execute(
+                f"SELECT id FROM upload_sessions WHERE status IN ({placeholders}) "
+                "AND expires_at <= ? ORDER BY expires_at, id LIMIT ?",
+                (*ACTIVE_STATUSES, now.isoformat(), limit),
+            ).fetchall()
+            return {str(row["id"]) for row in rows}
+
+    def finish_published(self, upload_id: str, now: datetime) -> dict[str, object]:
+        with self.db.transaction() as connection:
+            session = self._load(connection, upload_id)
+            if session["publication_state"] == "published" and session["message_id"] is not None:
+                if connection.execute(
+                    "SELECT 1 FROM messages WHERE id = ?", (session["message_id"],)
+                ).fetchone() is None:
+                    raise UploadStateConflict("Published upload message is missing")
+                connection.execute(
+                    "UPDATE upload_sessions SET status = 'complete', error_code = NULL, updated_at = ? WHERE id = ?",
+                    (now.isoformat(), upload_id),
+                )
+            return self._load(connection, upload_id)
 
     def fail(
         self, upload_id: str, error_code: str, now: datetime, ttl_seconds: int
@@ -429,3 +527,40 @@ class UploadRepository:
                     (now.isoformat(), *upload_ids),
                 )
             return [self._load(connection, upload_id) for upload_id in upload_ids]
+
+    def expire_mutations(
+        self, now: datetime, limit: int = 100, force_ids: set[str] | None = None
+    ) -> list[dict[str, object]]:
+        with self.db.transaction() as connection:
+            placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
+            forced = sorted(force_ids or set())
+            forced_clause = ""
+            parameters: tuple[object, ...]
+            if forced:
+                forced_placeholders = ", ".join("?" for _ in forced)
+                forced_clause = f" OR id IN ({forced_placeholders})"
+                parameters = (*ACTIVE_STATUSES, now.isoformat(), *forced, limit)
+            else:
+                parameters = (*ACTIVE_STATUSES, now.isoformat(), limit)
+            rows = connection.execute(
+                f"SELECT id FROM upload_sessions WHERE status IN ({placeholders}) "
+                f"AND (expires_at <= ?{forced_clause}) ORDER BY expires_at, id LIMIT ?",
+                parameters,
+            ).fetchall()
+            upload_ids = [str(row["id"]) for row in rows]
+            if upload_ids:
+                ids = ", ".join("?" for _ in upload_ids)
+                connection.execute(
+                    f"UPDATE upload_sessions SET status = 'expired', error_code = 'expired', "
+                    f"updated_at = ? WHERE id IN ({ids})",
+                    (now.isoformat(), *upload_ids),
+                )
+            mutations: list[dict[str, object]] = []
+            for upload_id in upload_ids:
+                result = self._load(connection, upload_id)
+                upload_id = str(result["upload_id"])
+                event = self._append_event(
+                    connection, "upload.expired", upload_id, result, now.isoformat()
+                )
+                mutations.append({"result": result, "events": [event], "changed": True})
+        return mutations
