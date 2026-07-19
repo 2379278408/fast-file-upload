@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS audit_events (id INTEGER PRIMARY KEY AUTOINCREMENT,
  action TEXT NOT NULL, entity_id TEXT, detail TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS upload_sessions (
  id TEXT PRIMARY KEY, client_request_id TEXT NOT NULL UNIQUE,
- source_device_id TEXT NOT NULL, original_name TEXT NOT NULL,
+ source_device_id TEXT NOT NULL, source_device_name TEXT NOT NULL,
+ original_name TEXT NOT NULL,
  mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL CHECK(size_bytes > 0),
  last_modified_ms INTEGER NOT NULL, sample_sha256 TEXT NOT NULL,
  chunk_size_bytes INTEGER NOT NULL CHECK(chunk_size_bytes > 0),
@@ -106,6 +107,15 @@ class Database:
             self._add_column(connection, "upload_sessions", "file_sha256 TEXT")
             self._add_column(connection, "upload_sessions", "message_id TEXT REFERENCES messages(id)")
             self._add_column(connection, "upload_sessions", "error_code TEXT")
+            self._add_column(
+                connection,
+                "upload_sessions",
+                "source_device_name TEXT NOT NULL DEFAULT ''",
+            )
+            connection.execute(
+                "UPDATE upload_sessions SET source_device_name = source_device_id "
+                "WHERE source_device_name = ''"
+            )
             connection.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS upload_sessions_message_id "
                 "ON upload_sessions(message_id)"

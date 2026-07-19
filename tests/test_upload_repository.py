@@ -39,6 +39,7 @@ def upload_command() -> UploadCreate:
         sample_sha256=sha256(b"sample").hexdigest(),
         chunk_size_bytes=4,
         source_device_id="device-1",
+        source_device_name="Work computer",
     )
 
 
@@ -70,7 +71,7 @@ def test_create_payload_id_and_metadata_replay(repository, upload_command, clock
     assert "id" not in session
     assert set(session) == {
         "upload_id", "client_request_id", "source_device_id", "original_name",
-        "mime_type", "size_bytes", "last_modified_ms", "sample_sha256",
+        "source_device_name", "mime_type", "size_bytes", "last_modified_ms", "sample_sha256",
         "chunk_size_bytes", "status", "confirmed_parts", "confirmed_bytes",
         "file_sha256", "message_id", "error_code", "publication_state",
         "created_at", "updated_at", "expires_at",
@@ -116,6 +117,28 @@ def test_part_replay_is_idempotent_and_conflict_is_rejected(repository, upload_c
     assert replay["expires_at"] == expiry
     with pytest.raises(UploadConflict):
         repository.begin_part(record.upload_id, 0, 0, 3, 4, sha256(b"nope").hexdigest())
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (("start_byte", 1), ("end_byte", 4), ("size_bytes", 3), ("sha256", "0" * 64)),
+)
+def test_confirm_rejects_lease_record_mismatch(repository, upload_command, clock, field: str, value: object) -> None:
+    session, _ = repository.create_or_get(upload_command, clock(), 86_400, 128)
+    record = part(session, 0, b"data", clock())
+    lease = repository.begin_part(record.upload_id, 0, 0, 3, 4, record.sha256)
+    assert isinstance(lease, PartLease)
+    with pytest.raises(UploadConflict):
+        repository.confirm_part(lease, replace(record, **{field: value}), clock(), 86_400)
+
+
+def test_confirm_rejects_directly_constructed_out_of_range_lease(repository, upload_command, clock) -> None:
+    session, _ = repository.create_or_get(upload_command, clock(), 86_400, 128)
+    digest = sha256(b"data").hexdigest()
+    lease = PartLease(str(session["upload_id"]), 0, 8, 11, 4, digest)
+    record = PartRecord(str(session["upload_id"]), 0, 8, 11, 4, digest, clock().isoformat())
+    with pytest.raises(UploadConflict):
+        repository.confirm_part(lease, record, clock(), 86_400)
 
 
 def test_pause_allows_started_part_to_confirm_and_preserves_paused(repository, upload_command, clock) -> None:
@@ -166,17 +189,52 @@ def test_capacity_counts_only_active_sessions(repository, upload_command, clock)
 
 
 def test_finalize_publication_uses_durable_device_data(repository, upload_command, clock, tmp_path: Path) -> None:
+    upload_command = replace(upload_command, original_name="notes?.txt")
     session, _ = repository.create_or_get(upload_command, clock(), 86_400, 128)
     confirm(repository, session, 0, b"data", clock())
     confirm(repository, session, 1, b"more", clock())
     repository.begin_completion(str(session["upload_id"]), clock(), 86_400)
-    pending = PendingFile("file-1", "notes.txt", "file-1_notes.txt", tmp_path / "part", tmp_path / "final", "text/plain", ".txt", 8, sha256(b"datamore").hexdigest())
-    result = repository.finalize_publication(str(session["upload_id"]), pending, clock(), 86_400)
+    digest = sha256(b"datamore").hexdigest()
+    repository.set_publication_state(str(session["upload_id"]), "assembled", digest, clock(), 86_400)
+    repository.set_publication_state(str(session["upload_id"]), "file_published", digest, clock(), 86_400)
+    pending = PendingFile("file-1", "notes.txt", "file-1_notes.txt", tmp_path / "part", tmp_path / "final", "text/plain", ".txt", 8, digest)
+    result = repository.finalize_publication(str(session["upload_id"]), pending, clock())
     assert result["changed"] is True
     assert [event["event_type"] for event in result["events"]] == ["upload.completed", "message.created", "file.finalized"]
     assert result["result"]["status"] == "complete"
-    replay = repository.finalize_publication(str(session["upload_id"]), pending, clock(), 86_400)
+    replay = repository.finalize_publication(str(session["upload_id"]), pending, clock())
     assert replay == {"result": result["result"], "events": [], "changed": False}
+    with repository.db.connect() as connection:
+        message = connection.execute("SELECT device_name FROM messages WHERE id = ?", (result["result"]["message_id"],)).fetchone()
+    assert message["device_name"] == upload_command.source_device_name
+
+
+@pytest.mark.parametrize(
+    "change",
+    (
+        {"sha256": "0" * 64},
+        {"original_name": "other.txt"},
+        {"mime_type": "application/octet-stream"},
+        {"size_bytes": 7},
+    ),
+)
+def test_finalize_rejects_pending_metadata_conflict(repository, upload_command, clock, tmp_path: Path, change: dict[str, object]) -> None:
+    session, _ = repository.create_or_get(upload_command, clock(), 86_400, 128)
+    confirm(repository, session, 0, b"data", clock())
+    confirm(repository, session, 1, b"more", clock())
+    repository.begin_completion(str(session["upload_id"]), clock(), 86_400)
+    digest = sha256(b"datamore").hexdigest()
+    repository.set_publication_state(str(session["upload_id"]), "assembled", digest, clock(), 86_400)
+    repository.set_publication_state(str(session["upload_id"]), "file_published", digest, clock(), 86_400)
+    pending = PendingFile("file-1", "notes.txt", "file-1_notes.txt", tmp_path / "part", tmp_path / "final", "text/plain", ".txt", 8, digest)
+    with pytest.raises((UploadConflict, UploadStateConflict)):
+        repository.finalize_publication(str(session["upload_id"]), replace(pending, **change), clock())
+
+
+def test_invalid_publication_state_raises_domain_conflict(repository, upload_command, clock) -> None:
+    session, _ = repository.create_or_get(upload_command, clock(), 86_400, 128)
+    with pytest.raises(UploadStateConflict):
+        repository.set_publication_state(str(session["upload_id"]), "invalid", None, clock(), 86_400)  # type: ignore[arg-type]
 
 
 def test_claim_expired_marks_active_rows_failed(repository, upload_command, clock) -> None:
@@ -184,4 +242,5 @@ def test_claim_expired_marks_active_rows_failed(repository, upload_command, cloc
     clock.advance(seconds=2)
     claimed = repository.claim_expired(clock())
     assert [item["upload_id"] for item in claimed] == [session["upload_id"]]
-    assert claimed[0]["status"] == "failed"
+    assert claimed[0]["status"] == "expired"
+    assert repository.claim_expired(clock()) == []

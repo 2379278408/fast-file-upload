@@ -25,10 +25,10 @@ def _insert_upload_session(
 ) -> None:
     connection.execute(
         "INSERT INTO upload_sessions ("
-        "id, client_request_id, source_device_id, original_name, mime_type, "
+        "id, client_request_id, source_device_id, source_device_name, original_name, mime_type, "
         "size_bytes, last_modified_ms, sample_sha256, chunk_size_bytes, status, "
         "message_id, created_at, updated_at, expires_at"
-        ") VALUES (?, ?, 'device-1', 'file.txt', 'text/plain', ?, 1, 'sample', ?, "
+        ") VALUES (?, ?, 'device-1', 'Device 1', 'file.txt', 'text/plain', ?, 1, 'sample', ?, "
         "'active', ?, '2026-07-19T00:00:00+00:00', "
         "'2026-07-19T00:00:00+00:00', '2026-07-20T00:00:00+00:00')",
         (upload_id, client_request_id, size_bytes, chunk_size_bytes, message_id),
@@ -56,7 +56,7 @@ def test_database_initializes_resumable_upload_schema(tmp_path: Path) -> None:
         parts = {row[1] for row in connection.execute("PRAGMA table_info(upload_parts)")}
         foreign_keys = connection.execute("PRAGMA foreign_key_list(upload_parts)").fetchall()
     assert {
-        "id", "client_request_id", "source_device_id", "original_name", "mime_type",
+        "id", "client_request_id", "source_device_id", "source_device_name", "original_name", "mime_type",
         "size_bytes", "last_modified_ms", "sample_sha256", "chunk_size_bytes", "status",
         "confirmed_bytes", "file_sha256", "message_id", "error_code", "publication_state",
         "created_at", "updated_at", "expires_at",
@@ -113,6 +113,7 @@ def test_resumable_upload_schema_constraints_and_indexes(tmp_path: Path) -> None
             for name in {
                 "client_request_id",
                 "source_device_id",
+                "source_device_name",
                 "original_name",
                 "mime_type",
                 "size_bytes",
@@ -269,7 +270,7 @@ def test_initialize_additively_migrates_legacy_upload_sessions(tmp_path: Path) -
             row[1] for row in connection.execute("PRAGMA table_info(upload_sessions)")
         }
         migrated = connection.execute(
-            "SELECT client_request_id, confirmed_bytes, publication_state, "
+            "SELECT client_request_id, confirmed_bytes, publication_state, source_device_name, "
             "file_sha256, message_id, error_code FROM upload_sessions "
             "WHERE id = 'legacy-upload'"
         ).fetchone()
@@ -279,8 +280,8 @@ def test_initialize_additively_migrates_legacy_upload_sessions(tmp_path: Path) -
             if row[1] == "upload_sessions_message_id"
         ]
 
-    assert {"publication_state", "file_sha256", "message_id", "error_code"} <= columns
-    assert tuple(migrated) == ("legacy-request", 5, "none", None, None, None)
+    assert {"publication_state", "file_sha256", "message_id", "error_code", "source_device_name"} <= columns
+    assert tuple(migrated) == ("legacy-request", 5, "none", "legacy-device", None, None, None)
     assert len(message_id_indexes) == 1
     assert message_id_indexes[0][2] == 1
 

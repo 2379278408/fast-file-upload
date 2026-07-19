@@ -119,7 +119,7 @@ def test_database_initializes_resumable_upload_schema(tmp_path: Path) -> None:
         parts = {row[1] for row in connection.execute("PRAGMA table_info(upload_parts)")}
         foreign_keys = connection.execute("PRAGMA foreign_key_list(upload_parts)").fetchall()
     assert {
-        "id", "client_request_id", "source_device_id", "original_name", "mime_type",
+        "id", "client_request_id", "source_device_id", "source_device_name", "original_name", "mime_type",
         "size_bytes", "last_modified_ms", "sample_sha256", "chunk_size_bytes", "status",
         "confirmed_bytes", "file_sha256", "message_id", "error_code", "publication_state",
         "created_at", "updated_at", "expires_at",
@@ -165,7 +165,8 @@ Append these statements to `SCHEMA`:
 ```sql
 CREATE TABLE IF NOT EXISTS upload_sessions (
  id TEXT PRIMARY KEY, client_request_id TEXT NOT NULL UNIQUE,
- source_device_id TEXT NOT NULL, original_name TEXT NOT NULL,
+ source_device_id TEXT NOT NULL, source_device_name TEXT NOT NULL,
+ original_name TEXT NOT NULL,
  mime_type TEXT NOT NULL, size_bytes INTEGER NOT NULL CHECK(size_bytes > 0),
  last_modified_ms INTEGER NOT NULL, sample_sha256 TEXT NOT NULL,
  chunk_size_bytes INTEGER NOT NULL CHECK(chunk_size_bytes > 0),
@@ -186,7 +187,7 @@ CREATE TABLE IF NOT EXISTS upload_parts (
 );
 ```
 
-Use `_add_column()` for `publication_state`, `file_sha256`, `message_id`, and `error_code` so an existing development database upgrades additively.
+Use `_add_column()` for `publication_state`, `file_sha256`, `message_id`, `error_code`, and `source_device_name` so an existing development database upgrades additively. Backfill legacy `source_device_name` from `source_device_id`.
 
 - [ ] **Step 5: Run focused tests and commit**
 
@@ -208,18 +209,18 @@ git commit -m "feat(upload): add resumable configuration and schema"
 - Create: `tests/test_upload_repository.py`
 
 **Interfaces:**
-- Produces `UploadCreate(client_request_id: str, original_name: str, mime_type: str, size_bytes: int, last_modified_ms: int, sample_sha256: str, chunk_size_bytes: int, source_device_id: str)`.
+- Produces `UploadCreate(client_request_id: str, original_name: str, mime_type: str, size_bytes: int, last_modified_ms: int, sample_sha256: str, chunk_size_bytes: int, source_device_id: str, source_device_name: str)`.
 - Produces `PartRecord(upload_id: str, part_index: int, start_byte: int, end_byte: int, size_bytes: int, sha256: str, created_at: str)`.
 - Produces exceptions `UploadNotFound`, `UploadConflict`, `UploadStateConflict`, and `UploadCapacityExceeded`.
 - Produces `UploadRepository.create_or_get(command: UploadCreate, now: datetime, ttl_seconds: int, max_active: int) -> tuple[dict[str, object], bool]`; new IDs use `uuid4().hex` so storage validation receives exactly 32 lowercase hexadecimal characters.
 - Produces `UploadRepository.get(upload_id: str) -> dict[str, object] | None`, `list_active() -> list[dict[str, object]]`, and `list_parts(upload_id: str) -> list[PartRecord]`; every session payload exposes `upload_id`, never the database column name `id`.
-- Session payloads use exact keys `upload_id`, `client_request_id`, `source_device_id`, `original_name`, `mime_type`, `size_bytes`, `last_modified_ms`, `sample_sha256`, `chunk_size_bytes`, `status`, `confirmed_parts`, `confirmed_bytes`, `file_sha256`, `message_id`, `error_code`, `publication_state`, `created_at`, `updated_at`, and `expires_at`.
+- Session payloads use exact keys `upload_id`, `client_request_id`, `source_device_id`, `source_device_name`, `original_name`, `mime_type`, `size_bytes`, `last_modified_ms`, `sample_sha256`, `chunk_size_bytes`, `status`, `confirmed_parts`, `confirmed_bytes`, `file_sha256`, `message_id`, `error_code`, `publication_state`, `created_at`, `updated_at`, and `expires_at`.
 - Produces `begin_part(upload_id: str, part_index: int, start_byte: int, end_byte: int, size_bytes: int, sha256: str) -> PartLease | dict[str, object]` and `confirm_part(lease: PartLease, part: PartRecord, now: datetime, ttl_seconds: int) -> dict[str, object]`. An identical confirmed replay returns the persisted session dictionary before reading the body; conflicting metadata raises `UploadConflict`.
 - Produces `transition(upload_id: str, action: Literal["pause", "resume"], source_device_id: str, now: datetime, ttl_seconds: int) -> dict[str, object]`.
 - Produces `cancel(upload_id: str, now: datetime, ttl_seconds: int) -> tuple[dict[str, object], bool]`.
 - Produces `begin_completion(upload_id: str, now: datetime, ttl_seconds: int) -> dict[str, object]`.
 - Produces `set_publication_state(upload_id: str, state: Literal["assembling", "assembled", "file_published"], file_sha256: str | None, now: datetime, ttl_seconds: int) -> dict[str, object]`.
-- Produces `finalize_publication(upload_id: str, pending: PendingFile, now: datetime, ttl_seconds: int) -> dict[str, object]`; it derives permanent-message device metadata from the durable source-device columns so restart recovery needs no online `SessionData` object.
+- Produces `finalize_publication(upload_id: str, pending: PendingFile, now: datetime) -> dict[str, object]`; it derives permanent-message device metadata from the durable source-device columns so restart recovery needs no online `SessionData` object and idempotent replay cannot extend expiry.
 - Produces `fail(upload_id: str, error_code: str, now: datetime, ttl_seconds: int) -> dict[str, object]` and `claim_expired(now: datetime, limit: int = 100) -> list[dict[str, object]]`.
 
 - [ ] **Step 1: Write failing transition, race, and expiry tests**
@@ -290,12 +291,17 @@ class UploadCreate:
     sample_sha256: str
     chunk_size_bytes: int
     source_device_id: str
+    source_device_name: str
 
 
 @dataclass(frozen=True, slots=True)
 class PartLease:
     upload_id: str
     part_index: int
+    start_byte: int
+    end_byte: int
+    size_bytes: int
+    sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,7 +330,7 @@ ACTIVE_STATUSES = ("queued", "uploading", "paused", "verifying", "failed")
 
 Use one `BEGIN IMMEDIATE` transaction in `begin_completion()` to prove contiguous coverage and set `status='verifying', publication_state='assembling'`. Use one transaction in `finalize_publication()` to insert `files`, insert one `messages` row carrying `upload_id`, set `status='complete', publication_state='published', message_id=?, file_sha256=?`, and append ordered `upload.completed`, `message.created`, and `file.finalized` events.
 
-Return every mutation in this exact shape:
+Return publication/event transaction mutations in this exact shape:
 
 ```python
 {
