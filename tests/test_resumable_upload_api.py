@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import logging
+import sqlite3
 import time
 import threading
 from datetime import datetime, timezone
@@ -1462,3 +1464,116 @@ def test_complete_upload_cancellation_returns_409(settings: Settings) -> None:
     response = client.delete(f"/api/uploads/{upload['upload_id']}")
     assert response.status_code == 409
     assert response.json()["detail"] == "Completed uploads cannot be cancelled"
+
+
+def test_recover_isolates_session_failure_and_logs_upload_id(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    app = create_app(settings)
+    client = authenticated_client(settings, app=app)
+    uploads = [
+        create_upload(client, request_id=f"recover-isolation-{index}")
+        for index in range(2)
+    ]
+    upload_ids = sorted(str(upload["upload_id"]) for upload in uploads)
+    with app.state.database.transaction() as connection:
+        connection.execute(
+            "UPDATE upload_sessions SET status = 'verifying', "
+            "publication_state = 'assembling' WHERE id IN (?, ?)",
+            upload_ids,
+        )
+    original_discard = app.state.chunk_storage.discard_assembled
+
+    def fail_first_discard(upload_id: str) -> None:
+        if upload_id == upload_ids[0]:
+            raise OSError("injected discard failure")
+        original_discard(upload_id)
+
+    monkeypatch.setattr(
+        app.state.chunk_storage, "discard_assembled", fail_first_discard
+    )
+    caplog.set_level(logging.ERROR, logger="transfer.upload")
+
+    mutations = asyncio.run(
+        app.state.upload_service.recover(datetime.now(timezone.utc))
+    )
+
+    assert mutations == []
+    assert app.state.upload_repository.get(upload_ids[0])["status"] == "verifying"
+    assert app.state.upload_repository.get(upload_ids[1])["status"] == "uploading"
+    assert any(
+        upload_ids[0] in record.getMessage() and "recover" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_expire_isolates_session_failure(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_app(settings)
+    client = authenticated_client(settings, app=app)
+    uploads = [
+        create_upload(client, request_id=f"expire-isolation-{index}")
+        for index in range(2)
+    ]
+    upload_ids = sorted(str(upload["upload_id"]) for upload in uploads)
+    now = datetime(2026, 7, 21, tzinfo=timezone.utc)
+    with app.state.database.transaction() as connection:
+        connection.execute(
+            "UPDATE upload_sessions SET expires_at = ? WHERE id IN (?, ?)",
+            ("2026-07-20T00:00:00+00:00", *upload_ids),
+        )
+    original_expire_one = app.state.upload_repository.expire_one
+
+    def fail_first_expiry(upload_id: str, *args, **kwargs):
+        if upload_id == upload_ids[0]:
+            raise sqlite3.OperationalError("injected expiry failure")
+        return original_expire_one(upload_id, *args, **kwargs)
+
+    monkeypatch.setattr(
+        app.state.upload_repository, "expire_one", fail_first_expiry
+    )
+
+    mutations = asyncio.run(app.state.upload_service.expire(now))
+
+    assert [mutation["result"]["upload_id"] for mutation in mutations] == [
+        upload_ids[1]
+    ]
+    assert app.state.upload_repository.get(upload_ids[0])["status"] == "queued"
+    assert app.state.upload_repository.get(upload_ids[1])["status"] == "expired"
+
+
+def test_startup_recovery_continues_after_single_session_failure(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = create_app(settings)
+    client = authenticated_client(settings, app=app)
+    uploads = [
+        create_upload(client, request_id=f"startup-isolation-{index}")
+        for index in range(2)
+    ]
+    upload_ids = sorted(str(upload["upload_id"]) for upload in uploads)
+    with app.state.database.transaction() as connection:
+        connection.execute(
+            "UPDATE upload_sessions SET status = 'verifying', "
+            "publication_state = 'assembling' WHERE id IN (?, ?)",
+            upload_ids,
+        )
+    original_discard = app.state.chunk_storage.discard_assembled
+
+    def fail_first_discard(upload_id: str) -> None:
+        if upload_id == upload_ids[0]:
+            raise RuntimeError("injected startup recovery failure")
+        original_discard(upload_id)
+
+    monkeypatch.setattr(
+        app.state.chunk_storage, "discard_assembled", fail_first_discard
+    )
+
+    with TestClient(app):
+        assert not app.state.maintenance_task.done()
+
+    assert app.state.upload_repository.get(upload_ids[0])["status"] == "verifying"
+    assert app.state.upload_repository.get(upload_ids[1])["status"] == "uploading"

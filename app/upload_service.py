@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import shutil
+import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
 from datetime import datetime
@@ -25,6 +27,7 @@ from .upload_repository import (
 
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 CONTENT_RANGE_PATTERN = re.compile(r"^bytes ([0-9]+)-([0-9]+)/([0-9]+)$")
+logger = logging.getLogger("transfer.upload")
 
 
 class UploadLockPool(Protocol):
@@ -438,14 +441,61 @@ class UploadService:
         session_ids = {str(session["upload_id"]) for session in sessions}
         orphan_ids = await asyncio.to_thread(self.chunks.orphan_sessions, session_ids)
         for orphan_id in orphan_ids:
-            await asyncio.to_thread(self.chunks.cleanup_session, orphan_id)
+            await self._run_isolated(
+                orphan_id,
+                "recover_orphan_cleanup",
+                self.chunks.cleanup_session,
+                orphan_id,
+            )
         mutations: list[dict[str, object]] = []
         for upload_id in sorted(session_ids):
-            async with self.upload_locks.hold(upload_id):
-                mutations.extend(
-                    await asyncio.to_thread(self._recover_locked, upload_id, now)
-                )
+            recovered = await self._run_isolated(
+                upload_id, "recover", self._recover_locked, upload_id, now
+            )
+            if recovered is not None:
+                mutations.extend(recovered)
         return mutations
+
+    async def _run_isolated(
+        self,
+        upload_id: str,
+        phase: str,
+        operation: Callable[..., list[dict[str, object]] | None],
+        *args: object,
+    ) -> list[dict[str, object]] | None:
+        try:
+            async with self.upload_locks.hold(upload_id):
+                task = asyncio.create_task(asyncio.to_thread(operation, *args))
+                try:
+                    return await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    try:
+                        await task
+                    except BaseException:
+                        pass
+                    raise
+        except asyncio.CancelledError:
+            raise
+        except (
+            InvalidUploadPart,
+            UploadTooLarge,
+            UploadStorageExceeded,
+            UploadNotFound,
+            UploadStateConflict,
+            PartIntegrityError,
+            OSError,
+            sqlite3.Error,
+        ):
+            logger.exception(
+                "Upload maintenance failed upload_id=%s phase=%s", upload_id, phase
+            )
+        except Exception:
+            logger.exception(
+                "Unexpected upload maintenance failure upload_id=%s phase=%s",
+                upload_id,
+                phase,
+            )
+        return None
 
     def _expire_locked(
         self, upload_id: str, now: datetime
@@ -482,8 +532,9 @@ class UploadService:
         upload_ids = await asyncio.to_thread(self.repository.expired_ids, now)
         mutations: list[dict[str, object]] = []
         for upload_id in sorted(upload_ids):
-            async with self.upload_locks.hold(upload_id):
-                mutations.extend(
-                    await asyncio.to_thread(self._expire_locked, upload_id, now)
-                )
+            expired = await self._run_isolated(
+                upload_id, "expire", self._expire_locked, upload_id, now
+            )
+            if expired is not None:
+                mutations.extend(expired)
         return mutations

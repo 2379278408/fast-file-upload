@@ -82,3 +82,27 @@
 ### 追加 Commit
 
 - `fix(upload): serialize recovery and completion events`（本追加报告随新 commit 提交）
+
+## 逐 Upload 异常隔离追加
+
+### 红灯证据
+
+- recover 首个 session 的 `discard_assembled()` 抛出 `OSError` 时，循环直接终止，第二个 session 保持 `verifying`。
+- expire 首个 session 的 `expire_one()` 抛出 `sqlite3.Error` 时，循环直接终止，第二个 session 未过期。
+- startup recover 首个 session 抛出意外 `RuntimeError` 时，FastAPI lifespan 启动失败。
+
+### 修复内容
+
+- recover、orphan cleanup 和 expire 均逐 upload 在 keyed lock 内运行，并对会话级故障隔离。
+- 预期领域异常、`OSError`、`sqlite3.Error` 与意外 `Exception` 记录 `upload_id`、`phase` 和 traceback 后继续下一 ID。
+- `CancelledError` 等待当前线程操作收束并继续传播，确保 keyed lock 不会在线程仍修改该 upload 时提前释放。
+- 返回 mutation 仅包含成功处理会话；故障会话不追加成功结果，也不执行后续清理。
+
+### 验证证据
+
+- 新增 recover、expire、startup 故障注入测试全部通过，日志断言包含故障 upload ID 和 recover 阶段。
+- Task 5 API、repository、files、events 测试：`164 passed`。
+
+### 追加 Commit
+
+- `fix(upload): isolate recovery failures per session`（本追加报告随新 commit 提交）
