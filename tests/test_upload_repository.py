@@ -182,6 +182,18 @@ def test_completion_requires_contiguous_coverage_and_complete_cannot_cancel(repo
     assert completing["publication_state"] == "assembling"
 
 
+def test_paused_upload_cannot_begin_completion(repository, upload_command, clock) -> None:
+    session, _ = repository.create_or_get(upload_command, clock(), 86_400, 128)
+    confirm(repository, session, 0, b"data", clock())
+    confirm(repository, session, 1, b"more", clock())
+    repository.transition(
+        str(session["upload_id"]), "pause", upload_command.source_device_id,
+        clock(), 86_400,
+    )
+    with pytest.raises(UploadStateConflict):
+        repository.begin_completion(str(session["upload_id"]), clock(), 86_400)
+
+
 def test_capacity_counts_only_active_sessions(repository, upload_command, clock) -> None:
     repository.create_or_get(upload_command, clock(), 86_400, 1)
     with pytest.raises(UploadCapacityExceeded):
@@ -244,3 +256,15 @@ def test_claim_expired_marks_active_rows_failed(repository, upload_command, cloc
     assert [item["upload_id"] for item in claimed] == [session["upload_id"]]
     assert claimed[0]["status"] == "expired"
     assert repository.claim_expired(clock()) == []
+
+
+def test_expired_upload_rejects_cancel_and_fail_without_extending_expiry(repository, upload_command, clock) -> None:
+    session, _ = repository.create_or_get(upload_command, clock(), 1, 128)
+    clock.advance(seconds=2)
+    expired = repository.claim_expired(clock())[0]
+    expiry = expired["expires_at"]
+    with pytest.raises(UploadStateConflict):
+        repository.cancel(str(session["upload_id"]), clock(), 86_400)
+    with pytest.raises(UploadStateConflict):
+        repository.fail(str(session["upload_id"]), "retry_failed", clock(), 86_400)
+    assert repository.get(str(session["upload_id"]))["expires_at"] == expiry

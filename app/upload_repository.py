@@ -266,8 +266,8 @@ class UploadRepository:
             session = self._load(connection, upload_id)
             if session["status"] == "cancelled":
                 return session, False
-            if session["status"] == "complete":
-                raise UploadStateConflict("Completed uploads cannot be cancelled")
+            if session["status"] in {"complete", "expired"}:
+                raise UploadStateConflict(f"{session['status']} uploads cannot be cancelled")
             connection.execute(
                 "UPDATE upload_sessions SET status = 'cancelled', updated_at = ?, expires_at = ? WHERE id = ?",
                 (now.isoformat(), self._expiry(now, ttl_seconds), upload_id),
@@ -279,7 +279,7 @@ class UploadRepository:
             session = self._load(connection, upload_id)
             if session["status"] == "verifying" and session["publication_state"] == "assembling":
                 return session
-            if session["status"] not in {"queued", "uploading", "paused"}:
+            if session["status"] != "uploading":
                 raise UploadStateConflict(str(session["status"]))
             rows = connection.execute(
                 "SELECT start_byte, end_byte, size_bytes FROM upload_parts WHERE upload_id = ? ORDER BY start_byte",
@@ -390,7 +390,7 @@ class UploadRepository:
     ) -> dict[str, object]:
         with self.db.transaction() as connection:
             session = self._load(connection, upload_id)
-            if session["status"] in {"complete", "cancelled"}:
+            if session["status"] in {"complete", "cancelled", "expired"}:
                 raise UploadStateConflict(str(session["status"]))
             if session["status"] == "failed" and session["error_code"] == error_code:
                 return session

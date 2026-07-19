@@ -737,12 +737,12 @@ def test_restart_recovers_file_published_session_without_duplicate_message(setti
     with database.transaction() as connection:
         connection.execute(
             "INSERT INTO upload_sessions "
-            "(id, client_request_id, source_device_id, original_name, mime_type, size_bytes, "
+            "(id, client_request_id, source_device_id, source_device_name, original_name, mime_type, size_bytes, "
             "last_modified_ms, sample_sha256, chunk_size_bytes, status, confirmed_bytes, "
             "file_sha256, message_id, error_code, publication_state, created_at, updated_at, expires_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)",
             (
-                upload_id, "recover-request", "source", "report.txt", "text/plain", len(content),
+                upload_id, "recover-request", "source", "Source device", "report.txt", "text/plain", len(content),
                 1_784_412_345_000, sha256(b"sample").hexdigest(), 8 * 1024 * 1024,
                 "verifying", len(content), sha256(content).hexdigest(), "file_published",
                 now, now, "2026-07-20T00:00:00+00:00",
@@ -777,7 +777,7 @@ async def complete(self, upload_id: str, device: SessionData, now: datetime) -> 
             return self.repository.get_completed_message(upload_id)
         session = self.repository.begin_completion(
             upload_id, now, self.settings.upload_session_ttl_seconds
-        )["result"]
+        )
         parts = self.repository.list_parts(upload_id)
 
     pending = await asyncio.to_thread(self.chunks.assemble, session, parts)
@@ -795,9 +795,7 @@ async def complete(self, upload_id: str, device: SessionData, now: datetime) -> 
             upload_id, "file_published", pending.sha256, now,
             self.settings.upload_session_ttl_seconds,
         )
-        mutation = self.repository.finalize_publication(
-            upload_id, pending, now, self.settings.upload_session_ttl_seconds
-        )
+        mutation = self.repository.finalize_publication(upload_id, pending, now)
         return mutation["result"]
 ```
 
