@@ -18,6 +18,7 @@ from playwright.sync_api import (
     CDPSession,
     Locator,
     Page,
+    Route,
     expect,
     sync_playwright,
 )
@@ -359,6 +360,55 @@ def _assert_browser_clean(session: BrowserSession) -> None:
 def _assert_no_horizontal_overflow(page: Page) -> None:
     assert page.evaluate(
         "() => document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+    )
+
+
+def create_test_files(
+    tmp_path: Path, count: int, size_bytes: int
+) -> list[Path]:
+    paths: list[Path] = []
+    block = b"transfer-e2e" * 1024
+    for index in range(count):
+        path = tmp_path / f"file-{index}.bin"
+        with path.open("wb") as output:
+            remaining = size_bytes
+            while remaining:
+                chunk = block[: min(len(block), remaining)]
+                output.write(chunk)
+                remaining -= len(chunk)
+        paths.append(path)
+    return paths
+
+
+def install_slow_part_responses(page: Page) -> None:
+    pending_routes: list[Route] = []
+
+    def hold_part(route: Route) -> None:
+        # Keep every active worker in-flight until the scheduler assertions finish.
+        pending_routes.append(route)
+
+    page.route("**/api/uploads/*/parts/*", hold_part)
+
+
+def release_upload_creations_together(page: Page, count: int) -> None:
+    page.add_init_script(
+        f"""
+        (() => {{
+          const originalFetch = window.fetch.bind(window);
+          const waiting = [];
+          window.fetch = async (input, options = {{}}) => {{
+            const response = await originalFetch(input, options);
+            const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+            if (url.pathname === '/api/uploads' && options.method === 'POST') {{
+              await new Promise(resolve => {{
+                waiting.push(resolve);
+                if (waiting.length === {count}) waiting.splice(0).forEach(release => release());
+              }});
+            }}
+            return response;
+          }};
+        }})();
+        """
     )
 
 
@@ -1039,6 +1089,13 @@ def test_old_page_anchor_restoration_has_no_smooth_drift_and_focuses_fallback(
     anchor_id = older_page.json()["items"][0]["id"]
     context.clear_cookies()
 
+    paged_requests: list[str] = []
+    page.on(
+        "request",
+        lambda request: paged_requests.append(request.url)
+        if "/api/messages?" in request.url and "before=" in request.url
+        else None,
+    )
     _open_locked_application(browser_session)
     page.evaluate(
         "sessionStorage.setItem('transfer-last-sequence', String(Number.MAX_SAFE_INTEGER))"
@@ -1049,10 +1106,6 @@ def test_old_page_anchor_restoration_has_no_smooth_drift_and_focuses_fallback(
     container = page.locator("#timelineContainer")
     container.evaluate("element => { element.scrollTop = 0; }")
     expect(anchor).to_be_attached(timeout=10_000)
-    paged_requests = page.evaluate(
-        "performance.getEntriesByType('resource').map(entry => entry.name)"
-        ".filter(name => name.includes('/api/messages?') && name.includes('before='))"
-    )
     assert paged_requests
 
     snapshot = page.evaluate(
@@ -1431,4 +1484,49 @@ def test_observer_can_cancel_and_remote_cancellation_reaches_both_pages(
         finally:
             if cdp is not None:
                 _cleanup_cdp_network_session(cdp)
+    _assert_browser_clean(browser_session)
+
+
+def test_resumable_40mb_upload_uses_bounded_parts_and_completes(
+    browser_session: BrowserSession, tmp_path: Path
+) -> None:
+    source = tmp_path / "forty-megabytes.bin"
+    block = bytes(range(256)) * 4096
+    with source.open("wb") as output:
+        for _ in range(40):
+            output.write(block)
+
+    page = browser_session.page
+    _open_locked_application(browser_session)
+    _unlock(page)
+    requests: list[int] = []
+    page.on(
+        "request",
+        lambda request: requests.append(len(request.post_data_buffer or b""))
+        if "/parts/" in request.url
+        else None,
+    )
+    page.locator("#composerFileInput").set_input_files(str(source))
+    expect(page.locator('[data-upload-status="complete"]')).to_be_visible(
+        timeout=120_000
+    )
+    assert requests
+    assert max(requests) <= 8 * 1024 * 1024
+    _assert_browser_clean(browser_session)
+
+
+def test_eleven_files_show_nine_uploading_and_two_queued(
+    browser_session: BrowserSession, tmp_path: Path
+) -> None:
+    paths = create_test_files(tmp_path, count=11, size_bytes=16 * 1024 * 1024)
+    page = browser_session.page
+    release_upload_creations_together(page, len(paths))
+    _open_locked_application(browser_session)
+    _unlock(page)
+    install_slow_part_responses(page)
+    page.locator("#composerFileInput").set_input_files([str(path) for path in paths])
+    expect(page.locator('[data-upload-status="uploading"]')).to_have_count(
+        9, timeout=30_000
+    )
+    expect(page.locator('[data-upload-status="queued"]')).to_have_count(2)
     _assert_browser_clean(browser_session)

@@ -47,12 +47,20 @@ UPLOAD_TOKEN='replace-with-a-strong-token' python3 server.py --host 0.0.0.0 --po
 | `RATE_LIMIT_COUNT` | 上传和删除限流次数；`0` 关闭 | `0` |
 | `RATE_LIMIT_WINDOW_SECONDS` | 上传和删除限流窗口 | `60` |
 | `CLIENT_REQUEST_LOCK_CAPACITY` | 并发幂等请求锁的最大键数量 | `1024` |
+| `UPLOAD_CHUNK_SIZE_BYTES` | 可恢复上传的服务端分片大小；浏览器默认按此 8MiB 边界发送 | `8388608` |
+| `UPLOAD_SESSION_TTL_SECONDS` | 可恢复上传会话的闲置有效期 | `86400`（24 小时） |
+| `UPLOAD_STORAGE_RESERVE_BYTES` | 创建和完成上传时必须保留的磁盘安全余量 | `268435456` |
+| `MAX_ACTIVE_UPLOAD_SESSIONS` | 服务端允许的活动上传会话上限 | `128` |
+| `MAX_CONCURRENT_CHUNK_HANDLERS` | 服务端并发分片请求处理上限 | `16` |
+| `UPLOAD_PROGRESS_INTERVAL_SECONDS` | 单个上传进度事件的最小发送间隔 | `0.25` |
 
 消息删除后有 30 秒撤销窗口。窗口结束后，后台 purge 才能永久删除关联文件和记录。
 
 ## 实时事件
 
 `GET /api/events?after=<sequence>` 升级为 WebSocket。连接使用签名会话 cookie，按严格递增 sequence 推送 JSON 事件；断线重连时使用最后收到的 sequence 回放遗漏事件。
+
+可恢复上传会发布 `upload.created`、`upload.progress`、`upload.state_changed`、`upload.completed`、`upload.cancelled` 和 `upload.expired`。进度事件包含上传 ID、状态、已确认字节、传输中字节、总字节、源设备和更新时间，并按 `UPLOAD_PROGRESS_INTERVAL_SECONDS` 节流；终态事件立即发布。
 
 ## API
 
@@ -64,7 +72,11 @@ UPLOAD_TOKEN='replace-with-a-strong-token' python3 server.py --host 0.0.0.0 --po
 - `DELETE /api/messages/{message_id}`：软删除消息。
 - `POST /api/messages/{message_id}/restore`：在 30 秒窗口内撤销删除。
 - `POST /api/messages/batch-delete`：批量软删除消息。
-- `POST /api/upload`：上传文件并创建文件消息。
+- `POST /api/upload`：legacy 整文件上传并创建文件消息。
+- `POST /api/uploads`、`GET /api/uploads/active`、`GET /api/uploads/{upload_id}`：创建或恢复上传会话、读取活动会话和单个会话。
+- `PUT /api/uploads/{upload_id}/parts/{part_index}`：上传并确认一个原始二进制分片。
+- `PATCH /api/uploads/{upload_id}`、`DELETE /api/uploads/{upload_id}`：暂停、继续或取消上传。
+- `POST /api/uploads/{upload_id}/complete`：流式组装、校验并原子发布文件消息。
 - `GET /api/files`：分页筛选文件消息。
 - `POST /api/files/batch-download`：生成有总大小限制的临时 ZIP。
 - `DELETE /api/files/{file_id}`：通过所属消息执行软删除。
@@ -74,6 +86,46 @@ UPLOAD_TOKEN='replace-with-a-strong-token' python3 server.py --host 0.0.0.0 --po
 - `GET /api/events?after=<sequence>`：WebSocket 实时事件与断线回放。
 
 静态资源、`POST /api/session` 和 `DELETE /api/session` 可在无有效会话时访问；其余 HTTP API、下载和 WebSocket 均要求有效签名会话。`DELETE /api/session` 可在无有效会话时幂等清理 cookie，重复调用仍返回成功。
+
+### 可恢复上传协议
+
+`POST /api/uploads` 接收 JSON：
+
+```json
+{
+  "client_request_id": "stable-request-id",
+  "name": "archive.bin",
+  "size_bytes": 41943040,
+  "mime_type": "application/octet-stream",
+  "last_modified_ms": 1784412345000,
+  "chunk_size_bytes": 8388608,
+  "sample_sha256": "64-character-lowercase-hex"
+}
+```
+
+响应包含 `upload_id`、`status`、`chunk_size_bytes`、`confirmed_parts`、`confirmed_bytes`、`source_device_id` 和 `expires_at`。相同 `client_request_id` 与元数据可安全重放；元数据冲突返回 `409`。空文件、超过 `MAX_UPLOAD_SIZE_MB`、扩展名受限或存储容量不足分别在接收分片前拒绝，其中容量要求为声明文件大小加 `UPLOAD_STORAGE_RESERVE_BYTES`。
+
+每个 `PUT /api/uploads/{upload_id}/parts/{part_index}` 使用原始请求体，并携带：
+
+```text
+Content-Type: application/octet-stream
+Content-Range: bytes <inclusive-start>-<inclusive-end>/<total-size>
+X-Chunk-SHA256: <sha256-of-this-chunk>
+```
+
+服务端校验索引、范围、长度和 SHA-256 后原子确认分片。相同分片可幂等重放；相同索引的数据或摘要冲突返回 `409`。浏览器每个文件仅发送一个在途分片，每片默认不超过 8MiB，同时最多上传 9 个文件，其余文件保持 `queued`。
+
+`PATCH /api/uploads/{upload_id}` 接收 `{"action":"pause"}` 或 `{"action":"resume"}`。暂停和继续仅允许创建会话的源设备执行；观察设备以只读方式接收状态，并可调用 `DELETE` 取消共享会话。完成接口仅允许源设备调用，要求所有分片连续覆盖文件；服务端以有界缓冲区组装并计算整文件 SHA-256，成功后返回永久文件消息。取消和完成后的非法状态转换返回 `409`，未知会话返回 `404`，容量或文件系统写入失败返回 `507`，并发资源耗尽返回 `503`。
+
+会话状态为 `queued`、`uploading`、`paused`、`verifying`、`failed`、`complete`、`cancelled` 或 `expired`。创建后以及成功确认分片或成功改变状态时，会话闲置期限续期为 24 小时；过期会话由启动恢复和周期维护清理。
+
+### 刷新恢复与重新选择
+
+Transfer 页面刷新后先读取 `/api/uploads/active`，再与 IndexedDB 中的本地任务协调。浏览器可继续使用且仍获授权的文件句柄时，上传器只发送服务端尚未确认的分片。文件句柄不可用时，任务保持暂停并显示“重新选择原文件”；重新选择后会核对文件名、大小、最后修改时间和抽样 SHA-256，匹配后仅续传缺失分片，任何身份不匹配都会保持暂停并显示可操作错误。会话重新认证后执行相同协调流程。
+
+### Legacy 迁移
+
+`POST /api/upload` 是兼容已有消费者的 legacy `multipart/form-data` 整文件路由。Transfer UI 仅使用 `/api/uploads*`。移除 legacy 路由需同时满足两个标准：所有文档化消费者均已迁移到 `/api/uploads*`；可恢复上传的遥测与回归覆盖稳定运行至少一个发布周期。
 
 ## 后台维护
 
@@ -99,6 +151,12 @@ python3 -m playwright install-deps chromium
 ```bash
 python3 -m pytest -q
 python3 -m compileall -q app server.py tests
+```
+
+默认 pytest 配置排除资源密集型 `large` 标记。显式运行稀疏 512MB 分片、服务端 SHA-256 和 Python 峰值内存验证：
+
+```bash
+python3 -m pytest -q -m large tests/test_large_upload.py
 ```
 
 聚焦前端契约测试：

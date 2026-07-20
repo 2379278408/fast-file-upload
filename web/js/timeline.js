@@ -118,6 +118,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     el.className = 'timeline-message';
     el.dataset.messageId = msg.id;
     el.dataset.createdAt = msg.created_at || '';
+    if (msg.upload_id) el.dataset.uploadStatus = 'complete';
 
     const body = document.createElement('div');
     body.className = 'timeline-message-body';
@@ -218,6 +219,9 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     element.dataset.uploadId = upload.uploadId;
     element.dataset.clientRequestId = upload.clientRequestId || '';
     element.dataset.createdAt = upload.createdAt || '';
+    element.dataset.uploadStatus = upload.status === 'completed'
+      ? 'complete'
+      : (upload.status || 'queued');
 
     const heading = document.createElement('div');
     heading.className = 'upload-card-heading';

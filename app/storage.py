@@ -28,6 +28,7 @@ def format_size(size: int) -> str:
 
 def sanitize_filename(name: str) -> str:
     cleaned = re.sub(r"[^\w\s.\-()_\u4e00-\u9fff]", "", name.strip())
+    cleaned = re.sub(r" *[\t\n\r\f\v]+ *", " ", cleaned)
     cleaned = cleaned or "unnamed-file"
     if len(cleaned) <= MAX_DISPLAY_NAME_LENGTH:
         return cleaned
