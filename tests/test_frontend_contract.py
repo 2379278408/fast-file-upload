@@ -2180,6 +2180,42 @@ def test_upload_summary_drop_overlay_and_accessible_responsive_contract() -> Non
     assert "progress" in read_web("js/timeline.js")
 
 
+def test_app_reconciles_active_uploads_before_timeline_restore_and_websocket() -> None:
+    source = read_web("js/app.js")
+    for start in (
+        source.index("async function checkSession()"),
+        source.index("listen(unlockForm, 'submit'"),
+        source.index("function resumeFromBFCache()"),
+    ):
+        section = source[start:]
+        reconcile_index = section.index("await restoreUploads()")
+        timeline_index = section.index("await timeline.loadInitial()")
+        websocket_index = section.index("startEventConnection()")
+        assert reconcile_index < timeline_index < websocket_index
+    assert "uploadCoordinator.applyRemoteEvent(event)" in source
+
+
+def test_upload_controls_have_touch_targets_focus_and_reduced_motion() -> None:
+    html = read_web("index.html")
+    css = read_web("styles.css")
+    assert 'id="uploadReselectInput"' in html
+    assert ".upload-card-action" in css
+    assert "min-width: 44px" in css
+    assert "min-height: 44px" in css
+    assert ".upload-card-action:focus-visible" in css
+    reduced = css[css.index("@media (prefers-reduced-motion: reduce)"):]
+    assert ".timeline-upload-card" in reduced
+    assert "transition: none" in reduced
+
+
+def test_live_region_announces_state_and_coarse_milestones_only() -> None:
+    source = read_web("js/upload-coordinator.js")
+    assert "LIVE_MILESTONES" in source
+    assert "[25, 50, 75, 100]" in source
+    assert "UPLOAD_ANNOUNCEMENT_INTERVAL_MS" in source
+    assert "1000" in source
+
+
 def test_composer_module_is_served(client: TestClient) -> None:
     resp = client.get("/js/composer.js")
     assert resp.status_code == 200
@@ -2353,6 +2389,187 @@ def test_upload_persistence_only_clones_metadata_and_optional_handle() -> None:
     assert "file" not in row
     assert "runtimeOnly" not in row
     assert row["fileHandle"] == {"kind": "file"}
+
+
+def test_upload_coordinator_reconcile_fetches_active_before_handles_and_restores_observers() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.calls = [];
+      globalThis.sent = [];
+      globalThis.AbortController = class AbortController {
+        constructor() { this.signal = {}; }
+        abort() {}
+      };
+      globalThis.cryptoObject = {
+        randomUUID: () => 'unused',
+        subtle: { digest: (_algorithm, bytes) => Promise.resolve(new Uint8Array([bytes[bytes.byteLength - 1]]).buffer) },
+      };
+      globalThis.makeFile = value => ({
+        name: 'source.bin', size: 8, type: '', lastModified: 7,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array([value]).buffer) }),
+      });
+      globalThis.grantedHandle = {
+        queryPermission(options) { calls.push(['query', options.mode, 'granted']); return Promise.resolve('granted'); },
+        getFile() { calls.push(['getFile', 'granted']); return Promise.resolve(makeFile(1)); },
+      };
+      globalThis.promptHandle = {
+        queryPermission(options) { calls.push(['query', options.mode, 'prompt']); return Promise.resolve('prompt'); },
+        getFile() { calls.push(['getFile', 'prompt']); throw new Error('must not prompt'); },
+      };
+      globalThis.remote = [
+        { upload_id: 'granted', client_request_id: 'granted-request', original_name: 'source.bin', size_bytes: 8, status: 'paused', confirmed_parts: [0], confirmed_bytes: 4, source_device_id: 'device-a' },
+        { upload_id: 'prompt', client_request_id: 'prompt-request', original_name: 'source.bin', size_bytes: 8, status: 'paused', confirmed_parts: [], confirmed_bytes: 0, source_device_id: 'device-a' },
+        { upload_id: 'observer', client_request_id: 'observer-request', original_name: 'remote.bin', size_bytes: 4, status: 'uploading', confirmed_parts: [], confirmed_bytes: 2, source_device_id: 'device-b' },
+      ];
+      globalThis.records = [
+        { uploadId: 'granted', clientRequestId: 'granted-request', fileHandle: grantedHandle, identity: { name: 'source.bin', size: 8, lastModified: 7, sampleSha256: '01' }, name: 'source.bin', sizeBytes: 8, status: 'paused', confirmedParts: [], confirmedBytes: 0, isSourceDevice: true, sourceDeviceId: 'device-a' },
+        { uploadId: 'prompt', clientRequestId: 'prompt-request', fileHandle: promptHandle, identity: { name: 'source.bin', size: 8, lastModified: 7, sampleSha256: '01' }, name: 'source.bin', sizeBytes: 8, status: 'paused', confirmedParts: [], confirmedBytes: 0, isSourceDevice: true, sourceDeviceId: 'device-a' },
+      ];
+      globalThis.api = {
+        listActiveUploads() { calls.push(['active']); return Promise.resolve(remote); },
+        uploadPart(_id, index) { sent.push(index); return new Promise(() => {}); },
+        controlUpload: () => Promise.resolve({}),
+        getUploadSession: () => Promise.resolve({ status: 'cancelled' }),
+      };
+      globalThis.persistence = {
+        getAll() { calls.push(['indexedDB']); return Promise.resolve(records); },
+        put: () => Promise.resolve(), remove: () => Promise.resolve(), close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, chunkSize: 4, maxActive: 1,
+      });
+      coordinator.start();
+    """)
+    drain_jobs(context)
+    calls = json.loads(context.eval("JSON.stringify(calls)"))
+    assert calls[:4] == [
+        ["active"],
+        ["indexedDB"],
+        ["query", "read", "granted"],
+        ["getFile", "granted"],
+    ]
+    assert ["getFile", "prompt"] not in calls
+    snapshot = json.loads(context.eval("JSON.stringify(coordinator.getSnapshot())"))
+    by_id = {task["uploadId"]: task for task in snapshot}
+    assert by_id["granted"]["isSourceDevice"] is True
+    assert by_id["granted"]["confirmedParts"] == [0]
+    assert by_id["prompt"]["status"] == "paused"
+    assert by_id["prompt"]["errorCode"] == "reselect_required"
+    assert by_id["observer"]["isSourceDevice"] is False
+    assert context.eval("sent[0]") == 1
+
+
+def test_upload_coordinator_reselect_requires_exact_identity_and_sends_server_missing_parts() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.sent = [];
+      globalThis.actions = [];
+      globalThis.AbortController = class AbortController {
+        constructor() { this.signal = {}; }
+        abort() {}
+      };
+      globalThis.cryptoObject = {
+        randomUUID: () => 'unused',
+        subtle: { digest: (_algorithm, bytes) => Promise.resolve(new Uint8Array([bytes[bytes.byteLength - 1]]).buffer) },
+      };
+      globalThis.makeFile = value => ({
+        name: 'resume.bin', size: 8, type: '', lastModified: 11,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array([value]).buffer) }),
+      });
+      globalThis.api = {
+        listActiveUploads: () => Promise.resolve([{ upload_id: 'resume', client_request_id: 'request', original_name: 'resume.bin', size_bytes: 8, status: 'paused', confirmed_parts: [0], confirmed_bytes: 4 }]),
+        uploadPart(_id, index) { sent.push(index); return new Promise(() => {}); },
+        controlUpload(_id, action) { actions.push(action); return Promise.resolve({}); },
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve([{ uploadId: 'resume', clientRequestId: 'request', identity: { name: 'resume.bin', size: 8, lastModified: 11, sampleSha256: '01' }, name: 'resume.bin', sizeBytes: 8, status: 'paused', confirmedParts: [], confirmedBytes: 0, isSourceDevice: true }]),
+        put: () => Promise.resolve(), remove: () => Promise.resolve(), close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.results = [];
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({ api, persistence, cryptoObject, chunkSize: 4, maxActive: 1 });
+      coordinator.start()
+        .then(() => coordinator.reselect('resume', makeFile(2)))
+        .then(value => { results.push(value); return coordinator.reselect('resume', makeFile(1)); })
+        .then(value => { results.push(value); });
+    """)
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(results)")) == [False, True]
+    assert json.loads(context.eval("JSON.stringify(sent)")) == [1]
+    assert "resume" in json.loads(context.eval("JSON.stringify(actions)"))
+    assert context.eval("coordinator.getSnapshot()[0].errorCode") is None
+
+
+def test_upload_coordinator_observer_guidance_terminal_order_and_remote_cancel_abort() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.abortCalls = 0;
+      globalThis.AbortController = class AbortController {
+        constructor() { this.signal = {}; }
+        abort() { abortCalls += 1; }
+      };
+      globalThis.cryptoObject = { randomUUID: () => 'source', subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) } };
+      globalThis.file = { name: 'source.bin', size: 4, type: '', lastModified: 1, slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }) };
+      globalThis.api = {
+        createUploadSession: () => Promise.resolve({ upload_id: 'source', status: 'queued', confirmed_parts: [] }),
+        uploadPart: () => new Promise(() => {}),
+        controlUpload: () => Promise.resolve({}), cancelUpload: () => Promise.resolve({}),
+      };
+      globalThis.persistence = { getAll: () => Promise.resolve([]), put: () => Promise.resolve(), remove: () => Promise.resolve(), close: () => {} };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({ api, persistence, cryptoObject, chunkSize: 4 });
+      coordinator.enqueueFiles([file]);
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      coordinator.applyRemoteEvent({ event_type: 'upload.cancelled', sequence: 10, payload: { upload_id: 'source', status: 'cancelled', updated_at: '2026-07-20T00:00:00Z' } });
+      coordinator.applyRemoteEvent({ event_type: 'upload.progress', sequence: 11, payload: { upload_id: 'source', status: 'uploading', confirmed_bytes: 4, updated_at: '2026-07-20T00:00:01Z' } });
+      coordinator.applyRemoteEvent({ event_type: 'upload.created', sequence: 12, payload: { upload_id: 'observer', original_name: 'remote.bin', size_bytes: 4, status: 'paused' } });
+      coordinator.pause('observer');
+      coordinator.resume('observer');
+    """)
+    assert context.eval("abortCalls") == 1
+    assert context.eval("coordinator.getSnapshot().find(task => task.uploadId === 'source').status") == "cancelled"
+    assert context.eval("coordinator.getSnapshot().find(task => task.uploadId === 'observer').errorCode") == "source_device_required"
+    assert context.eval("coordinator.getSnapshot().find(task => task.uploadId === 'observer').errorMessage") == "源设备控制暂停和继续"
+
+
+def test_upload_live_region_announcements_are_stateful_coarse_and_throttled() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.clock = 0;
+      globalThis.announcements = [];
+      globalThis.cryptoObject = { randomUUID: () => 'unused', subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) } };
+      globalThis.persistence = { getAll: () => Promise.resolve([]), put: () => Promise.resolve(), remove: () => Promise.resolve(), close: () => {} };
+      globalThis.api = {};
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, now: () => clock,
+        onAnnounce: message => announcements.push(message),
+      });
+      coordinator.applyRemoteEvent({ event_type: 'upload.created', sequence: 1, payload: { upload_id: 'remote', original_name: 'remote.bin', size_bytes: 100, status: 'queued', confirmed_bytes: 0 } });
+      coordinator.applyRemoteEvent({ event_type: 'upload.progress', sequence: 2, payload: { upload_id: 'remote', status: 'queued', confirmed_bytes: 25 } });
+      clock = 100;
+      coordinator.applyRemoteEvent({ event_type: 'upload.progress', sequence: 3, payload: { upload_id: 'remote', status: 'queued', confirmed_bytes: 50 } });
+      clock = 1100;
+      coordinator.applyRemoteEvent({ event_type: 'upload.progress', sequence: 4, payload: { upload_id: 'remote', status: 'queued', confirmed_bytes: 50 } });
+      coordinator.applyRemoteEvent({ event_type: 'upload.state_changed', sequence: 5, payload: { upload_id: 'remote', status: 'paused', confirmed_bytes: 50 } });
+    """)
+    announcements = json.loads(context.eval("JSON.stringify(announcements)"))
+    assert any("25%" in message for message in announcements)
+    assert any("50%" in message for message in announcements)
+    assert sum("50%" in message for message in announcements) == 1
+    assert any("已暂停" in message for message in announcements)
+    assert all("10%" not in message for message in announcements)
 
 
 def test_upload_coordinator_limits_active_files_and_one_part_per_file() -> None:
@@ -2949,7 +3166,7 @@ def test_upload_coordinator_destroy_rejects_pending_public_operations(method: st
 
     context.eval(r"""
       globalThis.lateHandled = true;
-      deferred[method].reject(new Error('late external rejection'));
+      deferred.reconcile.reject(new Error('late external rejection'));
     """)
     drain_jobs(context)
     assert context.eval("lateHandled") is True

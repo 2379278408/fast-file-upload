@@ -265,12 +265,13 @@ async function checkSession() {
     const storedName = getDeviceName();
     if (routeSource && storedName) routeSource.textContent = storedName;
     if (connectionDevice) connectionDevice.textContent = storedName || '-';
+    await restoreUploads();
+    if (appDestroyed) return;
     await refreshAll();
     if (appDestroyed) return;
     await timeline.loadInitial();
     if (appDestroyed) return;
-    await restoreUploads();
-    if (appDestroyed) return;
+    renderUploadSnapshots();
     hideLockOverlay();
     startEventConnection();
   } catch {
@@ -302,12 +303,13 @@ if (unlockForm) {
       await apiUnlock(token, deviceId, name);
       if (appDestroyed) return;
       setDeviceName(name);
+      await restoreUploads();
+      if (appDestroyed) return;
       await refreshAll();
       if (appDestroyed) return;
       await timeline.loadInitial();
       if (appDestroyed) return;
-      await restoreUploads();
-      if (appDestroyed) return;
+      renderUploadSnapshots();
       hideLockOverlay();
       startEventConnection();
     } catch (err) {
@@ -330,10 +332,17 @@ listen(window, 'session-logout', async () => {
 
 const timelineContainer = document.getElementById('timelineContainer');
 const newMessageButton = document.getElementById('newMessageButton');
+const uploadLiveRegion = document.getElementById('uploadLiveRegion');
 const uploadPersistence = createUploadPersistence({ indexedDB: window.indexedDB });
 const uploadCoordinator = createUploadCoordinator({
   api: resumableApi,
   persistence: uploadPersistence,
+  onAnnounce(message) {
+    if (uploadLiveRegion) uploadLiveRegion.textContent = message;
+  },
+  onCompleted(message) {
+    timeline.upsert?.(message);
+  },
 });
 let uploadCoordinatorStarted = false;
 
@@ -347,10 +356,13 @@ async function restoreUploads() {
       await uploadCoordinator.reconcile();
     }
     if (appDestroyed) return;
-    uploadCoordinator.getSnapshot().forEach(task => timeline.upsertUpload?.(task));
   } catch (error) {
     if (!appDestroyed) showToast(error.message || '上传任务恢复失败', 'error');
   }
+}
+
+function renderUploadSnapshots() {
+  uploadCoordinator.getSnapshot().forEach(task => timeline.upsertUpload?.(task));
 }
 
 const timeline = createTimeline({
@@ -367,6 +379,14 @@ const timeline = createTimeline({
     }
   },
   onUploadAction({ action, uploadId }) {
+    if (action === 'reselect') {
+      pendingReselectUploadId = uploadId;
+      if (uploadReselectInput) {
+        uploadReselectInput.value = '';
+        uploadReselectInput.click();
+      }
+      return;
+    }
     const handler = uploadCoordinator[action];
     if (typeof handler === 'function') handler.call(uploadCoordinator, uploadId);
   },
@@ -397,17 +417,24 @@ const pauseAllUploads = document.getElementById('pauseAllUploads');
 const resumeAllUploads = document.getElementById('resumeAllUploads');
 const cancelAllUploads = document.getElementById('cancelAllUploads');
 const transferDropOverlay = document.getElementById('transferDropOverlay');
-const uploadLiveRegion = document.getElementById('uploadLiveRegion');
-const announcedUploadStates = new Map();
+const uploadReselectInput = document.getElementById('uploadReselectInput');
+let pendingReselectUploadId = null;
+
+listen(uploadReselectInput, 'change', async () => {
+  const uploadId = pendingReselectUploadId;
+  const file = uploadReselectInput.files?.[0];
+  pendingReselectUploadId = null;
+  if (!uploadId || !file) return;
+  try {
+    await uploadCoordinator.reselect(uploadId, file);
+  } catch (error) {
+    if (!appDestroyed) showToast(error.message || '文件恢复失败', 'error');
+  }
+});
 
 const unsubscribeUploadCoordinator = uploadCoordinator.subscribe(tasks => {
   tasks.forEach(task => {
     timeline.upsertUpload?.(task);
-    const previousStatus = announcedUploadStates.get(task.uploadId);
-    if (uploadLiveRegion && previousStatus && previousStatus !== task.status) {
-      uploadLiveRegion.textContent = `${task.name}状态已更新`;
-    }
-    announcedUploadStates.set(task.uploadId, task.status);
   });
   const activeStates = ['queued', 'uploading', 'paused', 'verifying', 'completing', 'failed', 'needs-file'];
   const activeTasks = tasks.filter(task => activeStates.includes(task.status));
@@ -681,7 +708,7 @@ function updateConnectionStatus(status) {
 function applyIncomingEvent(event) {
   if (appDestroyed || !event) return false;
   if (event.event_type?.startsWith('upload.')) {
-    uploadCoordinator.applyRemoteEvent(event.payload || event);
+    uploadCoordinator.applyRemoteEvent(event);
   }
   timeline.mergeEvent(event);
   if (library && typeof library.applyEvent === 'function') {
@@ -868,7 +895,6 @@ export function destroyApp() {
   timelineObserver?.disconnect();
   timelineObserver = null;
   window.clearTimeout(showToast.timer);
-  announcedUploadStates.clear();
   if (window.__updateBatchToolbar === updateBatchToolbar) {
     window.__updateBatchToolbar = null;
   }
@@ -878,7 +904,8 @@ export function destroyApp() {
 }
 
 function handlePageHide(event) {
-  if (!event.persisted) destroyApp();
+  if (event.persisted) closeEventConnection();
+  else destroyApp();
 }
 
 function resumeFromBFCache() {
@@ -889,10 +916,11 @@ function resumeFromBFCache() {
       await getSession();
       if (appDestroyed) return false;
       isUnlocked = true;
-      await timeline.loadInitial();
-      if (appDestroyed) return false;
       await restoreUploads();
       if (appDestroyed) return false;
+      await timeline.loadInitial();
+      if (appDestroyed) return false;
+      renderUploadSnapshots();
       hideLockOverlay();
       startEventConnection();
       return true;

@@ -198,7 +198,11 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     const actions = [];
     if (upload.isSourceDevice !== false) {
       if (['queued', 'uploading'].includes(upload.status)) actions.push(['pause', '暂停']);
-      if (['paused', 'needs-file'].includes(upload.status)) actions.push(['resume', '继续']);
+      if (upload.errorCode === 'reselect_required' || upload.errorCode === 'file_mismatch' || upload.status === 'needs-file') {
+        actions.push(['reselect', '重新选择原文件']);
+      } else if (upload.status === 'paused') {
+        actions.push(['resume', '继续']);
+      }
       if (upload.status === 'failed') actions.push(['retry', '重试']);
       if (upload.status === 'queued') actions.push(['prioritize', '优先上传']);
     }
@@ -210,7 +214,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
 
   function renderUpload(upload) {
     const element = document.createElement('article');
-    element.className = `timeline-message upload-card upload-card-${upload.status || 'queued'}`;
+    element.className = `timeline-message timeline-upload-card upload-card upload-card-${upload.status || 'queued'}`;
     element.dataset.uploadId = upload.uploadId;
     element.dataset.clientRequestId = upload.clientRequestId || '';
     element.dataset.createdAt = upload.createdAt || '';
@@ -222,7 +226,9 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     name.textContent = upload.name || '未命名文件';
     const status = document.createElement('span');
     status.className = 'upload-card-status';
-    status.textContent = uploadStatusLabels[upload.status] || upload.status || '等待上传';
+    status.textContent = upload.errorCode === 'reselect_required'
+      ? '需要重新选择原文件'
+      : (upload.errorCode === 'file_mismatch' ? '文件不匹配' : (uploadStatusLabels[upload.status] || upload.status || '等待上传'));
     heading.append(name, status);
     element.append(heading);
 
@@ -239,8 +245,12 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     const total = upload.sizeBytes || 0;
     const parts = [`${Math.round(upload.progressPercent || 0)}%`, `${formatBytes(confirmed)} / ${formatBytes(total)}`];
     if (upload.status === 'uploading' && upload.isSourceDevice !== false) {
-      parts.push(`${formatBytes(upload.speedBytesPerSecond || 0)}/s`);
-      parts.push(`剩余 ${formatDuration(upload.etaSeconds)}`);
+      if (upload.etaSeconds === null || upload.etaSeconds === undefined) {
+        parts.push('计算中');
+      } else {
+        parts.push(`${formatBytes(upload.speedBytesPerSecond || 0)}/s`);
+        parts.push(`剩余 ${formatDuration(upload.etaSeconds)}`);
+      }
     }
     metrics.textContent = parts.join(' · ');
     element.append(metrics);
@@ -256,7 +266,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     actions.className = 'upload-card-actions';
     uploadActions(upload).forEach(([action, label]) => {
       const button = document.createElement('button');
-      button.className = action === 'cancel' ? 'btn btn-danger' : 'btn btn-soft';
+      button.className = `upload-card-action ${action === 'cancel' ? 'btn btn-danger' : 'btn btn-soft'}`;
       button.type = 'button';
       button.dataset.uploadAction = action;
       button.textContent = label;

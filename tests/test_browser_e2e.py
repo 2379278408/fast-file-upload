@@ -321,6 +321,22 @@ def _create_seed_session(session: BrowserSession, device_id: str) -> None:
     assert response.ok
 
 
+def _wait_for_active_upload(
+    context: BrowserContext, base_url: str, predicate: Callable[[dict[str, object]], bool]
+) -> dict[str, object]:
+    deadline = time.monotonic() + 30
+    last_uploads: list[dict[str, object]] = []
+    while time.monotonic() < deadline:
+        response = context.request.get(f"{base_url}/api/uploads/active")
+        assert response.ok
+        last_uploads = response.json()
+        for upload in last_uploads:
+            if predicate(upload):
+                return upload
+        time.sleep(0.05)
+    raise AssertionError(f"active upload did not reach the expected state: {last_uploads!r}")
+
+
 def _assert_route_state(
     page: Page, route: str, visible_nav: str, *, expect_heading_focus: bool = True
 ) -> None:
@@ -970,15 +986,6 @@ def test_old_page_anchor_restoration_has_no_smooth_drift_and_focuses_fallback(
     anchor_id = older_page.json()["items"][0]["id"]
     context.clear_cookies()
 
-    paged_requests: list[str] = []
-    page.on(
-        "request",
-        lambda request: (
-            paged_requests.append(request.url)
-            if "/api/messages?" in request.url and "before=" in request.url
-            else None
-        ),
-    )
     _open_locked_application(browser_session)
     page.evaluate(
         "localStorage.setItem('transfer-last-sequence', String(Number.MAX_SAFE_INTEGER))"
@@ -989,6 +996,10 @@ def test_old_page_anchor_restoration_has_no_smooth_drift_and_focuses_fallback(
     container = page.locator("#timelineContainer")
     container.evaluate("element => { element.scrollTop = 0; }")
     expect(anchor).to_be_attached(timeout=10_000)
+    paged_requests = page.evaluate(
+        "performance.getEntriesByType('resource').map(entry => entry.name)"
+        ".filter(name => name.includes('/api/messages?') && name.includes('before='))"
+    )
     assert paged_requests
 
     snapshot = page.evaluate(
@@ -1074,4 +1085,133 @@ def test_old_page_anchor_restoration_has_no_smooth_drift_and_focuses_fallback(
     assert abs(restored_offset - snapshot["offset"]) <= 2
     assert abs(stable_offset - restored_offset) <= 1
     assert smooth_calls == 0
+    _assert_browser_clean(browser_session)
+
+
+def test_upload_refresh_reselect_rejects_mismatch_and_sends_missing_parts_only(
+    browser_session: BrowserSession, tmp_path: Path
+) -> None:
+    page = browser_session.page
+    source_file = tmp_path / "resume.bin"
+    mismatch_dir = tmp_path / "mismatch"
+    mismatch_dir.mkdir()
+    mismatch_file = mismatch_dir / source_file.name
+    source_file.write_bytes(b"a" * (8 * 1024 * 1024) + b"z")
+    mismatch_file.write_bytes(b"b" * (8 * 1024 * 1024) + b"y")
+    stable_mtime_ns = 1_784_500_000_000_000_000
+    os.utime(source_file, ns=(stable_mtime_ns, stable_mtime_ns))
+    os.utime(mismatch_file, ns=(stable_mtime_ns, stable_mtime_ns))
+
+    _open_locked_application(browser_session)
+    _unlock(page)
+    sent_parts: list[int] = []
+
+    def record_part_request(request: object) -> None:
+        match = re.search(r"/parts/(\d+)$", request.url)  # type: ignore[attr-defined]
+        if match:
+            sent_parts.append(int(match.group(1)))
+
+    page.on("request", record_part_request)
+    page.route("**/api/uploads/*/parts/1", lambda route: route.abort())
+    page.locator("#composerFileInput").set_input_files(source_file)
+    active = _wait_for_active_upload(
+        browser_session.context,
+        browser_session.base_url,
+        lambda upload: upload.get("confirmed_parts") == [0],
+    )
+    upload_id = str(active["upload_id"])
+    upload_card = page.locator(f'[data-upload-id="{upload_id}"]')
+    expect(upload_card).to_be_visible()
+
+    page.reload(wait_until="domcontentloaded")
+    reselect = page.locator(
+        f'[data-upload-id="{upload_id}"] [data-upload-action="reselect"]'
+    )
+    expect(reselect).to_be_visible(timeout=10_000)
+    expect(page.locator(f'[data-upload-id="{upload_id}"] .upload-card-status')).to_have_text(
+        "需要重新选择原文件"
+    )
+
+    reselect.click()
+    page.locator("#uploadReselectInput").set_input_files(mismatch_file)
+    expect(page.locator(f'[data-upload-id="{upload_id}"] .upload-card-error')).to_have_text(
+        "所选文件与原文件不一致"
+    )
+
+    page.unroute("**/api/uploads/*/parts/1")
+    sent_parts.clear()
+    reselect.click()
+    page.locator("#uploadReselectInput").set_input_files(source_file)
+    expect(page.locator(f'[data-upload-id="{upload_id}"]')).to_have_count(0, timeout=20_000)
+    expect(page.locator(f'[data-message-id] [href="/download/{upload_id}"]')).to_have_count(1)
+    assert sent_parts == [1]
+    browser_session.console_messages[:] = [
+        message for message in browser_session.console_messages
+        if "net::ERR_FAILED" not in message
+    ]
+    _assert_browser_clean(browser_session)
+
+
+def test_observer_can_cancel_and_remote_cancellation_reaches_both_pages(
+    browser_session: BrowserSession, chromium_browser: Browser, tmp_path: Path
+) -> None:
+    source_page = browser_session.page
+    source_file = tmp_path / "observer-cancel.bin"
+    source_file.write_bytes(b"c" * (8 * 1024 * 1024 + 1))
+    _open_locked_application(browser_session)
+    _unlock(source_page)
+    expect(source_page.locator("#connectionStatus")).to_have_text("已连接", timeout=10_000)
+    source_page.route("**/api/uploads/*/parts/0", lambda route: route.abort())
+    source_page.locator("#composerFileInput").set_input_files(source_file)
+    active = _wait_for_active_upload(
+        browser_session.context,
+        browser_session.base_url,
+        lambda upload: upload.get("original_name") == source_file.name,
+    )
+    upload_id = str(active["upload_id"])
+    expect(source_page.locator(f'[data-upload-id="{upload_id}"]')).to_be_visible()
+
+    observer_context = chromium_browser.new_context(
+        base_url=browser_session.base_url,
+        viewport={"width": 390, "height": 844},
+    )
+    observer_page = observer_context.new_page()
+    try:
+        observer_page.goto("/", wait_until="domcontentloaded")
+        _unlock(observer_page)
+        expect(observer_page.locator("#connectionStatus")).to_have_text("已连接", timeout=10_000)
+        observer_card = observer_page.locator(f'[data-upload-id="{upload_id}"]')
+        expect(observer_card).to_be_visible(timeout=10_000)
+        expect(observer_card.locator('[data-upload-action="pause"]')).to_have_count(0)
+        expect(observer_card.locator('[data-upload-action="resume"]')).to_have_count(0)
+        expect(observer_card.locator('[data-upload-action="cancel"]')).to_be_visible()
+        cancel_box = observer_card.locator('[data-upload-action="cancel"]').bounding_box()
+        assert cancel_box is not None
+        assert cancel_box["width"] >= 44 and cancel_box["height"] >= 44
+        with observer_page.expect_response(
+            lambda response: response.request.method == "DELETE"
+            and response.url.endswith(f"/api/uploads/{upload_id}")
+        ) as cancel_response:
+            observer_card.locator('[data-upload-action="cancel"]').click()
+        assert cancel_response.value.status == 200
+        expect(observer_card.locator(".upload-card-status")).to_have_text("已取消")
+        source_status = source_page.locator(
+            f'[data-upload-id="{upload_id}"] .upload-card-status'
+        )
+        try:
+            expect(source_status).to_have_text("已取消", timeout=10_000)
+        except AssertionError as error:
+            details = source_page.evaluate("""
+              () => ({
+                sequence: localStorage.getItem('transfer-last-sequence'),
+                connection: document.getElementById('connectionStatus').textContent,
+              })
+            """)
+            raise AssertionError(f"source did not apply cancellation: {details!r}") from error
+    finally:
+        observer_context.close()
+    browser_session.console_messages[:] = [
+        message for message in browser_session.console_messages
+        if "net::ERR_FAILED" not in message
+    ]
     _assert_browser_clean(browser_session)

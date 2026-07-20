@@ -1910,10 +1910,17 @@
             min-height: 44px;
         }
 
-        .upload-card {
+        .upload-card-action:focus-visible {
+            outline: 3px solid var(--accent);
+            outline-offset: 2px;
+        }
+
+        .upload-card,
+        .timeline-upload-card {
             display: grid;
             gap: 8px;
             overflow: hidden;
+            transition: border-color 180ms ease, box-shadow 180ms ease;
         }
 
         .upload-card-heading {
@@ -2294,7 +2301,7 @@
             .upload-summary { align-items: stretch; flex-direction: column; }
             .upload-summary-actions { display: grid; grid-template-columns: 1fr; }
             .upload-card-heading { align-items: flex-start; flex-direction: column; gap: 4px; }
-            .upload-card-actions .btn { flex: 1 1 calc(50% - 4px); }
+            .upload-card-actions .btn { flex: 1 1 100%; width: 100%; }
         }
 
         @media (max-width: 360px) {
@@ -2308,4 +2315,6 @@
 
         @media (prefers-reduced-motion: reduce) {
             *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+            .timeline-upload-card,
+            .upload-card-progress { transition: none; }
         }
