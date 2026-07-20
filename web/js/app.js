@@ -912,7 +912,6 @@ function handlePageShow(event) {
 
 const appInstance = { destroy: destroyApp };
 window[APP_INSTANCE_KEY] = appInstance;
-listen(window, 'beforeunload', destroyApp);
 listen(window, 'pagehide', handlePageHide);
 listen(window, 'pageshow', handlePageShow);
 

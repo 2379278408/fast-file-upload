@@ -4448,14 +4448,18 @@ def test_app_bfcache_pagehide_preserves_instance_and_pageshow_resumes() -> None:
     result = json.loads(context.eval(r"""
       const afterResume = { ...lifecycle };
       const listenerCounts = {
+        beforeunload: (window.listeners.beforeunload || []).length,
         pagehide: (window.listeners.pagehide || []).length,
         pageshow: (window.listeners.pageshow || []).length,
       };
+      window.dispatchEvent({ type: 'beforeunload' });
+      const afterBeforeUnload = { ...lifecycle };
       window.dispatchEvent({ type: 'pagehide', persisted: false });
       window.dispatchEvent({ type: 'pageshow', persisted: true });
       JSON.stringify({
         afterPersistedHide: JSON.parse(afterPersistedHide),
         afterResume,
+        afterBeforeUnload,
         afterFinalHide: lifecycle,
         listenerCounts,
       });
@@ -4472,7 +4476,12 @@ def test_app_bfcache_pagehide_preserves_instance_and_pageshow_resumes() -> None:
         "closes": 1,
         "destroys": 0,
     }
-    assert result["listenerCounts"] == {"pagehide": 1, "pageshow": 1}
+    assert result["listenerCounts"] == {
+        "beforeunload": 0,
+        "pagehide": 1,
+        "pageshow": 1,
+    }
+    assert result["afterBeforeUnload"]["destroys"] == 0
     assert result["afterFinalHide"]["destroys"] == 5
     assert context.eval("lifecycle.sessions") == 2
 
@@ -4640,4 +4649,67 @@ def test_timeline_repeated_initial_load_observes_only_latest_sentinel() -> None:
         "activeTargets": 1,
         "activeIsCurrent": True,
         "sentinelCount": 1,
+    }
+
+
+def test_timeline_initial_load_discards_older_pending_generation() -> None:
+    context = create_js_context()
+    load_js_module(context, "./timeline.js", read_web("js/timeline.js"))
+    context.eval(r"""
+      globalThis.pendingPages = [];
+      globalThis.pagePaths = [];
+      const container = document.getElementById('generationTimeline');
+      globalThis.generationTimeline = __modules['./timeline.js'].createTimeline({
+        container,
+        newMessageButton: null,
+        api: path => {
+          pagePaths.push(path);
+          return new Promise(resolve => pendingPages.push({ path, resolve }));
+        },
+        onRestore: null,
+      });
+      globalThis.olderResult = null;
+      generationTimeline.loadOlder().then(result => { olderResult = result; });
+      generationTimeline.loadInitial();
+    """)
+    assert context.eval("pendingPages.length") == 2
+
+    context.eval(r"""
+      pendingPages[1].resolve({
+        items: [{ id: 'fresh-message', body: 'fresh', created_at: '2026-07-20T02:00:00Z' }],
+        next_before: 'fresh-cursor',
+      });
+    """)
+    drain_jobs(context)
+    context.eval("generationTimeline.loadOlder();")
+    assert context.eval("pendingPages.length") == 3
+    context.eval(r"""
+      pendingPages[0].resolve({
+        items: [{ id: 'stale-message', body: 'stale', created_at: '2026-07-19T02:00:00Z' }],
+        next_before: null,
+      });
+    """)
+    drain_jobs(context)
+    context.eval("generationTimeline.loadOlder();")
+
+    result = json.loads(context.eval(r"""
+      const resultContainer = document.getElementById('generationTimeline');
+      JSON.stringify({
+        paths: pagePaths,
+        ids: resultContainer.querySelectorAll('.timeline-message')
+          .map(element => element.dataset.messageId),
+        olderResult,
+        pendingCount: pendingPages.length,
+      });
+    """))
+
+    assert result == {
+        "paths": [
+            "/api/messages?limit=50",
+            "/api/messages?limit=50",
+            "/api/messages?limit=50&before=fresh-cursor",
+        ],
+        "ids": ["fresh-message"],
+        "olderResult": False,
+        "pendingCount": 3,
     }

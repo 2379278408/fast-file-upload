@@ -17,6 +17,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
   let exhausted = false;
   let loading = false;
   let loadingPromise = null;
+  let loadGeneration = 0;
   let observer = null;
   let atBottom = true;
   let newCount = 0;
@@ -619,7 +620,10 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
   }
 
   async function loadInitial() {
+    const generation = ++loadGeneration;
     if (destroyed || !container) return;
+    loading = false;
+    loadingPromise = null;
     observer?.disconnect();
     container.innerHTML = '';
     messages.clear();
@@ -647,7 +651,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     if (observer) observer.observe(sentinel);
 
     await loadOlder();
-    if (destroyed) return;
+    if (destroyed || generation !== loadGeneration) return;
     scrollToBottom(false);
 
     if (onRestore) await onRestore();
@@ -657,17 +661,19 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     if (destroyed) return Promise.resolve(false);
     if (loadingPromise) return loadingPromise;
     if (exhausted) return Promise.resolve(false);
+    const generation = loadGeneration;
+    const cursor = nextBefore;
     const anchor = captureVisibleAnchor();
     const previousScrollHeight = container ? container.scrollHeight : 0;
     const previousScrollTop = container ? container.scrollTop : 0;
     loading = true;
-    loadingPromise = (async () => {
+    const operationPromise = (async () => {
       try {
-        const url = nextBefore
-          ? `/api/messages?limit=50&before=${encodeURIComponent(nextBefore)}`
+        const url = cursor
+          ? `/api/messages?limit=50&before=${encodeURIComponent(cursor)}`
           : '/api/messages?limit=50';
         const data = await api(url);
-        if (destroyed || !data) return false;
+        if (destroyed || generation !== loadGeneration || !data) return false;
         const items = data.items || [];
         if (items.length === 0) {
           nextBefore = null;
@@ -686,16 +692,20 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
         }
         return true;
       } catch {
-        if (!destroyed) {
+        if (!destroyed && generation === loadGeneration) {
           window.dispatchEvent(new CustomEvent('timeline-error', { detail: { message: '加载历史消息失败，请稍后重试。' } }));
         }
         return false;
-      } finally {
+      }
+    })();
+    const requestPromise = operationPromise.finally(() => {
+      if (loadingPromise === requestPromise) {
         loading = false;
         loadingPromise = null;
       }
-    })();
-    return loadingPromise;
+    });
+    loadingPromise = requestPromise;
+    return requestPromise;
   }
 
   function captureVisibleAnchor() {
@@ -812,6 +822,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
   }
 
   function destroy() {
+    loadGeneration += 1;
     if (destroyed) return;
     destroyed = true;
     container?.removeEventListener('scroll', handleScroll);
@@ -822,6 +833,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     timers.forEach(timer => clearTimeout(timer));
     timers.clear();
     undoMessages.clear();
+    loading = false;
     loadingPromise = null;
   }
 
