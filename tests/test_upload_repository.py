@@ -235,6 +235,29 @@ def test_capacity_commitment_accumulates_and_confirmed_parts_reduce_it(
     assert second["status"] == "queued"
 
 
+def test_idempotent_create_replay_does_not_duplicate_capacity_commitment(
+    repository, upload_command, clock
+) -> None:
+    created, changed = repository.create_or_get(
+        upload_command, clock(), 86_400, 128, capacity_budget_bytes=16
+    )
+    replay, replay_changed = repository.create_or_get(
+        upload_command, clock(), 86_400, 128, capacity_budget_bytes=16
+    )
+
+    assert changed is True
+    assert replay_changed is False
+    assert replay == created
+    with pytest.raises(UploadStorageCommitmentExceeded):
+        repository.create_or_get(
+            replace(upload_command, client_request_id="idempotent-second"),
+            clock(),
+            86_400,
+            128,
+            capacity_budget_bytes=16,
+        )
+
+
 def test_terminal_session_releases_capacity_commitment(
     repository, upload_command, clock
 ) -> None:
@@ -265,6 +288,48 @@ def test_concurrent_capacity_admission_is_atomic(repository, upload_command, clo
         results = list(executor.map(create, ("concurrent-1", "concurrent-2")))
 
     assert sorted(results) == [False, True]
+
+
+@pytest.mark.parametrize("publication_state", ["assembling", "assembled", "file_published"])
+def test_reassembly_failure_restores_assembly_capacity_commitment(
+    repository, upload_command, clock, publication_state: str
+) -> None:
+    session, _ = repository.create_or_get(
+        upload_command, clock(), 86_400, 128, capacity_budget_bytes=24
+    )
+    confirm(repository, session, 0, b"data", clock())
+    confirm(repository, session, 1, b"more", clock())
+    repository.begin_completion(str(session["upload_id"]), clock(), 86_400)
+    if publication_state in {"assembled", "file_published"}:
+        digest = sha256(b"datamore").hexdigest()
+        repository.set_publication_state(
+            str(session["upload_id"]), "assembled", digest, clock(), 86_400
+        )
+        if publication_state == "file_published":
+            repository.set_publication_state(
+                str(session["upload_id"]), "file_published", digest, clock(), 86_400
+            )
+
+    failed = repository.fail(
+        str(session["upload_id"]),
+        "publication_error",
+        clock(),
+        86_400,
+        reset_publication=True,
+    )
+
+    assert failed["status"] == "failed"
+    assert failed["publication_state"] == "none"
+    assert failed["file_sha256"] is None
+    assert failed["message_id"] is None
+    with pytest.raises(UploadStorageCommitmentExceeded):
+        repository.create_or_get(
+            replace(upload_command, client_request_id=f"after-{publication_state}"),
+            clock(),
+            86_400,
+            128,
+            capacity_budget_bytes=16,
+        )
 
 
 def test_finalize_publication_uses_durable_device_data(repository, upload_command, clock, tmp_path: Path) -> None:

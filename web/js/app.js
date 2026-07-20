@@ -721,7 +721,7 @@ async function reconcileAuthoritativeSnapshot() {
   if (appDestroyed) throw new Error('Application is destroyed');
   await restoreUploads({ throwOnError: true });
   await Promise.all([
-    timeline.loadInitial(),
+    timeline.loadInitial({ throwOnError: true }),
     library.reconcileAuthoritative(),
   ]);
   if (appDestroyed) throw new Error('Application is destroyed');

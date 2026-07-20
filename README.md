@@ -47,7 +47,7 @@ UPLOAD_TOKEN='replace-with-a-strong-token' python3 server.py --host 0.0.0.0 --po
 | `RATE_LIMIT_COUNT` | 上传和删除限流次数；`0` 关闭 | `0` |
 | `RATE_LIMIT_WINDOW_SECONDS` | 上传和删除限流窗口 | `60` |
 | `CLIENT_REQUEST_LOCK_CAPACITY` | 并发幂等请求锁的最大键数量 | `1024` |
-| `UPLOAD_CHUNK_SIZE_BYTES` | 服务端拥有的分片边界；创建请求必须严格声明相同值。配置最大 64MiB，且 `MAX_UPLOAD_SIZE_MB` 对应的分片数最多 10000；生产浏览器固定使用 8MiB | `8388608` |
+| `UPLOAD_CHUNK_SIZE_BYTES` | 服务端拥有的分片边界；客户端可省略，显式声明时必须相同。配置最大 64MiB，且 `MAX_UPLOAD_SIZE_MB` 对应的分片数最多 10000 | `8388608` |
 | `UPLOAD_SESSION_TTL_SECONDS` | 可恢复上传会话的闲置有效期 | `86400`（24 小时） |
 | `UPLOAD_STORAGE_RESERVE_BYTES` | 创建和完成上传时必须保留的磁盘安全余量 | `268435456` |
 | `MAX_ACTIVE_UPLOAD_SESSIONS` | 服务端允许的活动上传会话上限 | `128` |
@@ -61,7 +61,7 @@ UPLOAD_TOKEN='replace-with-a-strong-token' python3 server.py --host 0.0.0.0 --po
 
 `GET /api/events?after=<sequence>` 升级为 WebSocket。连接使用签名会话 cookie，按严格递增 sequence 推送 JSON 事件；断线重连时使用最后收到的 sequence 回放遗漏事件。
 
-周期维护将 `events` 裁剪到最新 `EVENT_RETENTION_LIMIT` 条。客户端 cursor 早于当前 retention floor 时，服务端先发送 `{"event_type":"resync_required","sequence":<replay-target>}`，随后保持 `ready` 控制事件语义。客户端必须完成时间线消息、活动上传和文件库的权威快照协调，成功后推进到该 sequence；协调失败时关闭当前连接 generation，并使用原 cursor 重连。事件回调按到达顺序串行等待，快照协调期间的新事件保持有序。
+每条 message、file、upload 和 progress 事件均在写入事务内将 `events` 裁剪到最新 `EVENT_RETENTION_LIMIT` 条，周期维护提供额外校验。客户端 cursor 早于 retention floor 时，服务端发送 `{"event_type":"resync_required","sequence":<target>,"target_sequence":<target>,"reset_cursor":false}`；客户端 cursor 高于数据库最新 sequence 时发送相同控制协议并将 `reset_cursor` 设为 `true`，允许成功协调后向下重置 cursor。客户端必须完成时间线消息、活动上传和文件库的权威快照协调，成功后提交 target；协调失败时关闭当前连接 generation，并使用原 cursor 重连。事件回调跨 WebSocket generation 严格串行，旧 generation 完成的异步回调无法推进 cursor。
 
 可恢复上传会发布 `upload.created`、`upload.progress`、`upload.state_changed`、`upload.completed`、`upload.cancelled` 和 `upload.expired`。进度事件包含上传 ID、状态、已确认字节、传输中字节、总字节、源设备和更新时间，并按 `UPLOAD_PROGRESS_INTERVAL_SECONDS` 节流；终态事件立即发布。
 
@@ -101,12 +101,11 @@ UPLOAD_TOKEN='replace-with-a-strong-token' python3 server.py --host 0.0.0.0 --po
   "size_bytes": 41943040,
   "mime_type": "application/octet-stream",
   "last_modified_ms": 1784412345000,
-  "chunk_size_bytes": 8388608,
   "sample_sha256": "64-character-lowercase-hex"
 }
 ```
 
-响应包含 `upload_id`、`status`、`chunk_size_bytes`、`confirmed_parts`、`confirmed_bytes`、`source_device_id` 和 `expires_at`。相同 `client_request_id` 与元数据可安全重放；元数据冲突返回 `409`。`chunk_size_bytes` 与服务端配置不一致时返回带期望值的 `400`。空文件、超过 `MAX_UPLOAD_SIZE_MB`、扩展名受限或存储容量不足分别在接收分片前拒绝。容量准入在 SQLite `BEGIN IMMEDIATE` 事务内累计所有 active session 的未落盘字节和 assembly 副本峰值，新会话承诺 `2 * size_bytes`；已确认分片和终态会话相应减少承诺，磁盘安全余量始终保留。
+响应包含 `upload_id`、`status`、权威 `chunk_size_bytes`、`confirmed_parts`、`confirmed_bytes`、`source_device_id` 和 `expires_at`。请求可以省略 `chunk_size_bytes`；显式值与服务端配置不一致时返回带期望值的 `400`。相同 `client_request_id` 与元数据可安全重放；元数据冲突返回 `409`。空文件、超过 `MAX_UPLOAD_SIZE_MB`、扩展名受限或存储容量不足分别在接收分片前拒绝。容量准入在 SQLite `BEGIN IMMEDIATE` 事务内累计所有 active session 的未落盘字节和 assembly 副本峰值，新会话承诺 `2 * size_bytes`；已确认分片和终态会话相应减少承诺。需要重新 assembly 的 publication failure 会原子恢复该承诺并清除 durable publication 投影，磁盘安全余量始终保留。
 
 每个 `PUT /api/uploads/{upload_id}/parts/{part_index}` 使用原始请求体，并携带：
 
@@ -116,7 +115,7 @@ Content-Range: bytes <inclusive-start>-<inclusive-end>/<total-size>
 X-Chunk-SHA256: <sha256-of-this-chunk>
 ```
 
-服务端按创建请求中声明并返回的 `chunk_size_bytes` 校验索引、范围、长度和 SHA-256，随后原子确认分片。相同分片可幂等重放；相同索引的数据或摘要冲突返回 `409`。浏览器每个文件仅发送一个在途分片，固定使用 8MiB 分片边界（末片可更小），同时最多上传 9 个文件，其余文件保持 `queued`。
+服务端按创建响应返回的 `chunk_size_bytes` 校验索引、范围、长度和 SHA-256，随后原子确认分片。相同分片可幂等重放；相同索引的数据或摘要冲突返回 `409`。浏览器使用每个 session 的权威 chunk size 切片，每个文件仅发送一个在途分片，同时最多上传 9 个文件，其余文件保持 `queued`。
 
 `PATCH /api/uploads/{upload_id}` 接收 `{"action":"pause"}` 或 `{"action":"resume"}`。暂停和继续仅允许创建会话的源设备执行；观察设备以只读方式接收状态，并可调用 `DELETE` 取消共享会话。完成接口仅允许源设备调用，要求所有分片连续覆盖文件；服务端以有界缓冲区组装并计算整文件 SHA-256，成功后返回永久文件消息。取消和完成后的非法状态转换返回 `409`，未知会话返回 `404`，容量或文件系统写入失败返回 `507`，并发资源耗尽返回 `503`。
 

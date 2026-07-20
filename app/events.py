@@ -292,13 +292,22 @@ class EventConnection:
                 {"event_type": "ready", "sequence": self.last_sequence}
             )
 
-    async def require_resync(self, replay_target: int) -> None:
+    async def require_resync(
+        self, replay_target: int, *, reset_cursor: bool = False
+    ) -> None:
         async with self.send_lock:
-            await self._require_resync(replay_target)
+            await self._require_resync(replay_target, reset_cursor=reset_cursor)
 
-    async def _require_resync(self, replay_target: int) -> None:
+    async def _require_resync(
+        self, replay_target: int, *, reset_cursor: bool = False
+    ) -> None:
         await self.websocket.send_json(
-            {"event_type": "resync_required", "sequence": replay_target}
+            {
+                "event_type": "resync_required",
+                "sequence": replay_target,
+                "target_sequence": replay_target,
+                "reset_cursor": reset_cursor,
+            }
         )
         self.last_sequence = replay_target
         self.pending = {

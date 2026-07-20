@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -8,6 +7,7 @@ from typing import Literal
 from uuid import uuid4
 
 from .database import Database
+from .event_store import EventWriter
 from .repository import MessageRepository
 from .storage import PendingFile, sanitize_filename
 
@@ -89,8 +89,9 @@ CREATE_METADATA_KEYS = (
 
 
 class UploadRepository:
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, events: EventWriter | None = None) -> None:
         self.db = db
+        self.events = events or EventWriter(10_000)
 
     @staticmethod
     def _expiry(now: datetime, ttl_seconds: int) -> str:
@@ -398,17 +399,13 @@ class UploadRepository:
             )
             return self._load(connection, upload_id)
 
-    @staticmethod
     def _append_event(
-        connection: sqlite3.Connection, event_type: str, entity_id: str,
+        self, connection: sqlite3.Connection, event_type: str, entity_id: str,
         payload: dict[str, object], created_at: str,
     ) -> dict[str, object]:
-        insertion = connection.execute(
-            "INSERT INTO events (event_type, entity_id, payload, created_at) VALUES (?, ?, ?, ?)",
-            (event_type, entity_id, json.dumps(payload), created_at),
+        return self.events.append(
+            connection, event_type, entity_id, payload, created_at
         )
-        return {"sequence": int(insertion.lastrowid), "event_type": event_type,
-                "entity_id": entity_id, "payload": payload, "created_at": created_at}
 
     def persist_progress(
         self, upload_id: str, payload: dict[str, object]
@@ -463,7 +460,7 @@ class UploadRepository:
             message_row = connection.execute(
                 "SELECT * FROM messages WHERE id = ?", (message_id,)
             ).fetchone()
-            message_payload = MessageRepository(self.db)._message_payload(
+            message_payload = MessageRepository(self.db, self.events)._message_payload(
                 connection, message_row
             )
             file_payload = {"id": pending.file_id, "original_name": pending.original_name,
@@ -482,7 +479,7 @@ class UploadRepository:
             session = self._load(connection, upload_id)
             if session["status"] != "complete" or session["message_id"] is None:
                 raise UploadStateConflict(str(session["status"]))
-            message = MessageRepository(self.db).get_message(
+            message = MessageRepository(self.db, self.events).get_message(
                 str(session["message_id"]), connection
             )
             if message is None:
@@ -678,19 +675,42 @@ class UploadRepository:
         ttl_seconds: int,
         *,
         include_event: bool = False,
+        reset_publication: bool = False,
     ) -> dict[str, object]:
         with self.db.transaction() as connection:
             session = self._load(connection, upload_id)
             if session["status"] in {"complete", "cancelled", "expired"}:
                 raise UploadStateConflict(str(session["status"]))
-            if session["status"] == "failed" and session["error_code"] == error_code:
+            publication_is_reset = (
+                session["publication_state"] == "none"
+                and session["file_sha256"] is None
+                and session["message_id"] is None
+            )
+            if (
+                session["status"] == "failed"
+                and session["error_code"] == error_code
+                and (not reset_publication or publication_is_reset)
+            ):
                 if include_event:
                     return {"result": session, "events": [], "changed": False}
                 return session
-            connection.execute(
-                "UPDATE upload_sessions SET status = 'failed', error_code = ?, updated_at = ?, expires_at = ? WHERE id = ?",
-                (error_code, now.isoformat(), self._expiry(now, ttl_seconds), upload_id),
-            )
+            if reset_publication:
+                connection.execute(
+                    "UPDATE upload_sessions SET status = 'failed', error_code = ?, "
+                    "publication_state = 'none', file_sha256 = NULL, message_id = NULL, "
+                    "updated_at = ?, expires_at = ? WHERE id = ?",
+                    (
+                        error_code,
+                        now.isoformat(),
+                        self._expiry(now, ttl_seconds),
+                        upload_id,
+                    ),
+                )
+            else:
+                connection.execute(
+                    "UPDATE upload_sessions SET status = 'failed', error_code = ?, updated_at = ?, expires_at = ? WHERE id = ?",
+                    (error_code, now.isoformat(), self._expiry(now, ttl_seconds), upload_id),
+                )
             result = self._load(connection, upload_id)
             if not include_event:
                 return result

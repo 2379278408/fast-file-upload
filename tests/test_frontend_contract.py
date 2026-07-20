@@ -2574,6 +2574,103 @@ def test_upload_coordinator_reselect_requires_exact_identity_and_sends_server_mi
     assert context.eval("coordinator.getSnapshot()[0].errorCode") is None
 
 
+def test_upload_reconcile_replaces_stale_tasks_without_dropping_new_live_event() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.activeResolver = null;
+      globalThis.removed = [];
+      globalThis.api = {
+        listActiveUploads: () => new Promise(resolve => { activeResolver = resolve; }),
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve([{ uploadId: 'persisted-stale', name: 'old.bin',
+          sizeBytes: 4, status: 'paused', confirmedParts: [], isSourceDevice: true,
+          sessionReady: true, chunkSize: 4 }]),
+        put: () => Promise.resolve(),
+        remove: id => { removed.push(id); return Promise.resolve(); },
+        close: () => {},
+      };
+      globalThis.cryptoObject = {
+        randomUUID: () => 'unused',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, chunkSize: 4,
+      });
+      coordinator.applyRemoteEvent({ event_type: 'upload.created', sequence: 1,
+        payload: { upload_id: 'observer-stale', original_name: 'stale.bin', size_bytes: 4,
+          status: 'uploading', chunk_size_bytes: 4 } });
+      globalThis.reconcilePromise = coordinator.reconcile();
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      coordinator.applyRemoteEvent({ event_type: 'upload.created', sequence: 2,
+        payload: { upload_id: 'live-new', original_name: 'new.bin', size_bytes: 4,
+          status: 'uploading', confirmed_bytes: 3, chunk_size_bytes: 4 } });
+      activeResolver([{ upload_id: 'live-new', original_name: 'new.bin', size_bytes: 4,
+        status: 'paused', confirmed_bytes: 0, confirmed_parts: [], chunk_size_bytes: 4 }]);
+    """)
+    drain_jobs(context)
+
+    assert json.loads(context.eval(
+        "JSON.stringify(coordinator.getSnapshot().map(task => task.uploadId).sort())"
+    )) == ["live-new"]
+    assert sorted(json.loads(context.eval("JSON.stringify(removed)"))) == [
+        "observer-stale", "persisted-stale"
+    ]
+    assert context.eval("coordinator.getSnapshot()[0].status") == "uploading"
+    assert context.eval("coordinator.getSnapshot()[0].confirmedBytes") == 3
+
+
+def test_upload_reconcile_does_not_pause_source_task_updated_after_snapshot_start() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.activeCalls = 0;
+      globalThis.activeResolver = null;
+      globalThis.api = {
+        listActiveUploads: () => activeCalls++ === 0
+          ? Promise.resolve([{ upload_id: 'live-source', original_name: 'source.bin',
+              size_bytes: 4, status: 'uploading', chunk_size_bytes: 4 }])
+          : new Promise(resolve => { activeResolver = resolve; }),
+        controlUpload: () => Promise.resolve({}),
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve([{ uploadId: 'live-source', name: 'source.bin',
+          sizeBytes: 4, status: 'paused', confirmedParts: [], isSourceDevice: true,
+          sessionReady: true, chunkSize: 4 }]),
+        put: () => Promise.resolve(), remove: () => Promise.resolve(), close: () => {},
+      };
+      globalThis.cryptoObject = {
+        randomUUID: () => 'unused',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, chunkSize: 4,
+      });
+      globalThis.startPromise = coordinator.start();
+    """)
+    drain_jobs(context)
+    context.eval("globalThis.reconcilePromise = coordinator.reconcile()")
+    drain_jobs(context)
+    context.eval(r"""
+      coordinator.applyRemoteEvent({ event_type: 'upload.progress', sequence: 2,
+        payload: { upload_id: 'live-source', status: 'uploading', confirmed_bytes: 3,
+          confirmed_parts: [], chunk_size_bytes: 4 } });
+      activeResolver([{ upload_id: 'live-source', original_name: 'source.bin', size_bytes: 4,
+        status: 'paused', confirmed_bytes: 0, confirmed_parts: [], chunk_size_bytes: 4 }]);
+    """)
+    drain_jobs(context)
+
+    assert context.eval("coordinator.getSnapshot()[0].status") == "uploading"
+    assert context.eval("coordinator.getSnapshot()[0].confirmedBytes") == 3
+
+
 def test_upload_coordinator_observer_guidance_terminal_order_and_remote_cancel_abort() -> None:
     context = create_js_context()
     context.eval(r"""
@@ -2642,9 +2739,9 @@ def test_upload_live_region_combines_state_and_milestone_in_one_dom_announcement
         api, persistence, cryptoObject, now: () => clock,
         onAnnounce: message => { announcementCalls += 1; announceToRegion(message); },
       });
-      coordinator.applyRemoteEvent({ event_type: 'upload.created', sequence: 1, payload: { upload_id: 'remote', original_name: 'remote.bin', size_bytes: 100, status: 'queued', confirmed_bytes: 0 } });
+      coordinator.applyRemoteEvent({ event_type: 'upload.created', sequence: 1, payload: { upload_id: 'remote', original_name: 'remote.bin', size_bytes: 100, status: 'queued', confirmed_bytes: 0, chunk_size_bytes: 25 } });
       clock = 1000;
-      coordinator.applyRemoteEvent({ event_type: 'upload.progress', sequence: 2, payload: { upload_id: 'remote', status: 'uploading', confirmed_bytes: 25 } });
+      coordinator.applyRemoteEvent({ event_type: 'upload.progress', sequence: 2, payload: { upload_id: 'remote', status: 'uploading', confirmed_bytes: 25, chunk_size_bytes: 25 } });
       globalThis.combinedText = region.children[0].textContent;
       globalThis.firstNode = region.children[0];
       announceToRegion(combinedText);
@@ -2663,14 +2760,14 @@ def test_upload_notify_combines_all_changed_tasks_once_per_reconcile() -> None:
       globalThis.announcements = [];
       globalThis.cryptoObject = { randomUUID: () => 'unused', subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) } };
       globalThis.remote = [
-        { upload_id: 'one', original_name: 'one.bin', size_bytes: 100, status: 'uploading', confirmed_bytes: 25, confirmed_parts: [] },
-        { upload_id: 'two', original_name: 'two.bin', size_bytes: 100, status: 'uploading', confirmed_bytes: 50, confirmed_parts: [] },
-        { upload_id: 'three', original_name: 'three.bin', size_bytes: 100, status: 'uploading', confirmed_bytes: 75, confirmed_parts: [] },
+        { upload_id: 'one', original_name: 'one.bin', size_bytes: 100, status: 'uploading', confirmed_bytes: 25, confirmed_parts: [], chunk_size_bytes: 25 },
+        { upload_id: 'two', original_name: 'two.bin', size_bytes: 100, status: 'uploading', confirmed_bytes: 50, confirmed_parts: [], chunk_size_bytes: 25 },
+        { upload_id: 'three', original_name: 'three.bin', size_bytes: 100, status: 'uploading', confirmed_bytes: 75, confirmed_parts: [], chunk_size_bytes: 25 },
       ];
       globalThis.records = remote.map(item => ({
         uploadId: item.upload_id, name: item.original_name, sizeBytes: item.size_bytes,
-        status: 'queued', confirmedBytes: 0, confirmedParts: [], isSourceDevice: false,
-        announcedStatus: 'queued',
+            status: 'queued', confirmedBytes: 0, confirmedParts: [], isSourceDevice: false,
+            announcedStatus: 'queued', chunkSize: 25,
       }));
       globalThis.api = { listActiveUploads: () => Promise.resolve(remote) };
       globalThis.persistence = {
@@ -2789,6 +2886,70 @@ def test_upload_coordinator_limits_active_files_and_one_part_per_file() -> None:
     assert context.eval("pendingParts.length") == 0
     assert context.eval("peakFiles") == 9
     assert context.eval("coordinator.getSnapshot().every(Object.isFrozen)") is True
+
+
+def test_upload_coordinator_uses_create_response_chunk_size_for_slicing() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.AbortController = class AbortController {
+        constructor() { this.signal = { aborted: false }; }
+        abort() { this.signal.aborted = true; }
+      };
+      globalThis.createdMetadata = null;
+      globalThis.slices = [];
+      globalThis.parts = [];
+      globalThis.cryptoObject = {
+        randomUUID: () => 'server-sized-upload',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.api = {
+        createUploadSession: metadata => {
+          createdMetadata = metadata;
+          return Promise.resolve({
+            upload_id: 'server-sized-upload', status: 'queued', confirmed_parts: [],
+            confirmed_bytes: 0, chunk_size_bytes: 3,
+          });
+        },
+        uploadPart: (_id, index, blob, range) => {
+          parts.push([index, blob.size, range.start, range.end]);
+          return Promise.resolve({
+            status: 'uploading', confirmed_parts: [index],
+            confirmed_bytes: Math.min(7, (index + 1) * 3), chunk_size_bytes: 3,
+          });
+        },
+        completeUpload: id => Promise.resolve({ upload_id: id }),
+      };
+      globalThis.persistence = {
+        put: () => Promise.resolve(), getAll: () => Promise.resolve([]),
+        remove: () => Promise.resolve(), close: () => {},
+      };
+      globalThis.file = {
+        name: 'seven.bin', size: 7, type: 'application/octet-stream', lastModified: 1,
+        slice(start, end) {
+          slices.push([start, end]);
+          return {
+            size: end - start,
+            arrayBuffer: () => Promise.resolve(new Uint8Array(end - start).buffer),
+          };
+        },
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, delay: () => Promise.resolve(), maxActive: 1,
+      });
+      coordinator.enqueueFiles([file]);
+    """)
+    drain_jobs(context)
+
+    assert context.eval("createdMetadata.chunkSize === undefined") is True
+    assert json.loads(context.eval("JSON.stringify(parts)")) == [
+        [0, 3, 0, 2],
+        [1, 3, 3, 5],
+        [2, 1, 6, 6],
+    ]
+    assert context.eval("coordinator.getSnapshot()[0].status") == "completed"
 
 
 def test_upload_coordinator_controls_missing_retry_priority_size_and_eta() -> None:
@@ -4437,6 +4598,85 @@ def test_connect_events_retries_resync_failure_from_old_cursor() -> None:
     assert context.eval("sessionStorage.getItem('transfer-last-sequence')") == "2"
 
 
+def test_connect_events_serializes_across_generations_and_ignores_stale_completion() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.webSockets = [];
+      globalThis.reconnectCallback = null;
+      globalThis.firstResolver = null;
+      globalThis.deferredOnce = false;
+      globalThis.applied = [];
+      window.setTimeout = callback => { reconnectCallback = callback; return 1; };
+      globalThis.WebSocket = class WebSocket {
+        constructor(url) { this.url = url; this.closed = false; webSockets.push(this); }
+        close() { this.closed = true; }
+      };
+      sessionStorage.setItem('transfer-last-sequence', '2');
+    """)
+    load_js_module(context, "./api.js", read_web("js/api.js"))
+    context.eval(r"""
+      __modules['./api.js'].connectEvents({
+        after: () => 2,
+        onEvent: event => {
+          applied.push(`start-${event.sequence}`);
+          if (event.sequence === 3 && !deferredOnce) {
+            deferredOnce = true;
+            return new Promise(resolve => {
+              firstResolver = () => { applied.push('end-3'); resolve(true); };
+            });
+          }
+          applied.push(`end-${event.sequence}`);
+          return true;
+        },
+        onStatus: () => {},
+      });
+      webSockets[0].onmessage({ data: JSON.stringify({ event_type: 'message.created', sequence: 3 }) });
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      webSockets[0].onclose({ code: 1006 });
+      reconnectCallback();
+      webSockets[1].onmessage({ data: JSON.stringify({ event_type: 'message.created', sequence: 3 }) });
+    """)
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(applied)")) == ["start-3"]
+
+    context.eval("firstResolver();")
+    drain_jobs(context)
+
+    assert json.loads(context.eval("JSON.stringify(applied)")) == [
+        "start-3", "end-3", "start-3", "end-3"
+    ]
+    assert context.eval("sessionStorage.getItem('transfer-last-sequence')") == "3"
+
+
+def test_connect_events_applies_authoritative_downward_cursor_reset() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.webSockets = [];
+      globalThis.WebSocket = class WebSocket {
+        constructor(url) { this.url = url; webSockets.push(this); }
+        close() {}
+      };
+      sessionStorage.setItem('transfer-last-sequence', '9');
+    """)
+    load_js_module(context, "./api.js", read_web("js/api.js"))
+    context.eval(r"""
+      __modules['./api.js'].connectEvents({
+        after: () => 9,
+        onEvent: () => true,
+        onStatus: () => {},
+      });
+      webSockets[0].onmessage({ data: JSON.stringify({
+        event_type: 'resync_required', sequence: 1,
+        target_sequence: 1, reset_cursor: true,
+      }) });
+    """)
+    drain_jobs(context)
+
+    assert context.eval("sessionStorage.getItem('transfer-last-sequence')") == "1"
+
+
 def test_connect_events_cancels_stale_timer_and_preserves_reconnect() -> None:
     context = create_js_context()
     context.eval(r"""
@@ -4539,6 +4779,33 @@ def test_connect_events_cancels_stale_timer_and_preserves_reconnect() -> None:
         "finalReconnectWebSocketCount": 3,
         "unauthorizedStatuses": ["connecting", "closed"],
     }
+
+
+def test_timeline_strict_initial_load_propagates_network_failure() -> None:
+    context = create_js_context()
+    load_js_module(context, "./timeline.js", read_web("js/timeline.js"))
+    context.eval(r"""
+      globalThis.errors = 0;
+      window.addEventListener('timeline-error', () => { errors += 1; });
+      globalThis.strictRejected = false;
+      globalThis.friendlyResolved = false;
+      globalThis.strictTimeline = __modules['./timeline.js'].createTimeline({
+        container: document.getElementById('strictTimeline'),
+        newMessageButton: null,
+        api: () => Promise.reject(new Error('offline')),
+      });
+      strictTimeline.loadInitial({ throwOnError: true })
+        .catch(() => { strictRejected = true; });
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      strictTimeline.loadInitial().then(() => { friendlyResolved = true; });
+    """)
+    drain_jobs(context)
+
+    assert context.eval("strictRejected") is True
+    assert context.eval("friendlyResolved") is True
+    assert context.eval("errors") == 2
 
 
 def test_timeline_concurrent_loads_share_promise_and_load_until_continues(

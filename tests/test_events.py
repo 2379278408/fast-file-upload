@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import Settings
+from app.database import Database
+from app.event_store import EventWriter
 from app.auth import SessionData
 from app.events import EventHub, UploadProgressPublisher
 from app.main import create_app
@@ -390,8 +394,32 @@ def test_stale_websocket_cursor_requires_authoritative_resync(
         resync = ws.receive_json()
         ready = ws.receive_json()
 
-    assert resync == {"event_type": "resync_required", "sequence": 5}
+    assert resync == {
+        "event_type": "resync_required",
+        "sequence": 5,
+        "target_sequence": 5,
+        "reset_cursor": False,
+    }
     assert ready == {"event_type": "ready", "sequence": 5}
+
+
+def test_websocket_cursor_ahead_of_database_requests_downward_reset(
+    client: TestClient,
+) -> None:
+    unlock(client)
+    create_text(client, "current", "database-reset-current")
+
+    with client.websocket_connect("/api/events?after=99") as ws:
+        resync = ws.receive_json()
+        ready = ws.receive_json()
+
+    assert resync == {
+        "event_type": "resync_required",
+        "sequence": 1,
+        "target_sequence": 1,
+        "reset_cursor": True,
+    }
+    assert ready == {"event_type": "ready", "sequence": 1}
 
 
 def test_event_retention_keeps_latest_global_window(client: TestClient) -> None:
@@ -408,6 +436,76 @@ def test_event_retention_keeps_latest_global_window(client: TestClient) -> None:
 
     assert sequences == [6, 7, 8]
     assert client.app.state.messages.earliest_sequence() == 6
+
+
+def test_event_retention_is_enforced_by_each_append(client: TestClient) -> None:
+    unlock(client)
+    for index in range(8):
+        create_text(client, f"event-{index}", f"hard-bound-{index}")
+
+    with client.app.state.database.connect() as connection:
+        count = int(connection.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+
+    assert count == client.app.state.settings.event_retention_limit
+
+
+def test_concurrent_event_appends_preserve_retention_hard_bound(client: TestClient) -> None:
+    device = SessionData(
+        device_id="concurrent", device_name="Concurrent", expires_at=2_000_000_000
+    )
+
+    def append(index: int) -> None:
+        client.app.state.messages.create_text(
+            f"concurrent-{index}", f"concurrent-{index}", device
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(append, range(24)))
+
+    with client.app.state.database.connect() as connection:
+        count = int(connection.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+
+    assert count <= client.app.state.settings.event_retention_limit
+
+
+def test_all_repository_event_paths_share_the_write_time_retention_bound(
+    client: TestClient,
+) -> None:
+    unlock(client)
+    created = client.post(
+        "/api/uploads",
+        json={
+            "client_request_id": "event-upload",
+            "name": "event.txt",
+            "size_bytes": 4,
+            "mime_type": "text/plain",
+            "last_modified_ms": 1,
+            "sample_sha256": sha256(b"sample").hexdigest(),
+        },
+    )
+    assert created.status_code == 200
+    upload_id = str(created.json()["upload_id"])
+    client.app.state.upload_repository.persist_progress(
+        upload_id,
+        {"updated_at": "2026-07-20T00:00:00+00:00", "in_flight_bytes": 1},
+    )
+    uploaded = client.post(
+        "/api/upload",
+        data={"client_request_id": "event-file"},
+        files={"file": ("event.txt", b"data", "text/plain")},
+    )
+    assert uploaded.status_code == 200
+
+    with client.app.state.database.connect() as connection:
+        event_types = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT event_type FROM events ORDER BY sequence"
+            )
+        ]
+
+    assert len(event_types) <= client.app.state.settings.event_retention_limit
+    assert event_types == ["upload.progress", "message.created", "file.finalized"]
 
 
 def test_mutations_broadcast_committed_structured_events_only(client: TestClient) -> None:
@@ -577,7 +675,9 @@ def test_event_hub_serializes_and_orders_reversed_live_broadcasts() -> None:
     assert websocket.sent[0]["event_type"] == "ready"
 
 
-def test_live_gap_after_retention_emits_resync_before_new_event() -> None:
+def test_live_gap_after_retention_uses_commit_before_broadcast(
+    tmp_path: Path,
+) -> None:
     class FakeWebSocket:
         def __init__(self) -> None:
             self.sent: list[dict[str, object]] = []
@@ -585,8 +685,37 @@ def test_live_gap_after_retention_emits_resync_before_new_event() -> None:
         async def send_json(self, event: dict[str, object]) -> None:
             self.sent.append(event)
 
-    def fetch_missing(_after: int, _limit: int) -> dict[str, object]:
-        return {"earliest": 5, "latest": 7, "events": []}
+    database = Database(tmp_path / "events.sqlite3")
+    database.initialize()
+    writer = EventWriter(3)
+
+    def append(sequence_label: str) -> dict[str, object]:
+        with database.transaction() as connection:
+            return writer.append(
+                connection,
+                "message.created",
+                sequence_label,
+                {"id": sequence_label},
+            )
+
+    for index in range(7):
+        append(f"old-{index}")
+
+    def fetch_missing(after: int, limit: int) -> dict[str, object]:
+        with database.connect() as connection:
+            bounds = connection.execute(
+                "SELECT MIN(sequence), MAX(sequence) FROM events"
+            ).fetchone()
+            rows = connection.execute(
+                "SELECT sequence, event_type, entity_id, payload, created_at "
+                "FROM events WHERE sequence > ? ORDER BY sequence LIMIT ?",
+                (after, limit),
+            ).fetchall()
+        return {
+            "earliest": int(bounds[0]),
+            "latest": int(bounds[1]),
+            "events": [dict(row) for row in rows],
+        }
 
     async def scenario() -> FakeWebSocket:
         hub = EventHub()
@@ -594,24 +723,17 @@ def test_live_gap_after_retention_emits_resync_before_new_event() -> None:
         websocket = FakeWebSocket()
         connection = hub.connect(websocket, after=1)
         await connection.finish_replay(1)
-        await hub.broadcast(
-            {
-                "sequence": 8,
-                "event_type": "message.created",
-                "entity_id": "new",
-                "payload": {},
-            }
-        )
+        committed = append("new")
+        await hub.broadcast(committed)
         return websocket
 
     websocket = asyncio.run(scenario())
     assert websocket.sent == [
         {"event_type": "ready", "sequence": 1},
-        {"event_type": "resync_required", "sequence": 7},
         {
+            "event_type": "resync_required",
             "sequence": 8,
-            "event_type": "message.created",
-            "entity_id": "new",
-            "payload": {},
+            "target_sequence": 8,
+            "reset_cursor": False,
         },
     ]

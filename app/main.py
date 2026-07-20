@@ -39,6 +39,7 @@ from .chunk_storage import (
 )
 from .database import Database
 from .events import EventHub, UploadProgressPublisher
+from .event_store import EventWriter
 from .repository import (
     BatchDownloadSourceMissing,
     BatchDownloadTooLarge,
@@ -111,7 +112,7 @@ class CreateUploadRequest(BaseModel):
     size_bytes: int = Field(ge=1)
     mime_type: str = Field(default="application/octet-stream", max_length=255)
     last_modified_ms: int = Field(ge=0)
-    chunk_size_bytes: int = Field(gt=0)
+    chunk_size_bytes: int | None = Field(default=None, gt=0)
     sample_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
@@ -278,7 +279,8 @@ class _CleanupStreamingResponse(StreamingResponse):
 def create_app(settings: Settings) -> FastAPI:
     database = Database(settings.database_path)
     database.initialize()
-    messages = MessageRepository(database)
+    event_writer = EventWriter(settings.event_retention_limit)
+    messages = MessageRepository(database, event_writer)
     storage = FileStorage(settings.upload_dir, settings.max_upload_size, settings.allowed_extensions)
     zip_temp_paths = _TemporaryPathRegistry()
     zip_cleanup_tasks: set[asyncio.Task[None]] = set()
@@ -488,7 +490,7 @@ def create_app(settings: Settings) -> FastAPI:
     web_root = web_dir / "index.html"
     upload_locks = _KeyedLockPool(settings.client_request_lock_capacity)
     app.state.upload_locks = upload_locks
-    upload_repository = UploadRepository(database)
+    upload_repository = UploadRepository(database, event_writer)
     chunk_storage = ChunkStorage(settings.upload_dir)
     upload_service = UploadService(
         upload_repository, chunk_storage, settings, upload_locks, storage
@@ -937,7 +939,11 @@ def create_app(settings: Settings) -> FastAPI:
         session: SessionData = Depends(require_session),
         _: None = Depends(enforce_rate_limit),
     ) -> dict[str, object]:
-        if payload.chunk_size_bytes != request.app.state.settings.upload_chunk_size_bytes:
+        configured_chunk_size = request.app.state.settings.upload_chunk_size_bytes
+        if (
+            payload.chunk_size_bytes is not None
+            and payload.chunk_size_bytes != configured_chunk_size
+        ):
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -952,7 +958,7 @@ def create_app(settings: Settings) -> FastAPI:
             size_bytes=payload.size_bytes,
             last_modified_ms=payload.last_modified_ms,
             sample_sha256=payload.sample_sha256,
-            chunk_size_bytes=payload.chunk_size_bytes,
+            chunk_size_bytes=configured_chunk_size,
             source_device_id=session.device_id,
             source_device_name=session.device_name,
         )
@@ -1328,12 +1334,13 @@ def create_app(settings: Settings) -> FastAPI:
         await websocket.accept()
         window = messages.event_window_after(after, 1)
         latest = int(window["latest"])
-        if after > latest:
-            after = 0
         connection = hub.connect(websocket, after)
         try:
             replay_target = latest
             replay_cursor = after
+            if after > latest:
+                await connection.require_resync(latest, reset_cursor=True)
+                replay_cursor = latest
             while replay_cursor < replay_target:
                 replay_window = await asyncio.to_thread(
                     messages.event_window_after, replay_cursor

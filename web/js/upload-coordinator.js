@@ -1,4 +1,4 @@
-import { MAX_ACTIVE_UPLOADS, MAX_UPLOAD_SIZE_BYTES, UPLOAD_CHUNK_SIZE_BYTES, UPLOAD_ETA_MIN_SAMPLE_MS, UPLOAD_RETRY_DELAYS, UPLOAD_SPEED_WINDOW_MS } from './config.js';
+import { MAX_ACTIVE_UPLOADS, MAX_UPLOAD_SIZE_BYTES, UPLOAD_ETA_MIN_SAMPLE_MS, UPLOAD_RETRY_DELAYS, UPLOAD_SPEED_WINDOW_MS } from './config.js';
 
 const IDENTITY_SAMPLE_BYTES = 64 * 1024;
 const IDENTITY_VERSION = 'sample-identity-v1';
@@ -145,6 +145,7 @@ function persistedTask(task) {
     serverSequence: task.serverSequence,
     serverUpdatedAt: task.serverUpdatedAt,
     serverVersion: task.serverVersion,
+    chunkSize: task.chunkSize,
   };
 }
 
@@ -156,7 +157,7 @@ export function createUploadCoordinator({
   delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
   abortControllerFactory = () => new AbortController(),
   maxActive = MAX_ACTIVE_UPLOADS,
-  chunkSize = UPLOAD_CHUNK_SIZE_BYTES,
+  chunkSize = null,
   onAnnounce = null,
   onCompleted = null,
 }) {
@@ -166,6 +167,7 @@ export function createUploadCoordinator({
   let pumping = false;
   let generation = 0;
   let persistenceClosed = false;
+  let liveRevision = 0;
   let resolveDestroy;
   const destroyPromise = new Promise(resolve => { resolveDestroy = resolve; });
   const pendingWorkers = new Set();
@@ -240,8 +242,8 @@ export function createUploadCoordinator({
       : null;
   };
   const confirmedPartBytes = (task, parts) => parts.reduce((total, partIndex) => {
-    const start = partIndex * chunkSize;
-    return total + Math.max(0, Math.min(chunkSize, task.sizeBytes - start));
+    const start = partIndex * task.chunkSize;
+    return total + Math.max(0, Math.min(task.chunkSize, task.sizeBytes - start));
   }, 0);
   const recordServerRevision = (task, response) => {
     if (!response) return;
@@ -273,6 +275,17 @@ export function createUploadCoordinator({
     return true;
   };
   const applyServerState = (task, response, { authoritative = false } = {}) => {
+    const responseChunkSize = response && (response.chunk_size_bytes ?? response.chunkSize);
+    if (responseChunkSize !== undefined && responseChunkSize !== null) {
+      const resolvedChunkSize = Number(responseChunkSize);
+      if (!Number.isInteger(resolvedChunkSize) || resolvedChunkSize < 1) {
+        throw new Error('Upload session returned an invalid chunk size');
+      }
+      task.chunkSize = resolvedChunkSize;
+    }
+    if (!Number.isInteger(task.chunkSize) || task.chunkSize < 1) {
+      throw new Error('Upload session did not return a chunk size');
+    }
     const incomingParts = serverParts(response, []);
     task.confirmedParts = authoritative ? incomingParts : unionParts(task.confirmedParts, incomingParts);
     const serverBytes = response && (response.confirmed_bytes ?? response.confirmedBytes) !== undefined
@@ -303,7 +316,7 @@ export function createUploadCoordinator({
   };
   const findTask = uploadId => tasks.find(task => task.uploadId === uploadId || task.clientRequestId === uploadId);
   const nextMissingPart = task => {
-    const count = Math.ceil(task.sizeBytes / chunkSize);
+    const count = Math.ceil(task.sizeBytes / task.chunkSize);
     for (let index = 0; index < count; index += 1) {
       if (!task.confirmedParts.includes(index)) return index;
     }
@@ -347,8 +360,8 @@ export function createUploadCoordinator({
     task.status = 'uploading';
     task.controller = abortControllerFactory();
     if (!task.samples.length) task.samples = [{ time: now(), bytes: task.confirmedBytes }];
-    const start = partIndex * chunkSize;
-    const endExclusive = Math.min(task.sizeBytes, start + chunkSize);
+    const start = partIndex * task.chunkSize;
+    const endExclusive = Math.min(task.sizeBytes, start + task.chunkSize);
     const blob = task.file.slice(start, endExclusive);
     let attempt = 0;
     notify(token);
@@ -437,6 +450,8 @@ export function createUploadCoordinator({
       sourceDeviceId: null, isSourceDevice: true, errorCode: null, errorMessage: null,
       createdAt: now(), samples: [], controller: null, worker: null,
       sessionReady: false,
+      chunkSize: Number.isInteger(chunkSize) && chunkSize > 0 ? chunkSize : null,
+      liveRevision: 0,
       serverSequence: null, serverUpdatedAt: null, serverVersion: null,
     };
   }
@@ -453,15 +468,16 @@ export function createUploadCoordinator({
     try {
       task.identity = await raceWithDestroy(sampleFileIdentity(task.file, cryptoObject));
       if (!isCurrent(token) || task.status === 'cancelled') return;
-      const response = await raceWithDestroy(api.createUploadSession({
+      const metadata = {
         clientRequestId: task.clientRequestId,
         name: task.name,
         sizeBytes: task.sizeBytes,
         mimeType: task.mimeType,
         lastModified: task.identity.lastModified,
-        chunkSize,
         sampleSha256: task.identity.sampleSha256,
-      }));
+      };
+      if (task.chunkSize !== null) metadata.chunkSize = task.chunkSize;
+      const response = await raceWithDestroy(api.createUploadSession(metadata));
       if (!isCurrent(token)) return;
       task.uploadId = response.upload_id || response.uploadId || task.uploadId;
       task.sessionReady = true;
@@ -499,6 +515,8 @@ export function createUploadCoordinator({
       progressPercent: record.sizeBytes ? (record.confirmedBytes || 0) * 100 / record.sizeBytes : 0,
       speedBytesPerSecond: 0, etaSeconds: null, samples: [], controller: null, worker: null,
       isSourceDevice: Boolean(record.isSourceDevice), sessionReady: true,
+      chunkSize: record.chunkSize ?? record.chunk_size_bytes ?? chunkSize,
+      liveRevision: record.liveRevision ?? 0,
       serverSequence: record.serverSequence ?? null,
       serverUpdatedAt: record.serverUpdatedAt ?? null,
       serverVersion: record.serverVersion ?? null,
@@ -525,6 +543,8 @@ export function createUploadCoordinator({
       isSourceDevice: false, errorCode: null, errorMessage: null,
       createdAt: data.created_at || data.createdAt || now(), samples: [], controller: null,
       worker: null, sessionReady: true,
+      chunkSize: data.chunk_size_bytes ?? data.chunkSize ?? chunkSize,
+      liveRevision: 0,
       serverSequence: null, serverUpdatedAt: null, serverVersion: null,
     };
   }
@@ -708,6 +728,7 @@ export function createUploadCoordinator({
     cancelAll() { tasks.forEach(task => coordinator.cancel(task.uploadId)); },
     async reconcile() {
       const token = generation;
+      const reconcileRevision = liveRevision;
       if (!isCurrent(token)) throw coordinatorDestroyedError();
       const remote = api.listActiveUploads ? await raceWithDestroy(api.listActiveUploads()) : [];
       if (!isCurrent(token)) throw coordinatorDestroyedError();
@@ -717,6 +738,7 @@ export function createUploadCoordinator({
         const data = eventData(item);
         return [data.upload_id || data.uploadId, data];
       }));
+      const activeUploadIds = new Set(remoteById.keys());
 
       for (const record of records) {
         if (!isCurrent(token)) throw coordinatorDestroyedError();
@@ -728,38 +750,39 @@ export function createUploadCoordinator({
         const data = remoteById.get(record.uploadId);
         if (data) {
           remoteById.delete(record.uploadId);
-          task.clientRequestId = data.client_request_id || data.clientRequestId || task.clientRequestId;
-          task.name = data.original_name || data.name || task.name;
-          task.sizeBytes = data.size_bytes ?? data.sizeBytes ?? task.sizeBytes;
-          task.mimeType = data.mime_type || data.mimeType || task.mimeType;
-          task.sourceDeviceId = data.source_device_id || data.sourceDeviceId || task.sourceDeviceId;
-          applyServerState(task, data, { authoritative: true });
-          applyRemoteStatus(task, data);
-          await coordinateSourceFile(task, token);
+          if (task.liveRevision <= reconcileRevision) {
+            task.clientRequestId = data.client_request_id || data.clientRequestId || task.clientRequestId;
+            task.name = data.original_name || data.name || task.name;
+            task.sizeBytes = data.size_bytes ?? data.sizeBytes ?? task.sizeBytes;
+            task.mimeType = data.mime_type || data.mimeType || task.mimeType;
+            task.sourceDeviceId = data.source_device_id || data.sourceDeviceId || task.sourceDeviceId;
+            applyServerState(task, data, { authoritative: true });
+            applyRemoteStatus(task, data);
+            await coordinateSourceFile(task, token);
+          }
           if (!isCurrent(token)) throw coordinatorDestroyedError();
           await persist(task, token);
           continue;
         }
-        if (api.getUploadSession) {
-          try {
-            const finalData = await raceWithDestroy(api.getUploadSession(record.uploadId));
-            if (!isCurrent(token)) throw coordinatorDestroyedError();
-            if (TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(finalData.status))) {
-              applyServerState(task, finalData, { authoritative: true });
-              applyRemoteStatus(task, finalData);
-              await raceWithDestroy(persistence.remove(task.uploadId)).catch(() => {});
-              continue;
-            }
-          } catch (error) {
-            if (error.name === 'CoordinatorDestroyedError') throw error;
-          }
-        }
-        await coordinateSourceFile(task, token);
-        await persist(task, token);
       }
 
-      remoteById.forEach(data => coordinator.applyRemoteEvent({ event_type: 'upload.created', payload: data }));
+      remoteById.forEach(data => {
+        const existing = findTask(data.upload_id || data.uploadId)
+          || findTask(data.client_request_id || data.clientRequestId);
+        if (!existing || existing.liveRevision <= reconcileRevision) {
+          coordinator.applyRemoteEvent({ event_type: 'upload.created', payload: data });
+        }
+      });
       if (!isCurrent(token)) throw coordinatorDestroyedError();
+      for (let index = tasks.length - 1; index >= 0; index -= 1) {
+        const task = tasks[index];
+        if (!task.sessionReady || activeUploadIds.has(task.uploadId)
+            || task.liveRevision > reconcileRevision) continue;
+        task.controller?.abort();
+        tasks.splice(index, 1);
+        await raceWithDestroy(persistence.remove(task.uploadId)).catch(() => {});
+        if (!isCurrent(token)) throw coordinatorDestroyedError();
+      }
       notify(token);
       pump();
       return snapshot();
@@ -768,6 +791,7 @@ export function createUploadCoordinator({
       if (destroyed) return false;
       const data = eventData(event);
       const upsertRemote = payload => {
+        const eventRevision = ++liveRevision;
         const remoteUploadId = payload.upload_id || payload.uploadId;
         const remoteClientRequestId = payload.client_request_id || payload.clientRequestId;
         let task = findTask(remoteUploadId) || findTask(remoteClientRequestId);
@@ -781,6 +805,7 @@ export function createUploadCoordinator({
         if (remoteClientRequestId) task.clientRequestId = remoteClientRequestId;
         applyServerState(task, payload);
         applyRemoteStatus(task, payload);
+        task.liveRevision = eventRevision;
         notify();
         return true;
       };

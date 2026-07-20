@@ -633,7 +633,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     return false;
   }
 
-  async function loadInitial() {
+  async function loadInitial({ throwOnError = false } = {}) {
     const generation = ++loadGeneration;
     if (destroyed || !container) return;
     loading = false;
@@ -664,14 +664,14 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     container.append(sentinel);
     if (observer) observer.observe(sentinel);
 
-    await loadOlder();
+    await loadOlder({ throwOnError });
     if (destroyed || generation !== loadGeneration) return;
     scrollToBottom(false);
 
     if (onRestore) await onRestore();
   }
 
-  function loadOlder() {
+  function loadOlder({ throwOnError = false } = {}) {
     if (destroyed) return Promise.resolve(false);
     if (loadingPromise) return loadingPromise;
     if (exhausted) return Promise.resolve(false);
@@ -705,10 +705,11 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
           restorePagingPosition(anchor, previousScrollHeight, previousScrollTop);
         }
         return true;
-      } catch {
+      } catch (error) {
         if (!destroyed && generation === loadGeneration) {
           window.dispatchEvent(new CustomEvent('timeline-error', { detail: { message: '加载历史消息失败，请稍后重试。' } }));
         }
+        if (throwOnError) throw error;
         return false;
       }
     })();

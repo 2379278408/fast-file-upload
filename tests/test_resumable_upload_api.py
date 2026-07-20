@@ -85,6 +85,24 @@ def test_create_rejects_chunk_size_that_differs_from_server(settings: Settings) 
     }
 
 
+def test_create_uses_server_chunk_size_when_request_omits_it(settings: Settings) -> None:
+    client = authenticated_client(settings)
+    response = client.post(
+        "/api/uploads",
+        json={
+            "client_request_id": "server-chunk-size",
+            "name": "report.txt",
+            "size_bytes": 8,
+            "mime_type": "text/plain",
+            "last_modified_ms": 1,
+            "sample_sha256": sha256(b"sample").hexdigest(),
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["chunk_size_bytes"] == settings.upload_chunk_size_bytes
+
+
 def test_chunk_configuration_bounds_part_count_and_request_size(settings: Settings) -> None:
     maximum_size = 512 * 1024 * 1024
     with pytest.raises(ConfigurationError, match="10000 part limit"):
@@ -101,6 +119,16 @@ def test_chunk_configuration_bounds_part_count_and_request_size(settings: Settin
         upload_chunk_size_bytes=8 * 1024 * 1024,
     )
     assert configured.upload_chunk_size_bytes == 8 * 1024 * 1024
+
+
+def test_chunk_configuration_can_exceed_max_upload_size(settings: Settings) -> None:
+    configured = replace(
+        settings,
+        max_upload_size=1024,
+        upload_chunk_size_bytes=2 * 1024,
+    )
+
+    assert configured.upload_chunk_size_bytes == 2 * 1024
 
 
 def test_512_mib_session_reserves_upload_and_assembly_peak(

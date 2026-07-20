@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from .auth import SessionData
 from .database import Database
+from .event_store import EventWriter
 from .storage import IMAGE_EXTENSIONS, FileStorage, PendingFile, StoredFile, format_size
 
 
@@ -66,8 +67,9 @@ def new_sortable_id(now: datetime | None = None) -> str:
 
 
 class MessageRepository:
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, events: EventWriter | None = None) -> None:
         self.db = db
+        self.events = events or EventWriter(10_000)
 
     def _message_payload(
         self, connection: sqlite3.Connection, row: sqlite3.Row
@@ -118,19 +120,7 @@ class MessageRepository:
         entity_id: str,
         payload: dict[str, object],
     ) -> dict[str, object]:
-        created_at = utc_now().isoformat()
-        insertion = connection.execute(
-            "INSERT INTO events (event_type, entity_id, payload, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (event_type, entity_id, json.dumps(payload), created_at),
-        )
-        return {
-            "sequence": int(insertion.lastrowid),
-            "event_type": event_type,
-            "entity_id": entity_id,
-            "payload": payload,
-            "created_at": created_at,
-        }
+        return self.events.append(connection, event_type, entity_id, payload)
 
     def latest_sequence(self) -> int:
         with self.db.connect() as connection:

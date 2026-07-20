@@ -576,7 +576,18 @@ class UploadService:
                     self._continue_publication_locked(upload_id, original, now)
                 )
                 return mutations
-        except (OSError, PartIntegrityError, UploadStateConflict):
+        except PartIntegrityError:
+            mutations.append(
+                self.repository.fail(
+                    upload_id,
+                    "publication_error",
+                    now,
+                    self.settings.upload_session_ttl_seconds,
+                    include_event=True,
+                    reset_publication=True,
+                )
+            )
+        except (OSError, UploadStateConflict):
             mutations.append(
                 self.repository.fail(
                     upload_id,

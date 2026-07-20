@@ -79,11 +79,9 @@ class Settings:
             raise ConfigurationError("CLIENT_REQUEST_LOCK_CAPACITY must be at least 1")
         if self.upload_chunk_size_bytes < 1:
             raise ConfigurationError("UPLOAD_CHUNK_SIZE_BYTES must be at least 1")
-        if self.upload_chunk_size_bytes > min(
-            self.max_upload_size, MAX_UPLOAD_CHUNK_SIZE_BYTES
-        ):
+        if self.upload_chunk_size_bytes > MAX_UPLOAD_CHUNK_SIZE_BYTES:
             raise ConfigurationError(
-                "UPLOAD_CHUNK_SIZE_BYTES must not exceed the upload or 64 MiB limit"
+                "UPLOAD_CHUNK_SIZE_BYTES must not exceed the 64 MiB limit"
             )
         part_count = (
             self.max_upload_size + self.upload_chunk_size_bytes - 1

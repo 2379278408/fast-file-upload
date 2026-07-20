@@ -1149,6 +1149,13 @@ def test_old_page_anchor_restoration_has_no_smooth_drift_and_focuses_fallback(
         "sessionStorage.setItem('transfer-last-sequence', String(Number.MAX_SAFE_INTEGER))"
     )
     _unlock(page)
+    for _ in range(400):
+        if page.evaluate("sessionStorage.getItem('transfer-last-sequence')") == "60":
+            break
+        page.wait_for_timeout(25)
+    else:
+        raise AssertionError("ahead-of-database cursor was not reset to the replay target")
+    paged_requests.clear()
 
     anchor = page.locator(f'[data-message-id="{anchor_id}"]')
     container = page.locator("#timelineContainer")

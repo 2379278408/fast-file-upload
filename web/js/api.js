@@ -30,6 +30,7 @@ function storeLastSequence(sequence) {
 export function connectEvents({ after, onEvent, onStatus }) {
   let attempt = 0, stopped = false, socket, reconnectTimer = null;
   let lastAppliedSequence = normalizeSequence(after());
+  let eventQueue = Promise.resolve();
   const clearReconnectTimer = () => {
     if (reconnectTimer === null) return;
     window.clearTimeout(reconnectTimer);
@@ -48,14 +49,19 @@ export function connectEvents({ after, onEvent, onStatus }) {
       attempt = 0;
       onStatus('connected');
     };
-    let eventQueue = Promise.resolve();
     currentSocket.onmessage = message => {
       eventQueue = eventQueue.then(async () => {
         if (stopped || socket !== currentSocket || generation.failed) return;
         const event = JSON.parse(message.data);
         if (await onEvent(event) !== true) throw new Error('Event application failed');
+        if (stopped || socket !== currentSocket || generation.failed) return;
         if (event.sequence === undefined) return;
-        const sequence = normalizeSequence(event.sequence);
+        const sequence = normalizeSequence(event.target_sequence ?? event.sequence);
+        if (event.event_type === 'resync_required' && event.reset_cursor === true) {
+          lastAppliedSequence = sequence;
+          storeLastSequence(sequence);
+          return;
+        }
         if (sequence > lastAppliedSequence) {
           lastAppliedSequence = sequence;
           storeLastSequence(sequence);
