@@ -44,6 +44,15 @@ Baseline: `61ec8db` (`fix(upload): preserve tasks across reconcile migration`)
 - Batch controls use explicit transition sets matching the server contract: pause selects source `queued` and `uploading`; resume selects source `paused` and `failed`; cancel selects source and observer `queued`, `uploading`, `paused`, `verifying`, and `failed`. Skipped states stay outside the settled result and failure count.
 - Coordinator subscriptions now include `{ hasPendingControl }`. A pending individual or batch control suppresses overlapping batch execution until every selected request settles.
 
+### Follow-up Review 2: Retry Authority And Cancellation Races
+
+- Retry now dispatches from a fresh server snapshot while retaining the local `failed` entry condition. Authoritative `queued` or `uploading` sessions adopt confirmed parts and enter the existing pump; `paused` or `failed` sessions await server resume; `verifying` remains read-only; terminal sessions converge locally and reject retry.
+- A locally failed task whose server remains `uploading` resumes with one worker, skips the already confirmed part, uploads only the missing part, and publishes completion once.
+- Cancellation now covers every locally actionable non-terminal phase: `preparing`, `queued`, `uploading`, `paused`, `verifying`, `completing`, and `failed`. Batch totals and settled results include source and observer tasks in those phases.
+- Cancelling during deferred preparation records cancellation intent immediately. When session creation resolves, the coordinator deletes the new server session, removes both client-request and server-ID persistence, and never starts the upload pump.
+- Cancelling during deferred completion deletes the server `verifying` session. A late complete response cannot publish a completed message or replace the confirmed cancelled state, and pending batch state clears after settlement.
+- TDD RED coverage produced `8 failed, 2 passed`; the focused GREEN run produced `10 passed, 165 deselected, 1 warning in 0.35s`.
+
 ## UX Decisions
 
 - Pending controls keep the last server-confirmed status and replace the card status text with `正在暂停`, `正在继续`, or `正在取消`.
@@ -54,10 +63,10 @@ Baseline: `61ec8db` (`fix(upload): preserve tasks across reconcile migration`)
 
 ## Verification
 
-- Frontend contract suite: `167 passed, 1 warning in 5.10s`.
-- Browser E2E suite: `22 passed, 1 warning in 153.64s`.
-- Focused production picker reload regression: `1 passed, 1 warning in 39.69s`. The two reload-completion message assertions now share the suite's 20-second asynchronous UI window.
-- Default full suite: `561 passed, 1 deselected, 1 warning in 213.49s`.
+- Frontend contract suite: `175 passed, 1 warning in 4.56s`.
+- Browser E2E suite: `22 passed, 1 warning in 164.39s`.
+- Focused production picker reload regression: `1 passed, 1 warning in 15.46s`.
+- Default full suite: `569 passed, 1 deselected, 1 warning in 216.08s`.
 - `python3 -m compileall -q app server.py tests`: passed. The environment has no `python` executable alias.
 - `git diff --check`: passed.
 - Local preview: root returned HTTP 200 through `https://8086-57e9f8b4df557af1.monkeycode-ai.online` using existing background terminal `term_1784550079788_23`.
@@ -67,3 +76,4 @@ Baseline: `61ec8db` (`fix(upload): preserve tasks across reconcile migration`)
 - File System Access remains a Chromium-oriented progressive enhancement. Other browsers continue through the file input and can resume after a manual reselect.
 - IndexedDB implementations that cannot structured-clone a handle retain the existing metadata-only fallback. Real Chromium handle cloning and reload continuation are covered.
 - When both a control request and its recovery GET fail, the card retains the last confirmed local snapshot and displays the control error; the rejected promise drives the toast and a later reconcile can recover.
+- The first full browser run hit a Chromium OPFS fixture `FileSystemWritableFileStream` data-pipe `AbortError` before coordinator code executed. The focused OPFS regression and a complete browser rerun passed without product changes or relaxed assertions.

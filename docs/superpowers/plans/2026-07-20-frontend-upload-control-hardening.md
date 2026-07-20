@@ -101,3 +101,46 @@
 - [ ] Run whitespace and diff checks with `git diff --check` and inspect the complete diff.
 - [ ] Record findings 3/4/8/11/Minor, tests, UX decisions, and residual concerns in the branch report.
 - [ ] Review status/diff/log, stage only intended files, and create a new commit without amend.
+
+### Task 6: Authoritative retry state matrix
+
+**Files:**
+- Modify: `tests/test_frontend_contract.py`
+- Modify: `web/js/upload-coordinator.js`
+
+**Interfaces:**
+- Refines: `retry(uploadId): Promise<PublicUploadTask>`
+- Consumes: authoritative `getUploadSession(uploadId)` status and confirmed-part snapshot.
+
+- [x] Write failing contract coverage for a locally failed upload whose server status remains `uploading`, proving retry adopts missing parts, runs one worker, uploads only the missing part, and completes.
+- [x] Add matrix assertions for direct pump from `queued`/`uploading`, awaited resume from `paused`/`failed`, read-only rejection for `verifying`, and convergence plus rejection for terminal states.
+- [x] Run the focused tests and confirm the current failed-only server gate fails.
+- [x] Implement authoritative retry dispatch without creating a second worker.
+- [x] Run focused retry tests and confirm pass.
+
+### Task 7: Cancellation across local transition phases
+
+**Files:**
+- Modify: `tests/test_frontend_contract.py`
+- Modify: `web/js/upload-coordinator.js`
+
+**Interfaces:**
+- Refines: `cancel(uploadId): Promise<PublicUploadTask>`
+- Refines: `cancelAll(): Promise<ControlSummary>`
+- Adds internal cancellation intent that survives deferred session creation and deferred completion.
+
+- [x] Write a failing deferred-create test proving cancel settles only after a successful create response is immediately deleted and persistence is removed, with no upload worker.
+- [x] Write a failing deferred-complete test proving cancel preempts local `completing`, deletes the server `verifying` session, suppresses completion publication, and clears pending state.
+- [x] Assert `cancelAll` includes `preparing` and `completing`, reports exact totals/results, and cannot remain pending.
+- [x] Run focused cancellation tests and confirm failure against the current transition set and completion race.
+- [x] Implement the minimal cancellation-intent coordination and extend the batch cancel set.
+- [x] Run focused cancellation tests and confirm pass.
+
+### Task 8: Review verification and independent commit
+
+**Files:**
+- Modify: `.superpowers/sdd/branch-review-frontend-report.md`
+
+- [x] Run frontend contract, browser E2E, default full suite, compileall, and `git diff --check`.
+- [x] Update the review report with retry matrix, preparing/completing cancellation semantics, exact test results, and residual concerns.
+- [x] Inspect status, diff, and log; stage only intended files and create one new commit without amend.

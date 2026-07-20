@@ -2828,7 +2828,7 @@ def test_reselect_and_retry_require_server_controllable_source_states() -> None:
       coordinator.retry('retry-gate').catch(error => { retryError = error.message; });
     """)
     drain_jobs(context)
-    assert context.eval("retryError") == "仅服务端失败任务可以重试"
+    assert context.eval("retryError") == "服务端正在校验，无法重试"
     assert context.eval("coordinator.getSnapshot()[0].status") == "verifying"
     assert json.loads(context.eval("JSON.stringify(controlCalls)")) == []
     assert context.eval("uploadCalls") == upload_calls_before_retry
@@ -2969,13 +2969,13 @@ def test_batch_controls_follow_server_transitions_and_expose_pending_summary() -
     """)
     drain_jobs(context)
     expected_cancelled = {
-        *(f"source-{index}" for index in range(5)),
-        *(f"observer-{index}" for index in range(5)),
+        *(f"source-{index}" for index in range(7)),
+        *(f"observer-{index}" for index in range(7)),
     }
     assert set(json.loads(context.eval("JSON.stringify(cancelCalls)"))) == expected_cancelled
     context.eval("cancelResolvers.forEach(item => item.resolve({ status: 'cancelled' }))")
     drain_jobs(context)
-    assert context.eval("cancelResult.total") == 10
+    assert context.eval("cancelResult.total") == 14
     assert context.eval("cancelResult.failed") == 0
     assert context.eval("summaryHistory.includes(true)") is True
     assert context.eval("summaryHistory[summaryHistory.length - 1]") is False
@@ -3155,6 +3155,140 @@ def test_prepare_pending_control_migrates_client_key_without_reload_ghost() -> N
     assert json.loads(context.eval(
         "JSON.stringify(coordinator.getSnapshot().map(task => task.uploadId))"
     )) == ["server-key"]
+
+
+def test_cancel_preparing_marks_cancelled_then_deletes_deferred_created_session() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.createResolver = null;
+      globalThis.cancelCalls = [];
+      globalThis.uploadCalls = 0;
+      globalThis.rows = [];
+      globalThis.cancelSettled = false;
+      globalThis.cryptoObject = {
+        randomUUID: () => 'cancel-client',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'cancel-create.bin', size: 4, type: '', lastModified: 1,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      };
+      globalThis.api = {
+        createUploadSession: () => new Promise(resolve => { createResolver = resolve; }),
+        uploadPart() { uploadCalls += 1; return Promise.resolve({}); },
+        cancelUpload(id) {
+          cancelCalls.push(id);
+          return Promise.resolve({ status: 'cancelled' });
+        },
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve(rows.slice()),
+        put(record) {
+          rows = rows.filter(row => row.uploadId !== record.uploadId);
+          rows.push(record);
+          return Promise.resolve();
+        },
+        migrate(oldKey, record) {
+          rows = rows.filter(row => row.uploadId !== oldKey && row.uploadId !== record.uploadId);
+          rows.push(record);
+          return Promise.resolve();
+        },
+        remove(id) {
+          rows = rows.filter(row => row.uploadId !== id);
+          return Promise.resolve();
+        },
+        close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, chunkSize: 4,
+      });
+      coordinator.enqueueFiles([file]);
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      coordinator.cancel('cancel-client').then(() => { cancelSettled = true; });
+    """)
+    drain_jobs(context)
+    assert context.eval("coordinator.getSnapshot()[0].status") == "cancelled"
+    assert context.eval("coordinator.getSnapshot()[0].pendingAction") == "cancel"
+    assert context.eval("cancelSettled") is False
+    assert context.eval("uploadCalls") == 0
+
+    context.eval(r"""
+      createResolver({ upload_id: 'cancel-server', status: 'queued', confirmed_parts: [],
+        confirmed_bytes: 0, chunk_size_bytes: 4 });
+    """)
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == ["cancel-server"]
+    assert json.loads(context.eval("JSON.stringify(rows)")) == []
+    assert context.eval("uploadCalls") == 0
+    assert context.eval("cancelSettled") is True
+    assert context.eval("coordinator.getSummary().hasPendingControl") is False
+    assert context.eval("coordinator.getSnapshot()[0].status") == "cancelled"
+
+
+def test_cancel_all_preempts_deferred_complete_and_suppresses_publication() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.AbortController = class AbortController { constructor() { this.signal = {}; } abort() {} };
+      globalThis.completeResolver = null;
+      globalThis.cancelCalls = [];
+      globalThis.removed = [];
+      globalThis.completedMessages = 0;
+      globalThis.batchResult = null;
+      globalThis.cryptoObject = {
+        randomUUID: () => 'cancel-complete',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'cancel-complete.bin', size: 4, type: '', lastModified: 1,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      };
+      globalThis.api = {
+        createUploadSession: () => Promise.resolve({ upload_id: 'cancel-complete', status: 'queued',
+          confirmed_parts: [], confirmed_bytes: 0, chunk_size_bytes: 4 }),
+        uploadPart: () => Promise.resolve({ confirmed_parts: [0], confirmed_bytes: 4 }),
+        completeUpload: () => new Promise(resolve => { completeResolver = resolve; }),
+        cancelUpload(id) {
+          cancelCalls.push(id);
+          return Promise.resolve({ status: 'cancelled' });
+        },
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve([]), put: () => Promise.resolve(),
+        migrate: () => Promise.resolve(),
+        remove(id) { removed.push(id); return Promise.resolve(); },
+        close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, chunkSize: 4,
+        onCompleted: () => { completedMessages += 1; },
+      });
+      coordinator.enqueueFiles([file]);
+    """)
+    drain_jobs(context)
+    assert context.eval("coordinator.getSnapshot()[0].status") == "completing"
+    context.eval("coordinator.cancelAll().then(result => { batchResult = result; })")
+    drain_jobs(context)
+    assert context.eval("batchResult.total") == 1
+    assert context.eval("batchResult.succeeded") == 1
+    assert context.eval("batchResult.failed") == 0
+    assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == ["cancel-complete"]
+    assert context.eval("coordinator.getSnapshot()[0].status") == "cancelled"
+    assert context.eval("coordinator.getSummary().hasPendingControl") is False
+
+    context.eval("completeResolver({ message_id: 'must-not-publish' })")
+    drain_jobs(context)
+    assert context.eval("completedMessages") == 0
+    assert context.eval("coordinator.getSnapshot()[0].status") == "cancelled"
+    assert context.eval("coordinator.getSummary().hasPendingControl") is False
+    assert context.eval("removed.includes('cancel-complete')") is True
 
 
 def test_upload_created_at_is_normalized_to_iso_at_every_source() -> None:
@@ -4254,6 +4388,10 @@ def test_upload_coordinator_retry_uses_authoritative_missing_snapshot() -> None:
       globalThis.AbortController = class AbortController { constructor() { this.signal = {}; } abort() {} };
       globalThis.phase = 'fail';
       globalThis.sent = [];
+      globalThis.activeWorkers = 0;
+      globalThis.maxActiveWorkers = 0;
+      globalThis.completeCalls = 0;
+      globalThis.completedMessages = 0;
       globalThis.cryptoObject = {
         randomUUID: () => 'retry-authority',
         subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
@@ -4263,17 +4401,25 @@ def test_upload_coordinator_retry_uses_authoritative_missing_snapshot() -> None:
         slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
       };
       globalThis.api = {
-        createUploadSession: () => Promise.resolve({ upload_id: 'retry-authority', confirmed_parts: [0], confirmed_bytes: 4 }),
+        createUploadSession: () => Promise.resolve({ upload_id: 'retry-authority', status: 'queued',
+          confirmed_parts: [], confirmed_bytes: 0, chunk_size_bytes: 4 }),
         uploadPart(_id, index) {
           sent.push(index);
-          return phase === 'fail'
+          activeWorkers += 1;
+          maxActiveWorkers = Math.max(maxActiveWorkers, activeWorkers);
+          return (phase === 'fail'
             ? Promise.reject(new Error('offline'))
-            : Promise.resolve({ confirmed_parts: [index], confirmed_bytes: 8 });
+            : Promise.resolve({ confirmed_parts: [index], confirmed_bytes: 8 }))
+            .finally(() => { activeWorkers -= 1; });
         },
-        getUploadSession: () => Promise.resolve({ status: 'failed', confirmed_parts: [1],
+        getUploadSession: () => Promise.resolve({ status: 'uploading', confirmed_parts: [0],
           confirmed_bytes: 4, updated_at: '2026-07-19T11:00:00Z', version: 5 }),
-        completeUpload: () => new Promise(() => {}),
-        controlUpload: () => Promise.resolve({}), cancelUpload: () => Promise.resolve({}),
+        completeUpload: () => {
+          completeCalls += 1;
+          return Promise.resolve({ message_id: 'retry-complete' });
+        },
+        controlUpload: () => { throw new Error('uploading retry must not resume'); },
+        cancelUpload: () => Promise.resolve({}),
       };
       globalThis.persistence = { put: () => Promise.resolve(), getAll: () => Promise.resolve([]), remove: () => Promise.resolve(), close: () => {} };
     """)
@@ -4281,14 +4427,103 @@ def test_upload_coordinator_retry_uses_authoritative_missing_snapshot() -> None:
     context.eval(r"""
       globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
         api, persistence, cryptoObject, delay: () => Promise.resolve(), maxActive: 1, chunkSize: 4,
+        onCompleted: () => { completedMessages += 1; },
       });
       coordinator.enqueueFiles([file]);
     """)
     drain_jobs(context)
     assert context.eval("coordinator.getSnapshot()[0].status") == "failed"
+    assert len(json.loads(context.eval("JSON.stringify(sent)"))) > 1
     context.eval("phase = 'success'; sent = []; coordinator.retry('retry-authority')")
     drain_jobs(context)
-    assert json.loads(context.eval("JSON.stringify(sent)"))[0] == 0
+    assert json.loads(context.eval("JSON.stringify(sent)")) == [1]
+    assert context.eval("maxActiveWorkers") == 1
+    assert context.eval("completeCalls") == 1
+    assert context.eval("completedMessages") == 1
+    assert context.eval("coordinator.getSnapshot()[0].status") == "completed"
+
+
+@pytest.mark.parametrize(
+    ("remote_status", "expected_controls", "expected_error"),
+    [
+        ("queued", [], None),
+        ("uploading", [], None),
+        ("paused", ["resume"], None),
+        ("failed", ["resume"], None),
+        ("verifying", [], "服务端正在校验，无法重试"),
+        ("completed", [], "上传任务已结束"),
+    ],
+)
+def test_upload_retry_dispatches_authoritative_server_status_matrix(
+    remote_status: str,
+    expected_controls: list[str],
+    expected_error: str | None,
+) -> None:
+    context = create_js_context()
+    context.set("remoteStatus", remote_status)
+    context.eval(r"""
+      globalThis.AbortController = class AbortController { constructor() { this.signal = {}; } abort() {} };
+      globalThis.phase = 'fail';
+      globalThis.sent = [];
+      globalThis.controlCalls = [];
+      globalThis.completeCalls = 0;
+      globalThis.cryptoObject = {
+        randomUUID: () => 'retry-matrix',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'matrix.bin', size: 4, type: '', lastModified: 1,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      };
+      globalThis.api = {
+        createUploadSession: () => Promise.resolve({ upload_id: 'retry-matrix', status: 'queued',
+          confirmed_parts: [], confirmed_bytes: 0, chunk_size_bytes: 4 }),
+        uploadPart(_id, index) {
+          sent.push(index);
+          return phase === 'fail'
+            ? Promise.reject(new Error('offline'))
+            : Promise.resolve({ confirmed_parts: [index], confirmed_bytes: 4 });
+        },
+        getUploadSession: () => Promise.resolve({ status: remoteStatus,
+          confirmed_parts: [], confirmed_bytes: 0, chunk_size_bytes: 4 }),
+        controlUpload(_id, action) {
+          controlCalls.push(action);
+          return Promise.resolve({ status: 'uploading', confirmed_parts: [], confirmed_bytes: 0 });
+        },
+        completeUpload: () => { completeCalls += 1; return Promise.resolve({ message_id: 'done' }); },
+      };
+      globalThis.persistence = {
+        put: () => Promise.resolve(), getAll: () => Promise.resolve([]),
+        remove: () => Promise.resolve(), close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.retryError = null;
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, delay: () => Promise.resolve(), maxActive: 1, chunkSize: 4,
+      });
+      coordinator.enqueueFiles([file]);
+    """)
+    drain_jobs(context)
+    assert context.eval("coordinator.getSnapshot()[0].status") == "failed"
+    context.eval(r"""
+      phase = 'success';
+      sent = [];
+      coordinator.retry('retry-matrix').catch(error => { retryError = error.message; });
+    """)
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(controlCalls)")) == expected_controls
+    if expected_error is not None:
+        assert context.eval("retryError") == expected_error
+        assert context.eval("coordinator.getSnapshot()[0].status") == remote_status
+        assert json.loads(context.eval("JSON.stringify(sent)")) == []
+        assert context.eval("completeCalls") == 0
+    else:
+        assert context.eval("retryError") is None
+        assert json.loads(context.eval("JSON.stringify(sent)")) == [0]
+        assert context.eval("completeCalls") == 1
+        assert context.eval("coordinator.getSnapshot()[0].status") == "completed"
 
 
 def test_upload_coordinator_unsubscribe_and_destroy_cleanup_listeners() -> None:
