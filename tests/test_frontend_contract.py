@@ -2719,6 +2719,7 @@ def test_upload_coordinator_limits_active_files_and_one_part_per_file() -> None:
       globalThis.activeParts = {};
       globalThis.peakFiles = 0;
       globalThis.duplicatePart = false;
+      globalThis.pendingParts = [];
       globalThis.uuidIndex = 0;
       globalThis.AbortController = class AbortController {
         constructor() { this.signal = { aborted: false }; }
@@ -2737,7 +2738,7 @@ def test_upload_coordinator_limits_active_files_and_one_part_per_file() -> None:
           activeParts[id] = (activeParts[id] || 0) + 1;
           duplicatePart = duplicatePart || activeParts[id] > 1;
           peakFiles = Math.max(peakFiles, Object.keys(activeParts).filter(key => activeParts[key] > 0).length);
-          return Promise.resolve({ status: 'uploading', confirmed_parts: [index], confirmed_bytes: 4 })
+          return new Promise(resolve => pendingParts.push({ id, index, resolve }))
             .finally(() => { activeParts[id] -= 1; });
         },
         completeUpload: id => Promise.resolve({ id: `message-${id}`, upload_id: id }),
@@ -2761,6 +2762,30 @@ def test_upload_coordinator_limits_active_files_and_one_part_per_file() -> None:
     drain_jobs(context)
     assert context.eval("peakFiles") == 9
     assert context.eval("duplicatePart") is False
+    statuses = json.loads(context.eval(
+        "JSON.stringify(coordinator.getSnapshot().map(task => task.status))"
+    ))
+    assert statuses.count("uploading") == 9
+    assert statuses.count("queued") == 2
+
+    context.eval(r"""
+      pendingParts.splice(0).forEach(part => part.resolve({
+        status: 'uploading', confirmed_parts: [part.index], confirmed_bytes: 4,
+      }));
+    """)
+    drain_jobs(context)
+    assert context.eval("pendingParts.length") == 2
+
+    context.eval(r"""
+      pendingParts.splice(0).forEach(part => part.resolve({
+        status: 'uploading', confirmed_parts: [part.index], confirmed_bytes: 4,
+      }));
+    """)
+    drain_jobs(context)
+    assert context.eval("coordinator.getSnapshot().every(task => task.status === 'completed')") is True
+    assert context.eval("Object.values(activeParts).every(count => count === 0)") is True
+    assert context.eval("pendingParts.length") == 0
+    assert context.eval("peakFiles") == 9
     assert context.eval("coordinator.getSnapshot().every(Object.isFrozen)") is True
 
 

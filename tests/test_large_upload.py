@@ -90,16 +90,22 @@ def test_sparse_512mb_upload_completes_with_server_sha256(
     with client:
         upload = create_upload_for_path(client, source, chunk_size=CHUNK_SIZE)
         tracemalloc.start()
-        with source.open("rb") as input_file:
-            for part_index, chunk in enumerate(
-                iter(lambda: input_file.read(CHUNK_SIZE), b"")
-            ):
-                expected.update(chunk)
-                put_large_part(client, upload, part_index, chunk)
-                gc.collect()
-        response = client.post(f"/api/uploads/{upload['upload_id']}/complete", json={})
-        _, peak = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
+        try:
+            with source.open("rb") as input_file:
+                for part_index, chunk in enumerate(
+                    iter(lambda: input_file.read(CHUNK_SIZE), b"")
+                    ):
+                        expected.update(chunk)
+                        put_large_part(client, upload, part_index, chunk)
+                        # TestClient retains completed request bodies in reference cycles;
+                        # collect each cycle so traced heap measures bounded server work.
+                        gc.collect()
+            response = client.post(
+                f"/api/uploads/{upload['upload_id']}/complete", json={}
+            )
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
 
     assert response.status_code == 200
     assert response.json()["file"]["sha256"] == expected.hexdigest()

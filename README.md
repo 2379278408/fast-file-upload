@@ -47,7 +47,7 @@ UPLOAD_TOKEN='replace-with-a-strong-token' python3 server.py --host 0.0.0.0 --po
 | `RATE_LIMIT_COUNT` | 上传和删除限流次数；`0` 关闭 | `0` |
 | `RATE_LIMIT_WINDOW_SECONDS` | 上传和删除限流窗口 | `60` |
 | `CLIENT_REQUEST_LOCK_CAPACITY` | 并发幂等请求锁的最大键数量 | `1024` |
-| `UPLOAD_CHUNK_SIZE_BYTES` | 可恢复上传的服务端分片大小；浏览器默认按此 8MiB 边界发送 | `8388608` |
+| `UPLOAD_CHUNK_SIZE_BYTES` | 服务端分片配置默认值；当前创建协议由客户端显式声明并按会话存储该边界，浏览器代码固定声明 8MiB，修改此变量不会改变浏览器分片大小 | `8388608` |
 | `UPLOAD_SESSION_TTL_SECONDS` | 可恢复上传会话的闲置有效期 | `86400`（24 小时） |
 | `UPLOAD_STORAGE_RESERVE_BYTES` | 创建和完成上传时必须保留的磁盘安全余量 | `268435456` |
 | `MAX_ACTIVE_UPLOAD_SESSIONS` | 服务端允许的活动上传会话上限 | `128` |
@@ -113,7 +113,7 @@ Content-Range: bytes <inclusive-start>-<inclusive-end>/<total-size>
 X-Chunk-SHA256: <sha256-of-this-chunk>
 ```
 
-服务端校验索引、范围、长度和 SHA-256 后原子确认分片。相同分片可幂等重放；相同索引的数据或摘要冲突返回 `409`。浏览器每个文件仅发送一个在途分片，每片默认不超过 8MiB，同时最多上传 9 个文件，其余文件保持 `queued`。
+服务端按创建请求中声明并返回的 `chunk_size_bytes` 校验索引、范围、长度和 SHA-256，随后原子确认分片。相同分片可幂等重放；相同索引的数据或摘要冲突返回 `409`。浏览器每个文件仅发送一个在途分片，固定使用 8MiB 分片边界（末片可更小），同时最多上传 9 个文件，其余文件保持 `queued`。
 
 `PATCH /api/uploads/{upload_id}` 接收 `{"action":"pause"}` 或 `{"action":"resume"}`。暂停和继续仅允许创建会话的源设备执行；观察设备以只读方式接收状态，并可调用 `DELETE` 取消共享会话。完成接口仅允许源设备调用，要求所有分片连续覆盖文件；服务端以有界缓冲区组装并计算整文件 SHA-256，成功后返回永久文件消息。取消和完成后的非法状态转换返回 `409`，未知会话返回 `404`，容量或文件系统写入失败返回 `507`，并发资源耗尽返回 `503`。
 
@@ -153,11 +153,13 @@ python3 -m pytest -q
 python3 -m compileall -q app server.py tests
 ```
 
-默认 pytest 配置排除资源密集型 `large` 标记。显式运行稀疏 512MB 分片、服务端 SHA-256 和 Python 峰值内存验证：
+默认 pytest 配置排除资源密集型 `large` 标记。显式运行稀疏 512MiB 分片、服务端 SHA-256 和 Python traced heap peak `<40MiB` 验证：
 
 ```bash
 python3 -m pytest -q -m large tests/test_large_upload.py
 ```
+
+内存指标由 `tracemalloc` 采集，仅覆盖 Python traced heap；RSS、native allocator 和 kernel buffers 位于测量范围外。in-process TestClient 会通过引用周期保留已完成请求体，因此测试在每个分片请求后执行 `gc.collect()`，让峰值反映逐请求回收条件下的服务端有界处理。
 
 聚焦前端契约测试：
 

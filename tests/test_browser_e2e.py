@@ -18,7 +18,7 @@ from playwright.sync_api import (
     CDPSession,
     Locator,
     Page,
-    Route,
+    Request,
     expect,
     sync_playwright,
 )
@@ -380,14 +380,61 @@ def create_test_files(
     return paths
 
 
-def install_slow_part_responses(page: Page) -> None:
-    pending_routes: list[Route] = []
+def hold_part_requests_until_released(page: Page) -> None:
+    page.add_init_script(r"""
+      (() => {
+        const originalOpen = XMLHttpRequest.prototype.open;
+        const originalSend = XMLHttpRequest.prototype.send;
+        const held = [];
+        let released = false;
+        XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+          this.__uploadUrl = String(url);
+          return originalOpen.call(this, method, url, ...rest);
+        };
+        XMLHttpRequest.prototype.send = function(body) {
+          if (!released && this.__uploadUrl?.includes('/parts/')) {
+            held.push({ request: this, body });
+            return;
+          }
+          return originalSend.call(this, body);
+        };
+        window.__heldUploadPartCount = () => held.length;
+        window.__releaseUploadParts = () => {
+          released = true;
+          const requests = held.splice(0);
+          requests.forEach(entry => originalSend.call(entry.request, entry.body));
+          return requests.length;
+        };
+      })();
+    """)
 
-    def hold_part(route: Route) -> None:
-        # Keep every active worker in-flight until the scheduler assertions finish.
-        pending_routes.append(route)
 
-    page.route("**/api/uploads/*/parts/*", hold_part)
+@contextmanager
+def track_part_request_concurrency(page: Page) -> Iterator[dict[str, int]]:
+    state = {"active": 0, "peak": 0}
+
+    def is_part_request(request: Request) -> bool:
+        return "/api/uploads/" in request.url and "/parts/" in request.url
+
+    def request_started(request: Request) -> None:
+        if not is_part_request(request):
+            return
+        state["active"] += 1
+        state["peak"] = max(state["peak"], state["active"])
+
+    def request_finished(request: Request) -> None:
+        if is_part_request(request):
+            state["active"] -= 1
+
+    page.on("request", request_started)
+    page.on("requestfinished", request_finished)
+    page.on("requestfailed", request_finished)
+    try:
+        yield state
+    finally:
+        page.remove_listener("request", request_started)
+        page.remove_listener("requestfinished", request_finished)
+        page.remove_listener("requestfailed", request_finished)
 
 
 def release_upload_creations_together(page: Page, count: int) -> None:
@@ -1087,6 +1134,7 @@ def test_old_page_anchor_restoration_has_no_smooth_drift_and_focuses_fallback(
     )
     assert older_page.ok
     anchor_id = older_page.json()["items"][0]["id"]
+    assert anchor_id not in {item["id"] for item in first_page.json()["items"]}
     context.clear_cookies()
 
     paged_requests: list[str] = []
@@ -1104,9 +1152,15 @@ def test_old_page_anchor_restoration_has_no_smooth_drift_and_focuses_fallback(
 
     anchor = page.locator(f'[data-message-id="{anchor_id}"]')
     container = page.locator("#timelineContainer")
-    container.evaluate("element => { element.scrollTop = 0; }")
-    expect(anchor).to_be_attached(timeout=10_000)
+    for _ in range(200):
+        if paged_requests:
+            break
+        container.evaluate("element => { element.scrollTop = element.scrollHeight; }")
+        page.wait_for_timeout(25)
+        container.evaluate("element => { element.scrollTop = 0; }")
+        page.wait_for_timeout(25)
     assert paged_requests
+    expect(anchor).to_be_attached(timeout=10_000)
 
     snapshot = page.evaluate(
         """
@@ -1497,36 +1551,89 @@ def test_resumable_40mb_upload_uses_bounded_parts_and_completes(
             output.write(block)
 
     page = browser_session.page
+    page.add_init_script(r"""
+      (() => {
+        window.__uploadPartBodySizes = [];
+        const originalOpen = XMLHttpRequest.prototype.open;
+        const originalSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+          this.__uploadUrl = String(url);
+          return originalOpen.call(this, method, url, ...rest);
+        };
+        XMLHttpRequest.prototype.send = function(body) {
+          if (this.__uploadUrl?.includes('/parts/')) {
+            window.__uploadPartBodySizes.push(Number(body?.size ?? body?.byteLength ?? 0));
+          }
+          return originalSend.call(this, body);
+        };
+      })();
+    """)
     _open_locked_application(browser_session)
     _unlock(page)
-    requests: list[int] = []
-    page.on(
-        "request",
-        lambda request: requests.append(len(request.post_data_buffer or b""))
-        if "/parts/" in request.url
-        else None,
-    )
-    page.locator("#composerFileInput").set_input_files(str(source))
-    expect(page.locator('[data-upload-status="complete"]')).to_be_visible(
-        timeout=120_000
-    )
-    assert requests
-    assert max(requests) <= 8 * 1024 * 1024
+    content_ranges: list[str] = []
+
+    def record_part_range(request: Request) -> None:
+        if "/parts/" not in request.url:
+            return
+        content_ranges.append(request.headers["content-range"])
+
+    page.on("requestfinished", record_part_range)
+    try:
+        page.locator("#composerFileInput").set_input_files(str(source))
+        expect(page.locator('[data-upload-status="complete"]')).to_be_visible(
+            timeout=120_000
+        )
+    finally:
+        page.remove_listener("requestfinished", record_part_range)
+
+    expected_part_size = 8 * 1024 * 1024
+    body_sizes = page.evaluate("window.__uploadPartBodySizes")
+    assert body_sizes == [expected_part_size] * 5
+    assert sum(body_sizes) == 40 * 1024 * 1024
+    assert content_ranges == [
+        f"bytes {index * expected_part_size}-{(index + 1) * expected_part_size - 1}/41943040"
+        for index in range(5)
+    ]
     _assert_browser_clean(browser_session)
 
 
-def test_eleven_files_show_nine_uploading_and_two_queued(
+def test_eleven_files_complete_after_showing_nine_uploading_and_two_queued(
     browser_session: BrowserSession, tmp_path: Path
 ) -> None:
     paths = create_test_files(tmp_path, count=11, size_bytes=16 * 1024 * 1024)
     page = browser_session.page
     release_upload_creations_together(page, len(paths))
+    hold_part_requests_until_released(page)
     _open_locked_application(browser_session)
     _unlock(page)
-    install_slow_part_responses(page)
-    page.locator("#composerFileInput").set_input_files([str(path) for path in paths])
-    expect(page.locator('[data-upload-status="uploading"]')).to_have_count(
-        9, timeout=30_000
-    )
-    expect(page.locator('[data-upload-status="queued"]')).to_have_count(2)
+    with track_part_request_concurrency(page) as concurrency:
+        try:
+            page.locator("#composerFileInput").set_input_files(
+                [str(path) for path in paths]
+            )
+            expect(page.locator('[data-upload-status="uploading"]')).to_have_count(
+                9, timeout=30_000
+            )
+            expect(page.locator('[data-upload-status="queued"]')).to_have_count(2)
+            deadline = time.monotonic() + 30
+            while (
+                page.evaluate("window.__heldUploadPartCount()") < 9
+                and time.monotonic() < deadline
+            ):
+                page.wait_for_timeout(25)
+            assert page.evaluate("window.__heldUploadPartCount()") == 9
+            assert page.evaluate("window.__releaseUploadParts()") == 9
+
+            expect(page.locator('[data-upload-status="complete"]')).to_have_count(
+                11, timeout=120_000
+            )
+            expect(page.locator('[data-upload-status="uploading"]')).to_have_count(0)
+            expect(page.locator('[data-upload-status="queued"]')).to_have_count(0)
+        finally:
+            page.evaluate("window.__releaseUploadParts()")
+
+        page.wait_for_timeout(100)
+        assert page.evaluate("window.__heldUploadPartCount()") == 0
+        assert 1 <= concurrency["peak"] <= 9
+        assert concurrency["active"] == 0
     _assert_browser_clean(browser_session)
