@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -17,6 +18,7 @@ from app.upload_repository import (
     UploadConflict,
     UploadCreate,
     UploadRepository,
+    UploadStorageCommitmentExceeded,
     UploadStateConflict,
 )
 
@@ -210,6 +212,59 @@ def test_capacity_counts_only_active_sessions(repository, upload_command, clock)
     repository.create_or_get(upload_command, clock(), 86_400, 1)
     with pytest.raises(UploadCapacityExceeded):
         repository.create_or_get(replace(upload_command, client_request_id="request-2"), clock(), 86_400, 1)
+
+
+def test_capacity_commitment_accumulates_and_confirmed_parts_reduce_it(
+    repository, upload_command, clock
+) -> None:
+    first, _ = repository.create_or_get(
+        upload_command, clock(), 86_400, 128, capacity_budget_bytes=28
+    )
+    with pytest.raises(UploadStorageCommitmentExceeded):
+        repository.create_or_get(
+            replace(upload_command, client_request_id="request-2"),
+            clock(), 86_400, 128, capacity_budget_bytes=28,
+        )
+
+    confirm(repository, first, 0, b"data", clock())
+    second, created = repository.create_or_get(
+        replace(upload_command, client_request_id="request-2"),
+        clock(), 86_400, 128, capacity_budget_bytes=28,
+    )
+    assert created is True
+    assert second["status"] == "queued"
+
+
+def test_terminal_session_releases_capacity_commitment(
+    repository, upload_command, clock
+) -> None:
+    first, _ = repository.create_or_get(
+        upload_command, clock(), 86_400, 128, capacity_budget_bytes=16
+    )
+    repository.cancel(str(first["upload_id"]), clock(), 86_400)
+    second, created = repository.create_or_get(
+        replace(upload_command, client_request_id="request-2"),
+        clock(), 86_400, 128, capacity_budget_bytes=16,
+    )
+    assert created is True
+    assert second["status"] == "queued"
+
+
+def test_concurrent_capacity_admission_is_atomic(repository, upload_command, clock) -> None:
+    def create(request_id: str) -> bool:
+        try:
+            repository.create_or_get(
+                replace(upload_command, client_request_id=request_id),
+                clock(), 86_400, 128, capacity_budget_bytes=16,
+            )
+            return True
+        except UploadStorageCommitmentExceeded:
+            return False
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(create, ("concurrent-1", "concurrent-2")))
+
+    assert sorted(results) == [False, True]
 
 
 def test_finalize_publication_uses_durable_device_data(repository, upload_command, clock, tmp_path: Path) -> None:

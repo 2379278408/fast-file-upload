@@ -48,21 +48,23 @@ export function connectEvents({ after, onEvent, onStatus }) {
       attempt = 0;
       onStatus('connected');
     };
+    let eventQueue = Promise.resolve();
     currentSocket.onmessage = message => {
-      if (stopped || socket !== currentSocket || generation.failed) return;
-      try {
+      eventQueue = eventQueue.then(async () => {
+        if (stopped || socket !== currentSocket || generation.failed) return;
         const event = JSON.parse(message.data);
-        if (onEvent(event) !== true) throw new Error('Event application failed');
+        if (await onEvent(event) !== true) throw new Error('Event application failed');
         if (event.sequence === undefined) return;
         const sequence = normalizeSequence(event.sequence);
         if (sequence > lastAppliedSequence) {
           lastAppliedSequence = sequence;
           storeLastSequence(sequence);
         }
-      } catch {
+      }).catch(() => {
+        if (stopped || socket !== currentSocket || generation.failed) return;
         generation.failed = true;
         currentSocket.close();
-      }
+      });
     };
     currentSocket.onclose = event => {
       if (stopped || socket !== currentSocket || generation.closed) return;

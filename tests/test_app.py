@@ -112,6 +112,8 @@ def client(tmp_path: Path) -> TestClient:
         rate_limit_count=0,
         rate_limit_window_seconds=60,
         retention_days=0,
+        upload_chunk_size_bytes=1024,
+        event_retention_limit=100,
     )
     client = TestClient(create_app(settings))
     authenticate(client)
@@ -281,6 +283,8 @@ def test_cookie_session_protects_operations(tmp_path: Path) -> None:
         rate_limit_count=0,
         rate_limit_window_seconds=60,
         retention_days=0,
+        upload_chunk_size_bytes=1024,
+        event_retention_limit=100,
     )
     client = TestClient(create_app(settings))
 
@@ -339,6 +343,8 @@ def test_previewable_images_and_static_assets(tmp_path: Path) -> None:
         rate_limit_count=0,
         rate_limit_window_seconds=60,
         retention_days=0,
+        upload_chunk_size_bytes=1024,
+        event_retention_limit=100,
     )
     client = TestClient(create_app(settings))
     authenticate(client)
@@ -378,6 +384,8 @@ def test_svg_uploads_are_download_only(tmp_path: Path) -> None:
         rate_limit_count=0,
         rate_limit_window_seconds=60,
         retention_days=0,
+        upload_chunk_size_bytes=1024,
+        event_retention_limit=100,
     )
     client = TestClient(create_app(settings))
     authenticate(client)
@@ -411,6 +419,8 @@ def test_invalid_storage_entries_are_ignored(tmp_path: Path) -> None:
         rate_limit_count=0,
         rate_limit_window_seconds=60,
         retention_days=0,
+        upload_chunk_size_bytes=1024,
+        event_retention_limit=100,
     )
     with TestClient(create_app(settings)) as client:
         authenticate(client)
@@ -433,6 +443,8 @@ def test_upload_rate_limit_is_enforced(tmp_path: Path) -> None:
         rate_limit_count=2,
         rate_limit_window_seconds=60,
         retention_days=0,
+        upload_chunk_size_bytes=1024,
+        event_retention_limit=100,
     )
     client = TestClient(create_app(settings))
     authenticate(client)
@@ -476,6 +488,8 @@ def test_health_does_not_prune_expired_files(tmp_path: Path) -> None:
         rate_limit_count=0,
         rate_limit_window_seconds=60,
         retention_days=1,
+        upload_chunk_size_bytes=1024,
+        event_retention_limit=100,
     )
     client = TestClient(create_app(settings))
     authenticate(client)
@@ -502,6 +516,8 @@ def test_page_shell_and_static_fallback_are_public_when_api_is_protected(
         rate_limit_count=0,
         rate_limit_window_seconds=60,
         retention_days=0,
+        upload_chunk_size_bytes=1024,
+        event_retention_limit=100,
     )
     client = TestClient(create_app(settings))
 
@@ -583,6 +599,8 @@ def test_admin_summary_reports_large_and_stale_files(tmp_path: Path) -> None:
         rate_limit_count=0,
         rate_limit_window_seconds=60,
         retention_days=0,
+        upload_chunk_size_bytes=1024,
+        event_retention_limit=100,
     )
     client = TestClient(create_app(settings))
     authenticate(client)

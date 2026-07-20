@@ -6,6 +6,7 @@ import logging
 import sqlite3
 import time
 import threading
+from dataclasses import replace
 from datetime import datetime, timezone
 from hashlib import sha256
 
@@ -15,7 +16,7 @@ from fastapi.testclient import TestClient
 
 from app import safe_fs
 from app.auth import SessionData
-from app.config import Settings
+from app.config import ConfigurationError, Settings
 from app.database import Database
 from app.main import create_app
 from app.repository import MessageRepository
@@ -44,7 +45,7 @@ def create_upload(
     client: TestClient,
     request_id: str = "request-1",
     content: bytes = b"data",
-    chunk_size: int = 8 * 1024 * 1024,
+    chunk_size: int | None = None,
     name: str = "report.txt",
 ) -> dict[str, object]:
     response = client.post(
@@ -55,12 +56,88 @@ def create_upload(
             "size_bytes": len(content),
             "mime_type": "text/plain",
             "last_modified_ms": 1_784_412_345_000,
-            "chunk_size_bytes": chunk_size,
+            "chunk_size_bytes": chunk_size or client.app.state.settings.upload_chunk_size_bytes,
             "sample_sha256": sha256(b"sample").hexdigest(),
         },
     )
     assert response.status_code == 200
     return response.json()
+
+
+def test_create_rejects_chunk_size_that_differs_from_server(settings: Settings) -> None:
+    client = authenticated_client(settings)
+    response = client.post(
+        "/api/uploads",
+        json={
+            "client_request_id": "wrong-chunk-size",
+            "name": "report.txt",
+            "size_bytes": 8,
+            "mime_type": "text/plain",
+            "last_modified_ms": 1,
+            "chunk_size_bytes": settings.upload_chunk_size_bytes * 2,
+            "sample_sha256": sha256(b"sample").hexdigest(),
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": f"chunk_size_bytes must equal the server value {settings.upload_chunk_size_bytes}"
+    }
+
+
+def test_chunk_configuration_bounds_part_count_and_request_size(settings: Settings) -> None:
+    maximum_size = 512 * 1024 * 1024
+    with pytest.raises(ConfigurationError, match="10000 part limit"):
+        replace(settings, max_upload_size=maximum_size, upload_chunk_size_bytes=1)
+    with pytest.raises(ConfigurationError, match="64 MiB limit"):
+        replace(
+            settings,
+            max_upload_size=maximum_size,
+            upload_chunk_size_bytes=maximum_size,
+        )
+    configured = replace(
+        settings,
+        max_upload_size=maximum_size,
+        upload_chunk_size_bytes=8 * 1024 * 1024,
+    )
+    assert configured.upload_chunk_size_bytes == 8 * 1024 * 1024
+
+
+def test_512_mib_session_reserves_upload_and_assembly_peak(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    maximum_size = 512 * 1024 * 1024
+    configured = replace(
+        settings,
+        max_upload_size=maximum_size,
+        upload_chunk_size_bytes=8 * 1024 * 1024,
+        upload_storage_reserve_bytes=0,
+    )
+    app = create_app(configured)
+    client = authenticated_client(configured, app=app)
+
+    class Usage:
+        total = 4 * maximum_size
+        used = 0
+        free = (2 * maximum_size) - 1
+
+    monkeypatch.setattr("app.upload_service.shutil.disk_usage", lambda _path: Usage())
+    payload = {
+        "client_request_id": "peak-too-small",
+        "name": "large.txt",
+        "size_bytes": maximum_size,
+        "mime_type": "text/plain",
+        "last_modified_ms": 1,
+        "chunk_size_bytes": configured.upload_chunk_size_bytes,
+        "sample_sha256": sha256(b"sample").hexdigest(),
+    }
+    rejected = client.post("/api/uploads", json=payload)
+    assert rejected.status_code == 507
+
+    Usage.free = 2 * maximum_size
+    payload["client_request_id"] = "peak-exact"
+    accepted = client.post("/api/uploads", json=payload)
+    assert accepted.status_code == 200
 
 
 def put_part(
@@ -199,6 +276,7 @@ def test_cancel_discards_pending_and_rejects_late_progress(settings: Settings) -
 def test_complete_computes_server_hash_and_returns_one_permanent_message(
     settings: Settings,
 ) -> None:
+    settings.upload_chunk_size_bytes = 4
     client = authenticated_client(settings, device_id="source")
     content = b"abcdefgh"
     upload = create_upload(
@@ -552,6 +630,7 @@ def test_complete_invalidates_damaged_confirmed_part_for_reupload(
     settings: Settings,
     damage: str,
 ) -> None:
+    settings.upload_chunk_size_bytes = 4
     app = create_app(settings)
     with authenticated_client(settings, app=app, device_id="source") as client:
         content = b"abcdefgh"
@@ -683,6 +762,7 @@ def test_restart_recovers_each_publication_failure_to_one_message(
     failure_point: str,
     expected_state: str,
 ) -> None:
+    settings.upload_chunk_size_bytes = 4
     content = f"failure-{failure_point}".encode()
     app = create_app(settings)
     with TestClient(app, raise_server_exceptions=False) as client:
@@ -1470,7 +1550,7 @@ def test_create_upload_conflicting_metadata_returns_409(settings: Settings) -> N
             "size_bytes": 4,
             "mime_type": "text/plain",
             "last_modified_ms": 1_784_412_345_000,
-            "chunk_size_bytes": 8 * 1024 * 1024,
+            "chunk_size_bytes": settings.upload_chunk_size_bytes,
             "sample_sha256": sha256(b"sample").hexdigest(),
         },
     )
@@ -1586,6 +1666,7 @@ def test_chunk_capacity_returns_503_before_creating_temporary_file(
 
 
 def test_chunk_rate_limit_uses_normalized_route_key(settings: Settings) -> None:
+    settings.upload_chunk_size_bytes = 4
     app = create_app(settings)
     client = authenticated_client(settings, app=app)
     upload = create_upload(

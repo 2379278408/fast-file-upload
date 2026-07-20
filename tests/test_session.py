@@ -33,6 +33,8 @@ def protected_client(tmp_path: Path) -> TestClient:
         rate_limit_count=0,
         rate_limit_window_seconds=60,
         retention_days=0,
+        upload_chunk_size_bytes=1024,
+        event_retention_limit=100,
     )
     return TestClient(create_app(settings))
 
@@ -100,6 +102,8 @@ def test_https_session_cookie_is_secure_on_create_and_delete(tmp_path: Path) -> 
         rate_limit_count=0,
         rate_limit_window_seconds=60,
         retention_days=0,
+        upload_chunk_size_bytes=1024,
+        event_retention_limit=100,
     )
     client = TestClient(create_app(settings), base_url="https://testserver")
 
@@ -146,7 +150,7 @@ def test_resumable_upload_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_resumable_upload_environment_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("UPLOAD_TOKEN", "secret")
-    monkeypatch.setenv("UPLOAD_CHUNK_SIZE_BYTES", "4096")
+    monkeypatch.setenv("UPLOAD_CHUNK_SIZE_BYTES", "65536")
     monkeypatch.setenv("UPLOAD_SESSION_TTL_SECONDS", "7200")
     monkeypatch.setenv("UPLOAD_STORAGE_RESERVE_BYTES", "1024")
     monkeypatch.setenv("MAX_ACTIVE_UPLOAD_SESSIONS", "32")
@@ -155,7 +159,7 @@ def test_resumable_upload_environment_overrides(monkeypatch: pytest.MonkeyPatch)
 
     settings = Settings.from_env("uploads")
 
-    assert settings.upload_chunk_size_bytes == 4096
+    assert settings.upload_chunk_size_bytes == 65536
     assert settings.upload_session_ttl_seconds == 7200
     assert settings.upload_storage_reserve_bytes == 1024
     assert settings.max_active_upload_sessions == 32
@@ -243,6 +247,8 @@ def test_direct_settings_construction_rejects_blank_upload_token(
             rate_limit_count=0,
             rate_limit_window_seconds=60,
             retention_days=0,
+            upload_chunk_size_bytes=1024,
+            event_retention_limit=100,
         )
 
 
@@ -292,6 +298,8 @@ def test_login_endpoint_limits_failures_and_success_resets(
         rate_limit_count=0,
         rate_limit_window_seconds=60,
         retention_days=0,
+        upload_chunk_size_bytes=1024,
+        event_retention_limit=100,
         login_rate_limit_count=2,
     )
     client = TestClient(create_app(settings))

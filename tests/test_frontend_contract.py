@@ -29,6 +29,8 @@ def client(tmp_path: Path) -> TestClient:
         rate_limit_count=0,
         rate_limit_window_seconds=60,
         retention_days=0,
+        upload_chunk_size_bytes=1024,
+        event_retention_limit=100,
     )
     client = TestClient(create_app(settings))
     response = client.post(
@@ -4325,6 +4327,9 @@ def test_connect_events_replays_failed_generation_from_last_successful_cursor(
       });
       webSockets[0].onmessage({ data: JSON.stringify({ sequence: 4, event_type: 'message.created' }) });
       webSockets[0].onmessage({ data: JSON.stringify({ sequence: 5, event_type: 'message.created' }) });
+    """)
+    drain_jobs(context)
+    context.eval(r"""
       globalThis.sequenceAfterFailure = sessionStorage.getItem('transfer-last-sequence');
       webSockets[0].onmessage({ data: JSON.stringify({ sequence: 6, event_type: 'message.created' }) });
       globalThis.firstSocketClosed = webSockets[0].closed;
@@ -4332,6 +4337,9 @@ def test_connect_events_replays_failed_generation_from_last_successful_cursor(
       webSockets[0].onclose({ code: 1006 });
       reconnectCallback();
       webSockets[1].onmessage({ data: JSON.stringify({ sequence: 5, event_type: 'message.created' }) });
+    """)
+    drain_jobs(context)
+    context.eval(r"""
       globalThis.sequenceAfterReplay = sessionStorage.getItem('transfer-last-sequence');
     """)
     result = json.loads(context.eval(r"""
@@ -4357,6 +4365,76 @@ def test_connect_events_replays_failed_generation_from_last_successful_cursor(
         "attemptsBeforeReplay": [4, 5],
         "appliedSequences": [4, 5, 5],
     }
+
+
+def test_connect_events_serializes_async_events_and_resync_cursor() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.webSockets = [];
+      globalThis.resolvers = [];
+      globalThis.applied = [];
+      globalThis.WebSocket = class WebSocket {
+        constructor(url) { this.url = url; this.closed = false; webSockets.push(this); }
+        close() { this.closed = true; }
+      };
+      sessionStorage.setItem('transfer-last-sequence', '2');
+    """)
+    load_js_module(context, "./api.js", read_web("js/api.js"))
+    context.eval(r"""
+      __modules['./api.js'].connectEvents({
+        after: () => 2,
+        onEvent: event => new Promise(resolve => {
+          applied.push(`start-${event.event_type}`);
+          resolvers.push(() => { applied.push(`end-${event.event_type}`); resolve(true); });
+        }),
+        onStatus: () => {},
+      });
+      webSockets[0].onmessage({ data: JSON.stringify({ event_type: 'resync_required', sequence: 7 }) });
+      webSockets[0].onmessage({ data: JSON.stringify({ event_type: 'message.created', sequence: 8 }) });
+    """)
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(applied)")) == ["start-resync_required"]
+    assert context.eval("sessionStorage.getItem('transfer-last-sequence')") == "2"
+
+    context.eval("resolvers.shift()();")
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(applied)")) == [
+        "start-resync_required", "end-resync_required", "start-message.created"
+    ]
+    assert context.eval("sessionStorage.getItem('transfer-last-sequence')") == "7"
+
+    context.eval("resolvers.shift()();")
+    drain_jobs(context)
+    assert context.eval("sessionStorage.getItem('transfer-last-sequence')") == "8"
+
+
+def test_connect_events_retries_resync_failure_from_old_cursor() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.webSockets = [];
+      globalThis.reconnectCallback = null;
+      window.setTimeout = callback => { reconnectCallback = callback; return 1; };
+      globalThis.WebSocket = class WebSocket {
+        constructor(url) { this.url = url; this.closed = false; webSockets.push(this); }
+        close() { this.closed = true; }
+      };
+      sessionStorage.setItem('transfer-last-sequence', '2');
+    """)
+    load_js_module(context, "./api.js", read_web("js/api.js"))
+    context.eval(r"""
+      __modules['./api.js'].connectEvents({
+        after: () => 2,
+        onEvent: () => Promise.reject(new Error('snapshot failed')),
+        onStatus: () => {},
+      });
+      webSockets[0].onmessage({ data: JSON.stringify({ event_type: 'resync_required', sequence: 7 }) });
+    """)
+    drain_jobs(context)
+    context.eval("webSockets[0].onclose({ code: 1006 }); reconnectCallback();")
+
+    assert context.eval("webSockets[0].closed") is True
+    assert context.eval("webSockets[1].url") == "ws://testserver/api/events?after=2"
+    assert context.eval("sessionStorage.getItem('transfer-last-sequence')") == "2"
 
 
 def test_connect_events_cancels_stale_timer_and_preserves_reconnect() -> None:

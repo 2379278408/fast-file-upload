@@ -27,6 +27,8 @@ def protected_settings(tmp_path: Path) -> Settings:
         rate_limit_count=0,
         rate_limit_window_seconds=60,
         retention_days=0,
+        upload_chunk_size_bytes=1024,
+        event_retention_limit=3,
     )
 
 
@@ -376,6 +378,38 @@ def test_ready_event_sends_latest_sequence(client: TestClient) -> None:
         assert ready["sequence"] >= 1
 
 
+def test_stale_websocket_cursor_requires_authoritative_resync(
+    client: TestClient,
+) -> None:
+    unlock(client)
+    for index in range(5):
+        create_text(client, f"event-{index}", f"retained-{index}")
+    client.app.state.messages.trim_events(3)
+
+    with client.websocket_connect("/api/events?after=1") as ws:
+        resync = ws.receive_json()
+        ready = ws.receive_json()
+
+    assert resync == {"event_type": "resync_required", "sequence": 5}
+    assert ready == {"event_type": "ready", "sequence": 5}
+
+
+def test_event_retention_keeps_latest_global_window(client: TestClient) -> None:
+    unlock(client)
+    for index in range(8):
+        create_text(client, f"event-{index}", f"bounded-{index}")
+
+    client.app.state.messages.trim_events(3)
+    with client.app.state.database.connect() as connection:
+        sequences = [
+            int(row[0])
+            for row in connection.execute("SELECT sequence FROM events ORDER BY sequence")
+        ]
+
+    assert sequences == [6, 7, 8]
+    assert client.app.state.messages.earliest_sequence() == 6
+
+
 def test_mutations_broadcast_committed_structured_events_only(client: TestClient) -> None:
     unlock(client)
     broadcasts: list[dict[str, object]] = []
@@ -541,3 +575,43 @@ def test_event_hub_serializes_and_orders_reversed_live_broadcasts() -> None:
     assert websocket.max_active_sends == 1
     assert [event["sequence"] for event in websocket.sent] == [0, 1, 2]
     assert websocket.sent[0]["event_type"] == "ready"
+
+
+def test_live_gap_after_retention_emits_resync_before_new_event() -> None:
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, object]] = []
+
+        async def send_json(self, event: dict[str, object]) -> None:
+            self.sent.append(event)
+
+    def fetch_missing(_after: int, _limit: int) -> dict[str, object]:
+        return {"earliest": 5, "latest": 7, "events": []}
+
+    async def scenario() -> FakeWebSocket:
+        hub = EventHub()
+        hub.set_fetch_missing(fetch_missing)
+        websocket = FakeWebSocket()
+        connection = hub.connect(websocket, after=1)
+        await connection.finish_replay(1)
+        await hub.broadcast(
+            {
+                "sequence": 8,
+                "event_type": "message.created",
+                "entity_id": "new",
+                "payload": {},
+            }
+        )
+        return websocket
+
+    websocket = asyncio.run(scenario())
+    assert websocket.sent == [
+        {"event_type": "ready", "sequence": 1},
+        {"event_type": "resync_required", "sequence": 7},
+        {
+            "sequence": 8,
+            "event_type": "message.created",
+            "entity_id": "new",
+            "payload": {},
+        },
+    ]

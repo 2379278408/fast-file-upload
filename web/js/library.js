@@ -440,6 +440,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {}, onLoca
         fileListEl.innerHTML = '<div class="empty">文件列表读取失败，请检查服务状态。</div>';
       }
       updateStats();
+      if (opts?.throwOnError) throw err;
     } finally {
       loading = false;
       if (destroyed) return;
@@ -461,6 +462,15 @@ export function createLibrary({ root, api, timeline, onAttach = () => {}, onLoca
       return Promise.resolve();
     }
     return load({});
+  }
+
+  function reconcileAuthoritative() {
+    if (destroyed) return Promise.reject(new Error('Library is destroyed'));
+    if (loading) return Promise.reject(new Error('Library reconciliation is already in progress'));
+    cursor = null;
+    hasMore = false;
+    updateLoadMoreState();
+    return load({ throwOnError: true });
   }
 
   function loadMore() {
@@ -854,5 +864,6 @@ export function createLibrary({ root, api, timeline, onAttach = () => {}, onLoca
     openMessage,
     getFiles: () => filesState,
     reloadFromStart,
+    reconcileAuthoritative,
   };
 }

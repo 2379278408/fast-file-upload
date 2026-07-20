@@ -245,7 +245,7 @@ class EventConnection:
         self,
         websocket: WebSocket,
         after: int,
-        fetch_missing: Callable[[int, int], list[dict[str, object]]] | None = None,
+        fetch_missing: Callable[[int, int], dict[str, object]] | None = None,
     ) -> None:
         self.websocket = websocket
         self.last_sequence = after
@@ -292,19 +292,41 @@ class EventConnection:
                 {"event_type": "ready", "sequence": self.last_sequence}
             )
 
+    async def require_resync(self, replay_target: int) -> None:
+        async with self.send_lock:
+            await self._require_resync(replay_target)
+
+    async def _require_resync(self, replay_target: int) -> None:
+        await self.websocket.send_json(
+            {"event_type": "resync_required", "sequence": replay_target}
+        )
+        self.last_sequence = replay_target
+        self.pending = {
+            sequence: event
+            for sequence, event in self.pending.items()
+            if sequence > replay_target
+        }
+
     async def _backfill_and_flush(self) -> None:
         gap_start = self.last_sequence + 1
         if gap_start not in self.pending and self._fetch_missing is not None:
             try:
-                missing = await asyncio.to_thread(
+                window = await asyncio.to_thread(
                     self._fetch_missing, self.last_sequence, self._pending_limit
                 )
-                for evt in missing:
+                earliest = int(window["earliest"])
+                latest = int(window["latest"])
+                if latest and self.last_sequence < earliest - 1:
+                    await self._require_resync(latest)
+                    await self._flush_pending()
+                    return
+                for evt in window["events"]:
                     seq = int(evt.get("sequence", 0))
                     if seq > self.last_sequence and seq not in self.pending:
                         self.pending[seq] = evt
             except Exception:
                 logger.exception("Failed to backfill missing events")
+                raise
         await self._flush_pending()
 
     async def _flush_pending(self) -> None:
@@ -317,10 +339,10 @@ class EventConnection:
 class EventHub:
     def __init__(self) -> None:
         self.connections: dict[WebSocket, EventConnection] = {}
-        self._fetch_missing: Callable[[int, int], list[dict[str, object]]] | None = None
+        self._fetch_missing: Callable[[int, int], dict[str, object]] | None = None
 
     def set_fetch_missing(
-        self, fetcher: Callable[[int, int], list[dict[str, object]]]
+        self, fetcher: Callable[[int, int], dict[str, object]]
     ) -> None:
         self._fetch_missing = fetcher
 
@@ -339,5 +361,9 @@ class EventHub:
                 await connection.queue_live(event)
             except (WebSocketDisconnect, Exception):
                 failed.append(websocket)
+                try:
+                    await websocket.close(code=1011)
+                except Exception:
+                    pass
         for websocket in failed:
             self.connections.pop(websocket, None)

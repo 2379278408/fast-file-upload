@@ -8,6 +8,8 @@ from pathlib import Path
 
 
 SESSION_DAYS = 30
+MAX_UPLOAD_CHUNK_SIZE_BYTES = 64 * 1024 * 1024
+MAX_UPLOAD_PARTS = 10_000
 _SESSION_SECRET_DOMAIN = b"personal-transfer-timeline/session-secret/v1\0"
 
 
@@ -54,6 +56,7 @@ class Settings:
     max_active_upload_sessions: int = 128
     max_concurrent_chunk_handlers: int = 16
     upload_progress_interval_seconds: float = 0.25
+    event_retention_limit: int = 10_000
 
     def __post_init__(self) -> None:
         if not self.auth_token or not self.auth_token.strip():
@@ -76,6 +79,19 @@ class Settings:
             raise ConfigurationError("CLIENT_REQUEST_LOCK_CAPACITY must be at least 1")
         if self.upload_chunk_size_bytes < 1:
             raise ConfigurationError("UPLOAD_CHUNK_SIZE_BYTES must be at least 1")
+        if self.upload_chunk_size_bytes > min(
+            self.max_upload_size, MAX_UPLOAD_CHUNK_SIZE_BYTES
+        ):
+            raise ConfigurationError(
+                "UPLOAD_CHUNK_SIZE_BYTES must not exceed the upload or 64 MiB limit"
+            )
+        part_count = (
+            self.max_upload_size + self.upload_chunk_size_bytes - 1
+        ) // self.upload_chunk_size_bytes
+        if part_count > MAX_UPLOAD_PARTS:
+            raise ConfigurationError(
+                f"UPLOAD_CHUNK_SIZE_BYTES would exceed the {MAX_UPLOAD_PARTS} part limit"
+            )
         if self.upload_session_ttl_seconds < 1:
             raise ConfigurationError("UPLOAD_SESSION_TTL_SECONDS must be at least 1")
         if self.upload_storage_reserve_bytes < 0:
@@ -89,6 +105,8 @@ class Settings:
             or self.upload_progress_interval_seconds <= 0
         ):
             raise ConfigurationError("UPLOAD_PROGRESS_INTERVAL_SECONDS must be positive")
+        if self.event_retention_limit < 1:
+            raise ConfigurationError("EVENT_RETENTION_LIMIT must be at least 1")
 
     @classmethod
     def from_env(cls, upload_dir: str, max_upload_size: int | None = None) -> "Settings":
@@ -159,4 +177,5 @@ class Settings:
             upload_progress_interval_seconds=float(
                 os.environ.get("UPLOAD_PROGRESS_INTERVAL_SECONDS", "0.25")
             ),
+            event_retention_limit=int(os.environ.get("EVENT_RETENTION_LIMIT", "10000")),
         )

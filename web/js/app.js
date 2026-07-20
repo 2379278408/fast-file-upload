@@ -357,7 +357,7 @@ const uploadCoordinator = createUploadCoordinator({
 });
 let uploadCoordinatorStarted = false;
 
-async function restoreUploads() {
+async function restoreUploads({ throwOnError = false } = {}) {
   if (appDestroyed) return;
   try {
     if (!uploadCoordinatorStarted) {
@@ -369,6 +369,7 @@ async function restoreUploads() {
     if (appDestroyed) return;
   } catch (error) {
     if (!appDestroyed) showToast(error.message || '上传任务恢复失败', 'error');
+    if (throwOnError) throw error;
   }
 }
 
@@ -716,8 +717,23 @@ function updateConnectionStatus(status) {
   }
 }
 
-function applyIncomingEvent(event) {
+async function reconcileAuthoritativeSnapshot() {
+  if (appDestroyed) throw new Error('Application is destroyed');
+  await restoreUploads({ throwOnError: true });
+  await Promise.all([
+    timeline.loadInitial(),
+    library.reconcileAuthoritative(),
+  ]);
+  if (appDestroyed) throw new Error('Application is destroyed');
+  renderUploadSnapshots();
+}
+
+async function applyIncomingEvent(event) {
   if (appDestroyed || !event) return false;
+  if (event.event_type === 'resync_required') {
+    await reconcileAuthoritativeSnapshot();
+    return true;
+  }
   if (event.event_type === 'ready') return true;
   if (event.event_type?.startsWith('upload.')) {
     return uploadCoordinator.applyRemoteEvent(event);

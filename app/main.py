@@ -55,6 +55,7 @@ from .upload_repository import (
     UploadCreate,
     UploadNotFound,
     UploadRepository,
+    UploadStorageCommitmentExceeded,
     UploadStateConflict,
 )
 from .upload_service import (
@@ -332,12 +333,19 @@ def create_app(settings: Settings) -> FastAPI:
                         await expire_uploads(lifespan_app.state.clock())
                     except Exception:
                         logger.exception("Periodic upload expiry failed")
+                    try:
+                        await asyncio.to_thread(
+                            messages.trim_events, settings.event_retention_limit
+                        )
+                    except Exception:
+                        logger.exception("Periodic event retention failed")
 
         await run_purge()
         try:
             await expire_uploads(lifespan_app.state.clock())
         except Exception:
             logger.exception("Startup upload expiry failed")
+        await asyncio.to_thread(messages.trim_events, settings.event_retention_limit)
         maintenance_task = asyncio.create_task(maintenance_worker())
         lifespan_app.state.maintenance_task = maintenance_task
         try:
@@ -358,7 +366,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.zip_cleanup_tasks = zip_cleanup_tasks
     app.state.clock = utc_now
     hub = EventHub()
-    hub.set_fetch_missing(messages.events_after)
+    hub.set_fetch_missing(messages.event_window_after)
     app.state.hub = hub
     login_limiter = LoginRateLimiter(
         settings.login_rate_limit_count,
@@ -929,6 +937,14 @@ def create_app(settings: Settings) -> FastAPI:
         session: SessionData = Depends(require_session),
         _: None = Depends(enforce_rate_limit),
     ) -> dict[str, object]:
+        if payload.chunk_size_bytes != request.app.state.settings.upload_chunk_size_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "chunk_size_bytes must equal the server value "
+                    f"{request.app.state.settings.upload_chunk_size_bytes}"
+                ),
+            )
         command = UploadCreate(
             client_request_id=payload.client_request_id,
             original_name=payload.name,
@@ -962,6 +978,8 @@ def create_app(settings: Settings) -> FastAPI:
         except UploadTooLarge as error:
             raise HTTPException(status_code=413, detail=str(error)) from error
         except UploadStorageExceeded as error:
+            raise HTTPException(status_code=507, detail=str(error)) from error
+        except UploadStorageCommitmentExceeded as error:
             raise HTTPException(status_code=507, detail=str(error)) from error
         except UploadCapacityExceeded as error:
             raise HTTPException(status_code=429, detail="Too many active uploads") from error
@@ -1308,7 +1326,8 @@ def create_app(settings: Settings) -> FastAPI:
             await websocket.close(code=1008)
             return
         await websocket.accept()
-        latest = messages.latest_sequence()
+        window = messages.event_window_after(after, 1)
+        latest = int(window["latest"])
         if after > latest:
             after = 0
         connection = hub.connect(websocket, after)
@@ -1316,9 +1335,16 @@ def create_app(settings: Settings) -> FastAPI:
             replay_target = latest
             replay_cursor = after
             while replay_cursor < replay_target:
+                replay_window = await asyncio.to_thread(
+                    messages.event_window_after, replay_cursor
+                )
+                if replay_cursor < int(replay_window["earliest"]) - 1:
+                    await connection.require_resync(replay_target)
+                    replay_cursor = replay_target
+                    break
                 replay = [
                     event
-                    for event in await asyncio.to_thread(messages.events_after, replay_cursor)
+                    for event in replay_window["events"]
                     if int(event["sequence"]) <= replay_target
                 ]
                 if not replay:

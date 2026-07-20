@@ -186,9 +186,7 @@ class UploadService:
             free_bytes = shutil.disk_usage(Path(self.settings.upload_dir)).free
         except OSError as error:
             raise UploadStorageExceeded("Storage capacity check failed") from error
-        required_bytes = command.size_bytes + self.settings.upload_storage_reserve_bytes
-        if free_bytes < required_bytes:
-            raise UploadStorageCapacityExceeded(required_bytes, free_bytes)
+        capacity_budget_bytes = free_bytes - self.settings.upload_storage_reserve_bytes
         extension = Path(sanitized_name).suffix.lower()
         if self.settings.allowed_extensions and extension not in self.settings.allowed_extensions:
             allowed = ", ".join(sorted(self.settings.allowed_extensions))
@@ -199,6 +197,7 @@ class UploadService:
             self.settings.upload_session_ttl_seconds,
             self.settings.max_active_upload_sessions,
             include_event=True,
+            capacity_budget_bytes=capacity_budget_bytes,
         )
         result = mutation["result"]
         mutation["result"] = self._result(result)

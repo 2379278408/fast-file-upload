@@ -157,6 +157,52 @@ class MessageRepository:
                 for row in rows
             ]
 
+    def earliest_sequence(self) -> int:
+        with self.db.connect() as connection:
+            row = connection.execute("SELECT MIN(sequence) FROM events").fetchone()
+            return int(row[0]) if row is not None and row[0] is not None else 1
+
+    def event_window_after(
+        self, sequence: int, limit: int = 500
+    ) -> dict[str, object]:
+        with self.db.transaction() as connection:
+            bounds = connection.execute(
+                "SELECT MIN(sequence), MAX(sequence) FROM events"
+            ).fetchone()
+            earliest = int(bounds[0]) if bounds[0] is not None else 1
+            latest = int(bounds[1]) if bounds[1] is not None else 0
+            rows = connection.execute(
+                "SELECT sequence, event_type, entity_id, payload, created_at "
+                "FROM events WHERE sequence > ? ORDER BY sequence ASC LIMIT ?",
+                (sequence, limit),
+            ).fetchall()
+            events = [
+                {
+                    "sequence": row["sequence"],
+                    "event_type": row["event_type"],
+                    "entity_id": row["entity_id"],
+                    "payload": json.loads(row["payload"]),
+                    "created_at": row["created_at"],
+                }
+                for row in rows
+            ]
+        return {"earliest": earliest, "latest": latest, "events": events}
+
+    def trim_events(self, retention_limit: int) -> int:
+        if retention_limit < 1:
+            raise ValueError("retention_limit must be at least 1")
+        with self.db.transaction() as connection:
+            cutoff = connection.execute(
+                "SELECT sequence FROM events ORDER BY sequence DESC LIMIT 1 OFFSET ?",
+                (retention_limit - 1,),
+            ).fetchone()
+            if cutoff is None:
+                return 0
+            deleted = connection.execute(
+                "DELETE FROM events WHERE sequence < ?", (int(cutoff[0]),)
+            )
+            return int(deleted.rowcount)
+
     def get_message(
         self, message_id: str, connection: sqlite3.Connection | None = None
     ) -> dict[str, object] | None:

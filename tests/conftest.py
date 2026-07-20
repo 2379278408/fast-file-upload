@@ -42,6 +42,8 @@ def settings(tmp_path: Path) -> Settings:
         rate_limit_count=0,
         rate_limit_window_seconds=60,
         retention_days=0,
+        upload_chunk_size_bytes=1024,
+        event_retention_limit=100,
     )
 
 

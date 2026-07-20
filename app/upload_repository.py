@@ -28,6 +28,13 @@ class UploadCapacityExceeded(Exception):
     pass
 
 
+class UploadStorageCommitmentExceeded(Exception):
+    def __init__(self, required_bytes: int, budget_bytes: int) -> None:
+        super().__init__("Insufficient storage capacity for active uploads")
+        self.required_bytes = required_bytes
+        self.budget_bytes = budget_bytes
+
+
 @dataclass(frozen=True, slots=True)
 class UploadCreate:
     client_request_id: str
@@ -107,7 +114,7 @@ class UploadRepository:
 
     def create_or_get(
         self, command: UploadCreate, now: datetime, ttl_seconds: int, max_active: int,
-        *, include_event: bool = False,
+        *, include_event: bool = False, capacity_budget_bytes: int | None = None,
     ) -> tuple[dict[str, object], bool] | dict[str, object]:
         with self.db.transaction() as connection:
             existing = connection.execute(
@@ -134,6 +141,20 @@ class UploadRepository:
             ).fetchone()[0]
             if int(active) >= max_active:
                 raise UploadCapacityExceeded(max_active)
+            if capacity_budget_bytes is not None:
+                placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
+                committed = connection.execute(
+                    f"SELECT COALESCE(SUM(CASE "
+                    "WHEN publication_state IN ('assembled', 'file_published', 'published') THEN 0 "
+                    "ELSE (2 * size_bytes) - confirmed_bytes END), 0) "
+                    f"FROM upload_sessions WHERE status IN ({placeholders})",
+                    ACTIVE_STATUSES,
+                ).fetchone()[0]
+                required = int(committed) + (2 * command.size_bytes)
+                if required > capacity_budget_bytes:
+                    raise UploadStorageCommitmentExceeded(
+                        required, capacity_budget_bytes
+                    )
             upload_id = uuid4().hex
             timestamp = now.isoformat()
             connection.execute(
