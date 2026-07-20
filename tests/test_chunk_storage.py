@@ -385,16 +385,22 @@ def test_assemble_rejects_disk_size_or_digest_damage(
     storage, session, parts = _assembly_case(tmp_path)
     storage.part_path("4" * 32, 0).write_bytes(damage)
 
-    with pytest.raises(PartIntegrityError):
+    with pytest.raises(PartIntegrityError) as captured:
         storage.assemble(session, parts)
+
+    assert captured.value.part_index == 0
+    assert captured.value.reason in {"size_mismatch", "digest_mismatch"}
 
 
 def test_assemble_reports_missing_stored_part_as_integrity_error(tmp_path: Path) -> None:
     storage, session, parts = _assembly_case(tmp_path)
     storage.part_path("4" * 32, 1).unlink()
 
-    with pytest.raises(PartIntegrityError, match="missing"):
+    with pytest.raises(PartIntegrityError, match="missing") as captured:
         storage.assemble(session, parts)
+
+    assert captured.value.part_index == 1
+    assert captured.value.reason == "missing"
 
 
 def test_write_part_stops_consuming_immediately_after_size_limit(tmp_path: Path) -> None:

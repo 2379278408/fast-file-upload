@@ -1118,7 +1118,10 @@ def create_app(settings: Settings) -> FastAPI:
                 await progress_publisher.mark_terminal(upload_id)
                 blocked = True
             mutation = await upload_service.complete(
-                upload_id, session, request.app.state.clock()
+                upload_id,
+                session,
+                request.app.state.clock(),
+                on_mutation=broadcast_mutation,
             )
         except UploadNotFound as error:
             if blocked:

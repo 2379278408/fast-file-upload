@@ -468,16 +468,32 @@ class UploadRepository:
                 raise UploadStateConflict("Completed upload message is missing")
             return message
 
-    def reset_assembling(self, upload_id: str, now: datetime) -> dict[str, object]:
+    def reset_assembling(
+        self, upload_id: str, now: datetime, *, include_event: bool = False
+    ) -> dict[str, object]:
         with self.db.transaction() as connection:
             session = self._load(connection, upload_id)
+            changed = False
             if session["status"] == "verifying" and session["publication_state"] == "assembling":
                 connection.execute(
                     "UPDATE upload_sessions SET status = 'uploading', publication_state = 'none', "
                     "file_sha256 = NULL, updated_at = ? WHERE id = ?",
                     (now.isoformat(), upload_id),
                 )
-            return self._load(connection, upload_id)
+                changed = True
+            result = self._load(connection, upload_id)
+            if not include_event:
+                return result
+            if not changed:
+                return {"result": result, "events": [], "changed": False}
+            event = self._append_event(
+                connection,
+                "upload.state_changed",
+                upload_id,
+                result,
+                now.isoformat(),
+            )
+            return {"result": result, "events": [event], "changed": True}
 
     def reconcile_missing_parts(
         self, missing: set[tuple[str, int]], now: datetime, ttl_seconds: int
@@ -510,8 +526,64 @@ class UploadRepository:
                     "updated_at = ?, expires_at = ? WHERE id = ? AND status NOT IN ('complete', 'cancelled', 'expired')",
                     (confirmed_bytes, now.isoformat(), self._expiry(now, ttl_seconds), upload_id),
                 )
-                changed.append(self._load(connection, upload_id))
+                result = self._load(connection, upload_id)
+                event = self._append_event(
+                    connection,
+                    "upload.state_changed",
+                    upload_id,
+                    result,
+                    now.isoformat(),
+                )
+                changed.append(
+                    {"result": result, "events": [event], "changed": True}
+                )
         return changed
+
+    def invalidate_part(
+        self,
+        upload_id: str,
+        part_index: int,
+        error_code: str,
+        now: datetime,
+        ttl_seconds: int,
+        *,
+        include_event: bool = False,
+    ) -> dict[str, object]:
+        with self.db.transaction() as connection:
+            session = self._load(connection, upload_id)
+            if session["status"] in {"complete", "cancelled", "expired"}:
+                raise UploadStateConflict(str(session["status"]))
+            connection.execute(
+                "DELETE FROM upload_parts WHERE upload_id = ? AND part_index = ?",
+                (upload_id, part_index),
+            )
+            confirmed_bytes = connection.execute(
+                "SELECT COALESCE(SUM(size_bytes), 0) FROM upload_parts WHERE upload_id = ?",
+                (upload_id,),
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE upload_sessions SET status = 'failed', error_code = ?, "
+                "publication_state = 'none', file_sha256 = NULL, confirmed_bytes = ?, "
+                "updated_at = ?, expires_at = ? WHERE id = ?",
+                (
+                    error_code,
+                    confirmed_bytes,
+                    now.isoformat(),
+                    self._expiry(now, ttl_seconds),
+                    upload_id,
+                ),
+            )
+            result = self._load(connection, upload_id)
+            if not include_event:
+                return result
+            event = self._append_event(
+                connection,
+                "upload.state_changed",
+                upload_id,
+                result,
+                now.isoformat(),
+            )
+            return {"result": result, "events": [event], "changed": True}
 
     def expired_ids(self, now: datetime, limit: int = 100) -> set[str]:
         placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
@@ -547,9 +619,12 @@ class UploadRepository:
             )
             return {"result": result, "events": [event], "changed": True}
 
-    def finish_published(self, upload_id: str, now: datetime) -> dict[str, object]:
+    def finish_published(
+        self, upload_id: str, now: datetime, *, include_event: bool = False
+    ) -> dict[str, object]:
         with self.db.transaction() as connection:
             session = self._load(connection, upload_id)
+            changed = False
             if session["publication_state"] == "published" and session["message_id"] is not None:
                 if connection.execute(
                     "SELECT 1 FROM messages WHERE id = ?", (session["message_id"],)
@@ -559,22 +634,53 @@ class UploadRepository:
                     "UPDATE upload_sessions SET status = 'complete', error_code = NULL, updated_at = ? WHERE id = ?",
                     (now.isoformat(), upload_id),
                 )
-            return self._load(connection, upload_id)
+                changed = session["status"] != "complete"
+            result = self._load(connection, upload_id)
+            if not include_event:
+                return result
+            if not changed:
+                return {"result": result, "events": [], "changed": False}
+            event = self._append_event(
+                connection,
+                "upload.state_changed",
+                upload_id,
+                result,
+                now.isoformat(),
+            )
+            return {"result": result, "events": [event], "changed": True}
 
     def fail(
-        self, upload_id: str, error_code: str, now: datetime, ttl_seconds: int
+        self,
+        upload_id: str,
+        error_code: str,
+        now: datetime,
+        ttl_seconds: int,
+        *,
+        include_event: bool = False,
     ) -> dict[str, object]:
         with self.db.transaction() as connection:
             session = self._load(connection, upload_id)
             if session["status"] in {"complete", "cancelled", "expired"}:
                 raise UploadStateConflict(str(session["status"]))
             if session["status"] == "failed" and session["error_code"] == error_code:
+                if include_event:
+                    return {"result": session, "events": [], "changed": False}
                 return session
             connection.execute(
                 "UPDATE upload_sessions SET status = 'failed', error_code = ?, updated_at = ?, expires_at = ? WHERE id = ?",
                 (error_code, now.isoformat(), self._expiry(now, ttl_seconds), upload_id),
             )
-            return self._load(connection, upload_id)
+            result = self._load(connection, upload_id)
+            if not include_event:
+                return result
+            event = self._append_event(
+                connection,
+                "upload.state_changed",
+                upload_id,
+                result,
+                now.isoformat(),
+            )
+            return {"result": result, "events": [event], "changed": True}
 
     def claim_expired(self, now: datetime, limit: int = 100) -> list[dict[str, object]]:
         placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)

@@ -283,6 +283,72 @@ def test_concurrent_complete_runs_assemble_and_finalize_once(
     assert calls == {"assemble": 1, "finalize": 1}
 
 
+def test_cancel_preempts_assembly_and_prevents_publication(
+    settings: Settings,
+) -> None:
+    app = create_app(settings)
+    original_assemble = app.state.chunk_storage.assemble
+    assembling = threading.Event()
+    release = threading.Event()
+    cancel_finished = threading.Event()
+    broadcasts: list[dict[str, object]] = []
+
+    def blocked_assemble(*args, **kwargs):
+        assembling.set()
+        assert release.wait(timeout=2)
+        return original_assemble(*args, **kwargs)
+
+    async def capture(event: dict[str, object]) -> None:
+        broadcasts.append(event)
+
+    app.state.chunk_storage.assemble = blocked_assemble
+    app.state.hub.broadcast = capture
+    with authenticated_client(settings, app=app, device_id="source") as client:
+        upload = create_upload(client, content=b"cancel-assembly")
+        upload_id = str(upload["upload_id"])
+        put_single_part(client, upload, b"cancel-assembly")
+        responses: dict[str, object] = {}
+
+        def complete() -> None:
+            responses["complete"] = client.post(
+                f"/api/uploads/{upload_id}/complete", json={}
+            )
+
+        def cancel() -> None:
+            responses["cancel"] = client.delete(f"/api/uploads/{upload_id}")
+            cancel_finished.set()
+
+        complete_thread = threading.Thread(target=complete)
+        cancel_thread = threading.Thread(target=cancel)
+        complete_thread.start()
+        assert assembling.wait(timeout=2)
+        verifying_was_broadcast = any(
+            event["event_type"] == "upload.state_changed"
+            and event["payload"]["status"] == "verifying"
+            for event in broadcasts
+        )
+
+        cancel_thread.start()
+        try:
+            cancel_preempted = cancel_finished.wait(timeout=0.5)
+        finally:
+            release.set()
+        complete_thread.join(timeout=2)
+        cancel_thread.join(timeout=2)
+
+        assert verifying_was_broadcast
+        assert cancel_preempted
+        assert responses["cancel"].status_code == 200
+        assert responses["cancel"].json()["status"] == "cancelled"
+        assert responses["complete"].status_code == 409
+        assert app.state.upload_repository.get(upload_id)["status"] == "cancelled"
+        assert client.get("/api/messages?limit=50").json()["items"] == []
+        assert not (settings.upload_dir / f"{upload_id}_report.txt").exists()
+        assert not (
+            settings.upload_dir / ".resumable" / upload_id / "final.uploading"
+        ).exists()
+
+
 def test_complete_broadcasts_only_its_mutation_events(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -337,7 +403,7 @@ def test_complete_broadcasts_only_its_mutation_events(
         assert broadcasts == []
 
 
-def test_complete_does_not_restart_durable_assembling_session(
+def test_complete_retry_resets_assembling_and_restarts_once(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = create_app(settings)
@@ -350,13 +416,17 @@ def test_complete_does_not_restart_durable_assembling_session(
         return original_assemble(*args, **kwargs)
 
     app.state.chunk_storage.assemble = counted_assemble
-    monkeypatch.setattr(
-        app.state.upload_repository,
-        "set_publication_state",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            RuntimeError("injected failure before assembled persistence")
-        ),
-    )
+    original_set_state = app.state.upload_repository.set_publication_state
+    failed = False
+
+    def fail_once(*args, **kwargs):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("injected failure before assembled persistence")
+        return original_set_state(*args, **kwargs)
+
+    monkeypatch.setattr(app.state.upload_repository, "set_publication_state", fail_once)
     with TestClient(app, raise_server_exceptions=False) as client:
         assert client.post(
             "/api/session",
@@ -373,11 +443,146 @@ def test_complete_does_not_restart_durable_assembling_session(
         replay = client.post(f"/api/uploads/{upload['upload_id']}/complete", json={})
 
     assert first.status_code == 500
-    assert replay.status_code == 409
-    assert assemble_calls == 1
+    assert replay.status_code == 200
+    assert assemble_calls == 2
     session = app.state.upload_repository.get(str(upload["upload_id"]))
-    assert session["status"] == "verifying"
-    assert session["publication_state"] == "assembling"
+    assert session["status"] == "complete"
+    assert session["publication_state"] == "published"
+
+
+@pytest.mark.parametrize("durable_state", ("assembled", "file_published"))
+def test_complete_retry_continues_durable_publication_state(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    durable_state: str,
+) -> None:
+    app = create_app(settings)
+    original_assemble = app.state.chunk_storage.assemble
+    assemble_calls = 0
+
+    def counted_assemble(*args, **kwargs):
+        nonlocal assemble_calls
+        assemble_calls += 1
+        return original_assemble(*args, **kwargs)
+
+    app.state.chunk_storage.assemble = counted_assemble
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert client.post(
+            "/api/session",
+            json={
+                "access_token": settings.auth_token,
+                "device_id": "source",
+                "device_name": "source",
+            },
+        ).status_code == 200
+        content = f"retry-{durable_state}".encode()
+        upload = create_upload(client, content=content)
+        upload_id = str(upload["upload_id"])
+        put_single_part(client, upload, content)
+
+        if durable_state == "assembled":
+            original_operation = app.state.upload_service.storage.publish
+
+            def fail_operation(*args, **kwargs):
+                raise OSError("injected publish failure")
+
+            monkeypatch.setattr(
+                app.state.upload_service.storage, "publish", fail_operation
+            )
+        else:
+            original_operation = app.state.upload_repository.finalize_publication
+
+            def fail_operation(*args, **kwargs):
+                raise RuntimeError("injected finalize failure")
+
+            monkeypatch.setattr(
+                app.state.upload_repository, "finalize_publication", fail_operation
+            )
+
+        first = client.post(f"/api/uploads/{upload_id}/complete", json={})
+        assert first.status_code >= 500
+        assert app.state.upload_repository.get(upload_id)["publication_state"] == durable_state
+
+        if durable_state == "assembled":
+            monkeypatch.setattr(
+                app.state.upload_service.storage, "publish", original_operation
+            )
+        else:
+            monkeypatch.setattr(
+                app.state.upload_repository, "finalize_publication", original_operation
+            )
+        retry = client.post(f"/api/uploads/{upload_id}/complete", json={})
+        replay = client.post(f"/api/uploads/{upload_id}/complete", json={})
+
+        assert retry.status_code == 200
+        assert replay.json() == retry.json()
+        assert assemble_calls == 1
+        messages = client.get("/api/messages?limit=50").json()["items"]
+        assert [item["upload_id"] for item in messages] == [upload_id]
+        assert (settings.upload_dir / retry.json()["file"]["storage_name"]).is_file()
+
+
+def test_complete_retry_finishes_published_state_idempotently(
+    settings: Settings,
+) -> None:
+    app = create_app(settings)
+    with authenticated_client(settings, app=app, device_id="source") as client:
+        upload = create_upload(client, content=b"published-retry")
+        upload_id = str(upload["upload_id"])
+        put_single_part(client, upload, b"published-retry")
+        completed = client.post(f"/api/uploads/{upload_id}/complete", json={})
+        assert completed.status_code == 200
+        with app.state.database.transaction() as connection:
+            connection.execute(
+                "UPDATE upload_sessions SET status = 'verifying' WHERE id = ?",
+                (upload_id,),
+            )
+
+        retry = client.post(f"/api/uploads/{upload_id}/complete", json={})
+
+        assert retry.status_code == 200
+        assert retry.json() == completed.json()
+        assert app.state.upload_repository.get(upload_id)["status"] == "complete"
+        assert len(client.get("/api/messages?limit=50").json()["items"]) == 1
+
+
+@pytest.mark.parametrize("damage", ("corrupt", "missing"))
+def test_complete_invalidates_damaged_confirmed_part_for_reupload(
+    settings: Settings,
+    damage: str,
+) -> None:
+    app = create_app(settings)
+    with authenticated_client(settings, app=app, device_id="source") as client:
+        content = b"abcdefgh"
+        upload = create_upload(client, content=content, chunk_size=4)
+        upload_id = str(upload["upload_id"])
+        put_part(client, upload, 0, content[:4])
+        put_part(client, upload, 1, content[4:])
+        damaged_path = app.state.chunk_storage.part_path(upload_id, 1)
+        if damage == "corrupt":
+            damaged_path.write_bytes(b"WXYZ")
+        else:
+            damaged_path.unlink()
+
+        failed = client.post(f"/api/uploads/{upload_id}/complete", json={})
+
+        assert failed.status_code == 409
+        current = client.get(f"/api/uploads/{upload_id}").json()
+        assert current["status"] == "failed"
+        assert current["confirmed_bytes"] == 4
+        assert current["confirmed_parts"] == [0]
+        assert not damaged_path.exists()
+
+        resumed = client.patch(
+            f"/api/uploads/{upload_id}", json={"action": "resume"}
+        )
+        assert resumed.status_code == 200
+        put_part(client, upload, 1, content[4:])
+        completed = client.post(f"/api/uploads/{upload_id}/complete", json={})
+
+        assert completed.status_code == 200
+        assert completed.json()["file"]["sha256"] == sha256(content).hexdigest()
+        assert len(client.get("/api/messages?limit=50").json()["items"]) == 1
 
 
 def test_restart_recovers_file_published_session_without_duplicate_message(
@@ -538,12 +743,12 @@ def test_restart_recovers_each_publication_failure_to_one_message(
         assert app.state.upload_repository.get(str(upload["upload_id"]))[
             "publication_state"
         ] == expected_state
+        monkeypatch.undo()
         retry = client.post(
             f"/api/uploads/{upload['upload_id']}/complete", json={}
         )
-        assert retry.status_code == 409
+        assert retry.status_code == 200
 
-    monkeypatch.undo()
     recovered_app = create_app(settings)
     with authenticated_client(
         settings, app=recovered_app, device_id="source"
@@ -578,6 +783,64 @@ def test_restart_reconciles_missing_confirmed_part(settings: Settings) -> None:
     assert session["error_code"] == "missing_part"
     assert session["confirmed_bytes"] == 0
     assert session["confirmed_parts"] == []
+
+
+def test_startup_recovery_broadcasts_state_mutations_in_sequence(
+    settings: Settings,
+) -> None:
+    app = create_app(settings)
+    client = authenticated_client(settings, app=app)
+    cases: dict[str, str] = {}
+    for index, state in enumerate(("missing", "assembling", "publication_error")):
+        content = f"recover-{state}".encode()
+        upload = create_upload(
+            client,
+            request_id=f"startup-state-{index}",
+            content=content,
+        )
+        upload_id = str(upload["upload_id"])
+        cases[state] = upload_id
+        put_single_part(client, upload, content)
+        if state == "missing":
+            app.state.chunk_storage.part_path(upload_id, 0).unlink()
+            continue
+        with app.state.database.transaction() as connection:
+            connection.execute(
+                "UPDATE upload_sessions SET status = 'verifying', publication_state = ?, "
+                "file_sha256 = ? WHERE id = ?",
+                (
+                    "assembling" if state == "assembling" else "assembled",
+                    None if state == "assembling" else sha256(content).hexdigest(),
+                    upload_id,
+                ),
+            )
+
+    restarted = create_app(settings)
+    broadcasts: list[dict[str, object]] = []
+
+    async def capture(event: dict[str, object]) -> None:
+        broadcasts.append(event)
+
+    restarted.state.hub.broadcast = capture
+    with TestClient(restarted):
+        pass
+
+    state_events = [
+        event
+        for event in broadcasts
+        if event["event_type"] == "upload.state_changed"
+        and event["entity_id"] in cases.values()
+    ]
+    assert [int(event["sequence"]) for event in state_events] == sorted(
+        int(event["sequence"]) for event in state_events
+    )
+    by_upload = {str(event["entity_id"]): event["payload"] for event in state_events}
+    assert by_upload[cases["missing"]]["status"] == "failed"
+    assert by_upload[cases["missing"]]["error_code"] == "missing_part"
+    assert by_upload[cases["assembling"]]["status"] == "uploading"
+    assert by_upload[cases["assembling"]]["publication_state"] == "none"
+    assert by_upload[cases["publication_error"]]["status"] == "failed"
+    assert by_upload[cases["publication_error"]]["error_code"] == "publication_error"
 
 
 def test_restart_uses_file_published_state_when_confirmed_part_is_missing(
@@ -638,7 +901,11 @@ def test_expired_unrecoverable_assembled_session_becomes_expired(
 
     mutations = asyncio.run(app.state.upload_service.expire(now))
 
-    assert len(mutations) == 1
+    assert [
+        event["event_type"]
+        for mutation in mutations
+        for event in mutation["events"]
+    ] == ["upload.state_changed", "upload.expired"]
     assert app.state.upload_repository.get(upload_id)["status"] == "expired"
 
 
@@ -713,7 +980,7 @@ def test_restart_finishes_cancelled_file_published_cleanup(
             "purge_file",
             lambda storage_name: (_ for _ in ()).throw(OSError("injected cleanup failure")),
         )
-        assert client.delete(f"/api/uploads/{upload['upload_id']}").status_code == 507
+        assert client.delete(f"/api/uploads/{upload['upload_id']}").status_code == 200
         assert final_path.is_file()
 
     monkeypatch.setattr(
@@ -833,7 +1100,7 @@ def test_maintenance_waits_for_in_progress_assembly(
         complete_thread.join(timeout=2)
         expire_thread.join(timeout=2)
 
-    assert maintenance_waited
+    assert not maintenance_waited
     assert assembled_survived
     assert responses["complete"].status_code == 200
     assert responses["expire"] == []
@@ -1455,23 +1722,44 @@ def test_cancel_is_idempotent_and_missing_upload_is_404(settings: Settings) -> N
     assert missing.status_code == 404
 
 
-def test_cancel_cleanup_storage_error_returns_507_after_persisting_state(
-    settings: Settings,
+def test_cancel_cleanup_failure_returns_cancelled_and_maintenance_retries(
+    settings: Settings, caplog: pytest.LogCaptureFixture
 ) -> None:
     app = create_app(settings)
-    client = authenticated_client(settings, app=app)
-    upload = create_upload(client)
+    broadcasts: list[dict[str, object]] = []
+
+    async def capture(event: dict[str, object]) -> None:
+        broadcasts.append(event)
+
+    app.state.hub.broadcast = capture
     original_cleanup = app.state.upload_service.chunks.cleanup_session
 
     def cleanup_failure(upload_id: str) -> None:
         raise OSError(errno.EIO, "Storage failure")
 
-    app.state.upload_service.chunks.cleanup_session = cleanup_failure
-    response = client.delete(f"/api/uploads/{upload['upload_id']}")
-    assert response.status_code == 507
-    assert app.state.upload_repository.get(str(upload["upload_id"]))["status"] == "cancelled"
-    app.state.upload_service.chunks.cleanup_session = original_cleanup
-    assert client.delete(f"/api/uploads/{upload['upload_id']}").status_code == 200
+    with authenticated_client(settings, app=app) as client:
+        upload = create_upload(client)
+        upload_id = str(upload["upload_id"])
+        put_single_part(client, upload, b"data")
+        session_dir = settings.upload_dir / ".resumable" / upload_id
+        app.state.upload_service.chunks.cleanup_session = cleanup_failure
+
+        with caplog.at_level(logging.WARNING, logger="transfer.upload"):
+            response = client.delete(f"/api/uploads/{upload_id}")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "cancelled"
+        assert app.state.upload_repository.get(upload_id)["status"] == "cancelled"
+        assert [event["event_type"] for event in broadcasts].count("upload.cancelled") == 1
+        assert upload_id in caplog.text
+        assert session_dir.exists()
+
+        app.state.upload_service.chunks.cleanup_session = original_cleanup
+        mutations = client.portal.call(
+            app.state.upload_service.expire, datetime.now(timezone.utc)
+        )
+        assert mutations == []
+        assert not session_dir.exists()
 
 
 def test_active_uploads_are_visible_to_observer(settings: Settings) -> None:
@@ -1678,7 +1966,9 @@ def test_recover_isolates_session_failure_and_logs_upload_id(
         app.state.upload_service.recover(datetime.now(timezone.utc))
     )
 
-    assert mutations == []
+    assert len(mutations) == 1
+    assert mutations[0]["result"]["upload_id"] == upload_ids[1]
+    assert mutations[0]["events"][0]["event_type"] == "upload.state_changed"
     assert app.state.upload_repository.get(upload_ids[0])["status"] == "verifying"
     assert app.state.upload_repository.get(upload_ids[1])["status"] == "uploading"
     assert any(

@@ -53,6 +53,7 @@ stateDiagram-v2
     uploading --> verifying
     verifying --> complete
     verifying --> failed
+    verifying --> cancelled
     queued --> cancelled
     uploading --> cancelled
     paused --> cancelled
@@ -65,7 +66,7 @@ stateDiagram-v2
     expired --> [*]
 ```
 
-`paused` is a server-visible state and a scheduler state. Pausing aborts or finishes the current chunk request and prevents new chunks. Confirmed chunks remain resumable. `failed` represents recoverable network, integrity, storage, publication, or re-authentication errors. `complete` is reachable only after whole-file verification and permanent message creation.
+`paused` is a server-visible state and a scheduler state. Pausing aborts or finishes the current chunk request and prevents new chunks. Confirmed chunks remain resumable. `failed` represents recoverable network, integrity, storage, publication, or re-authentication errors. `verifying` remains cancellable while assembly runs. `complete` is reachable only after whole-file verification and permanent message creation.
 
 ## Components And Interfaces
 
@@ -119,6 +120,12 @@ UPLOAD_DIR/.resumable/<upload_id>/
 
 The service derives every path from a server-generated identifier and validated numeric index. Incoming data writes to `incoming-*`; successful validation atomically renames the file to `part-*`. Completion streams ordered parts into a final `.uploading` path while calculating whole-file SHA-256, then uses the existing publish boundary.
 
+Completion uses three phases. The begin transition acquires the per-upload lock and durably records `verifying/assembling`; bounded assembly runs outside that lock; publication and database finalization reacquire the lock. The begin mutation is broadcast before assembly starts. After assembly, completion rereads durable state under the lock and discards the pending final when cancellation or expiry won, so DELETE can complete without waiting for whole-file hashing.
+
+An in-process complete retry enters the same durable recovery state machine used at startup. `assembling` discards the interrupted pending final, resets to `uploading`, and starts assembly again in the current request. `assembled` resumes file publication, `file_published` resumes database finalization, and `published` repairs the terminal status. Every path converges on one file and one permanent message.
+
+When assembly identifies a missing or damaged confirmed part, `PartIntegrityError` carries its `part_index` and machine-readable `reason`. Under the upload lock, the service removes the damaged file and atomically removes its database row, recomputes `confirmed_bytes`, and transitions the session to a resumable failed state. The client can then resume and retransmit only that part.
+
 ### Recovery And Maintenance
 
 Startup recovery reconciles SQLite and disk state:
@@ -130,6 +137,8 @@ Startup recovery reconciles SQLite and disk state:
 - Expire idle sessions older than 24 hours.
 
 The periodic maintenance loop reuses the same expiry and cleanup operation.
+
+Cancellation commits the durable `cancelled` mutation before temporary cleanup. Cleanup failures are logged and leave the successful cancellation response unchanged; startup and periodic maintenance retry cancelled and expired residual cleanup. Every recovery change to confirmed parts, status, error code, or publication state creates its state event in the same database transaction. Lifespan broadcasts those committed mutations in global event-sequence order.
 
 ## API Design
 

@@ -30,7 +30,16 @@ class PartConflict(ValueError):
 
 
 class PartIntegrityError(ValueError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        part_index: int | None = None,
+        reason: str = "invalid_structure",
+    ) -> None:
+        super().__init__(message)
+        self.part_index = part_index
+        self.reason = reason
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,11 +203,23 @@ class ChunkStorage:
         for part in ordered:
             range_size = part.end_byte - part.start_byte + 1
             if part.upload_id != upload_id:
-                raise PartIntegrityError("Part belongs to a different upload")
+                raise PartIntegrityError(
+                    "Part belongs to a different upload",
+                    part_index=part.part_index,
+                    reason="wrong_upload",
+                )
             if part.start_byte != expected_start or part.end_byte < part.start_byte:
-                raise PartIntegrityError("Upload part ranges must be precisely contiguous")
+                raise PartIntegrityError(
+                    "Upload part ranges must be precisely contiguous",
+                    part_index=part.part_index,
+                    reason="invalid_range",
+                )
             if part.size_bytes != range_size:
-                raise PartIntegrityError("Upload part size does not match its byte range")
+                raise PartIntegrityError(
+                    "Upload part size does not match its byte range",
+                    part_index=part.part_index,
+                    reason="record_size_mismatch",
+                )
             expected_start = part.end_byte + 1
         if expected_start != expected_size:
             raise PartIntegrityError("Upload parts do not cover the complete file range")
@@ -207,7 +228,11 @@ class ChunkStorage:
                 for part in ordered:
                     source_path = self.part_path(upload_id, part.part_index)
                     if source_path.is_symlink():
-                        raise PartIntegrityError("Upload part cannot be a symbolic link")
+                        raise PartIntegrityError(
+                            "Upload part cannot be a symbolic link",
+                            part_index=part.part_index,
+                            reason="symlink",
+                        )
                     part_digest = sha256()
                     part_written = 0
                     try:
@@ -219,11 +244,23 @@ class ChunkStorage:
                                 part_written += len(chunk)
                                 written += len(chunk)
                     except FileNotFoundError as exc:
-                        raise PartIntegrityError("Stored upload part is missing") from exc
+                        raise PartIntegrityError(
+                            "Stored upload part is missing",
+                            part_index=part.part_index,
+                            reason="missing",
+                        ) from exc
                     if part_written != part.size_bytes:
-                        raise PartIntegrityError("Stored part size differs from its record")
+                        raise PartIntegrityError(
+                            "Stored part size differs from its record",
+                            part_index=part.part_index,
+                            reason="size_mismatch",
+                        )
                     if part_digest.hexdigest() != part.sha256:
-                        raise PartIntegrityError("Stored part SHA-256 differs from its record")
+                        raise PartIntegrityError(
+                            "Stored part SHA-256 differs from its record",
+                            part_index=part.part_index,
+                            reason="digest_mismatch",
+                        )
                 output.flush()
                 os.fsync(output.fileno())
             if written != expected_size:
