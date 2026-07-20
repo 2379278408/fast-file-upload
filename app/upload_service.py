@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal, Protocol
 
+from . import safe_fs
 from .auth import SessionData
 from .chunk_storage import ChunkStorage, PartIntegrityError
 from .config import Settings
@@ -120,11 +121,25 @@ class UploadService:
     def _discard_unpublished_final(self, session: dict[str, object]) -> None:
         if session["publication_state"] not in {"assembled", "file_published"}:
             return
+        upload_id = str(session["upload_id"])
+        safe_name = sanitize_filename(str(session["original_name"]))
+        storage_name = f"{upload_id}_{safe_name}"
         try:
-            pending = self.chunks.pending_from_session(session, published=True)
-        except PartIntegrityError:
-            return
-        self.storage.purge_file(pending.storage_name)
+            safe_fs.quarantine_verified_file(
+                Path(self.settings.upload_dir),
+                storage_name,
+                expected_size=int(session["size_bytes"]),
+                expected_sha256=str(session["file_sha256"]),
+            )
+        except OSError as error:
+            logger.warning(
+                "Final upload cleanup deferred upload_id=%s storage_name=%s "
+                "isolated_name=%s",
+                upload_id,
+                storage_name,
+                getattr(error, "isolated_name", None),
+                exc_info=True,
+            )
 
     def _result(self, session: dict[str, object]) -> dict[str, object]:
         result = dict(session)

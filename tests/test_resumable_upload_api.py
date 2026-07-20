@@ -13,6 +13,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app import safe_fs
 from app.auth import SessionData
 from app.config import Settings
 from app.database import Database
@@ -994,18 +995,18 @@ def test_restart_finishes_cancelled_publication_cleanup(
         final_path = settings.upload_dir / (
             f"{upload['upload_id']}_{upload['original_name']}"
         )
-        original_purge = app.state.upload_service.storage.purge_file
+        original_cleanup = safe_fs.quarantine_verified_file
         monkeypatch.setattr(
-            app.state.upload_service.storage,
-            "purge_file",
-            lambda storage_name: (_ for _ in ()).throw(OSError("injected cleanup failure")),
+            safe_fs,
+            "quarantine_verified_file",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                OSError("injected cleanup failure")
+            ),
         )
         assert client.delete(f"/api/uploads/{upload['upload_id']}").status_code == 200
         assert final_path.is_file()
 
-    monkeypatch.setattr(
-        app.state.upload_service.storage, "purge_file", original_purge
-    )
+    monkeypatch.setattr(safe_fs, "quarantine_verified_file", original_cleanup)
     with authenticated_client(settings, app=create_app(settings)):
         pass
 
@@ -1054,17 +1055,17 @@ def test_cancel_removes_verified_final_after_publish_state_write_failure(
         assert final_path.read_bytes() == content
         assert session_dir.is_dir()
 
-        original_purge = app.state.upload_service.storage.purge_file
-        purge_calls = 0
+        original_cleanup = safe_fs.quarantine_verified_file
+        cleanup_calls = 0
 
-        def fail_once(storage_name: str) -> None:
-            nonlocal purge_calls
-            purge_calls += 1
-            if purge_calls == 1:
+        def fail_once(*args, **kwargs) -> bool:
+            nonlocal cleanup_calls
+            cleanup_calls += 1
+            if cleanup_calls == 1:
                 raise OSError("injected transient final cleanup failure")
-            original_purge(storage_name)
+            return original_cleanup(*args, **kwargs)
 
-        monkeypatch.setattr(app.state.upload_service.storage, "purge_file", fail_once)
+        monkeypatch.setattr(safe_fs, "quarantine_verified_file", fail_once)
 
         cancelled = client.delete(f"/api/uploads/{upload_id}")
 
@@ -1081,13 +1082,15 @@ def test_cancel_removes_verified_final_after_publish_state_write_failure(
         )
 
         assert mutations == []
-        assert purge_calls == 2
+        assert cleanup_calls == 2
         assert not final_path.exists()
         assert not session_dir.exists()
 
 
 def test_cancel_preserves_unverified_final_after_publish_state_write_failure(
-    settings: Settings, monkeypatch: pytest.MonkeyPatch
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     content = b"owned-content"
     replacement = b"other-content"
@@ -1102,6 +1105,7 @@ def test_cancel_preserves_unverified_final_after_publish_state_write_failure(
     monkeypatch.setattr(
         app.state.upload_repository, "set_publication_state", fail_file_published
     )
+    caplog.set_level(logging.WARNING, logger="transfer.upload")
     with TestClient(app, raise_server_exceptions=False) as client:
         assert client.post(
             "/api/session",
@@ -1121,7 +1125,11 @@ def test_cancel_preserves_unverified_final_after_publish_state_write_failure(
         cancelled = client.delete(f"/api/uploads/{upload_id}")
 
         assert cancelled.status_code == 200
-        assert final_path.read_bytes() == replacement
+        assert not final_path.exists()
+        isolated = list(settings.upload_dir.glob(".cleanup-*"))
+        assert len(isolated) == 1
+        assert isolated[0].read_bytes() == replacement
+        assert f"isolated_name={isolated[0].name}" in caplog.text
 
 
 def test_maintenance_retries_complete_session_chunk_cleanup(

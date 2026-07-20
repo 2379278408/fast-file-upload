@@ -65,7 +65,7 @@ Baseline: `e227557` (`fix(upload): harden completion recovery`)
 ### Rename And State-Write Boundary
 
 - RED: fault injection after successful rename left durable publication state at `assembled`; DELETE broadcast cancellation and removed chunks while leaving the final file behind.
-- GREEN: terminal cleanup now accepts `assembled` and `file_published`, reconstructs the upload-scoped final name, validates upload ID and path constraints, and verifies durable size and SHA-256 before deleting the exact final name. A same-path replacement with a different digest is preserved.
+- GREEN: terminal cleanup now accepts `assembled` and `file_published`, reconstructs the upload-scoped final name, validates upload ID and path constraints, and verifies durable size and SHA-256 before deleting the exact final name. A same-path replacement with a different digest is retained under an isolated `.cleanup-*` quarantine name.
 - Recovery: cancellation remains successful when the first cleanup attempt fails; periodic maintenance and startup recovery retry both durable publication states until verified final and chunk residue converge.
 
 ### Complete Residual Cleanup
@@ -99,3 +99,50 @@ Baseline: `e227557` (`fix(upload): harden completion recovery`)
   - `python3 -m compileall -q app server.py tests`
   - `git diff --check`
   - Result: exit code 0 with no output.
+
+## TOCTOU Follow-up Remediation
+
+Baseline: `e35f69d` (`fix(upload): close publication cleanup gaps`)
+
+### Final File Quarantine
+
+- RED: final-file size and digest validation used pathname operations followed by a separate pathname unlink, so replacement between verification and deletion could select another directory entry.
+- GREEN: cleanup opens the trusted upload root with `O_DIRECTORY|O_NOFOLLOW`, atomically isolates the final file under an unpredictable `.cleanup-*` name with `renameat2(RENAME_NOREPLACE)`, and opens it with `O_NOFOLLOW`. Deletion requires a regular single-link file, durable size and SHA-256, and a final device/inode/type match. Collision retries never overwrite an existing quarantine entry; failed proof retains the isolated object and logs the cleanup deferral.
+
+### Resumable Tree Anchoring
+
+- RED: `Path.iterdir()`, child unlink, and session `rmdir()` resolved names independently, allowing session or `.resumable` replacement to redirect later traversal.
+- GREEN: session cleanup opens upload root, `.resumable`, and descendant directories with trusted `dir_fd` plus `O_DIRECTORY|O_NOFOLLOW`. It lists open descriptors, stats without following symlinks, unlinks symlink entries directly, and compares directory identity before removal. Concurrent missing-entry races converge idempotently.
+
+### TOCTOU Tests
+
+- Final hash-followed-by-name-replacement preserves both the external sentinel and retained original inode.
+- Upload-root symlink and hard-linked final objects are rejected.
+- Session-directory replacement and `.resumable` parent replacement preserve external sentinels.
+- Normal recursive cleanup removes nested content and symlink entries without following them.
+- Concurrent final and session cleanup, quarantine-name collision, and missing secure platform primitives are covered.
+
+### TOCTOU Verification
+
+- Initial RED:
+  - `python3 -m pytest -q tests/test_safe_fs.py`
+  - Result: collection failed because `app.safe_fs` did not exist.
+- Safe-filesystem unit suite:
+  - `python3 -m pytest -q tests/test_safe_fs.py`
+  - Result: `11 passed, 1 warning in 0.04s`.
+- Focused upload cleanup suite:
+  - `python3 -m pytest -q tests/test_safe_fs.py tests/test_chunk_storage.py tests/test_resumable_upload_api.py`
+  - Result before the final hard-link case: `111 passed, 1 warning in 9.39s`.
+- Full default project suite:
+  - `python3 -m pytest -q`
+  - Result: `520 passed, 1 deselected, 1 warning in 194.91s`.
+- Python compilation and patch validation:
+  - `python3 -m compileall -q app server.py tests`
+  - `git diff --check`
+  - Result: exit code 0 with no output.
+
+### Platform Considerations
+
+- Secure cleanup requires POSIX directory descriptors, `O_DIRECTORY`, `O_NOFOLLOW`, descriptor-based `listdir`, no-follow `stat`, and Linux `renameat2(RENAME_NOREPLACE)`. Missing primitives produce `ENOTSUP`, retain residual data, and rely on startup or maintenance retry after deployment to a supported platform.
+- Trusted directories must be owned by the effective user and must not be group- or world-writable. This blocks untrusted local users from mutating cleanup directory entries.
+- A process with the same effective UID can modify owner-controlled directories. The design reduces its race window through unpredictable quarantine names and identity checks; deployment should keep the application UID dedicated to this service.

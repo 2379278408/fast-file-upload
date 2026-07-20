@@ -10,6 +10,7 @@ from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
+from .safe_fs import remove_tree_anchored
 from .storage import PendingFile, sanitize_filename
 from .upload_repository import PartRecord
 
@@ -358,22 +359,8 @@ class ChunkStorage:
             pass
 
     def cleanup_session(self, upload_id: str) -> None:
-        session_dir = self._session_dir(upload_id)
-        try:
-            children = list(session_dir.iterdir())
-        except FileNotFoundError:
-            return
-        for child in children:
-            if child.is_dir() and not child.is_symlink():
-                raise ValueError("Unexpected directory in upload session")
-            try:
-                child.unlink()
-            except FileNotFoundError:
-                pass
-        try:
-            session_dir.rmdir()
-        except FileNotFoundError:
-            pass
+        _validate_key(upload_id, 0)
+        remove_tree_anchored(self.upload_dir, (self.resumable_dir.name, upload_id))
 
     def reconcile(
         self,
