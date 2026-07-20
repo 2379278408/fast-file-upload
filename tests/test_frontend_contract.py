@@ -2124,7 +2124,8 @@ def test_timeline_upload_projection_replaces_card_without_duplicate() -> None:
     """)
     assert context.eval("container.querySelectorAll('[data-upload-id=\"upload-1\"]').length") == 0
     assert context.eval("container.querySelectorAll('[data-message-id=\"message-1\"]').length") == 1
-    assert context.eval("container.children.length") == 1
+    assert context.eval("container.querySelectorAll('.timeline-message').length") == 1
+    assert context.eval("container.querySelectorAll('.timeline-date-separator').length") == 1
 
 
 def test_upload_cards_render_text_states_metrics_and_observer_permissions() -> None:
@@ -3475,16 +3476,18 @@ def test_timeline_focus_message_respects_reduced_motion_and_keeps_focus_state() 
     load_js_module(context, "./timeline.js", read_web("js/timeline.js"))
     result = json.loads(context.eval(r"""
       const container = document.getElementById('timelineContainer');
-      const target = document.createElement('div');
-      target.className = 'timeline-message';
-      target.dataset.messageId = 'motion-message';
-      container.append(target);
       const timeline = __modules['./timeline.js'].createTimeline({
         container,
         newMessageButton: document.getElementById('newMessageButton'),
         api: () => Promise.resolve({ items: [], next_before: null }),
         onRestore: null,
       });
+      timeline.upsert({
+        id: 'motion-message',
+        body: 'motion',
+        created_at: '2026-07-19T00:00:00Z',
+      });
+      const target = container.querySelector('[data-message-id="motion-message"]');
       globalThis.__scrollIntoViewOptions = [];
 
       window.matchMedia = () => ({ matches: false });
@@ -4115,3 +4118,275 @@ def test_timeline_concurrent_loads_share_promise_and_load_until_continues(
         "/api/messages?limit=50",
         f"/api/messages?limit=50&before={first_page['next_before']}",
     ]
+
+
+def test_timeline_message_first_suppresses_later_terminal_upload_snapshot() -> None:
+    context = create_js_context()
+    load_js_module(context, "./timeline.js", read_web("js/timeline.js"))
+    result = json.loads(context.eval(r"""
+      const container = document.getElementById('messageFirstTimeline');
+      const timeline = __modules['./timeline.js'].createTimeline({
+        container,
+        newMessageButton: null,
+        api: () => Promise.resolve({ items: [], next_before: null }),
+        onRestore: null,
+      });
+      timeline.upsert({
+        id: 'message-first',
+        upload_id: 'upload-first',
+        client_request_id: 'request-first',
+        created_at: '2026-07-19T10:00:00Z',
+        file: { id: 'file-first', name: 'first.txt' },
+      });
+      timeline.upsertUpload({
+        uploadId: 'upload-first',
+        clientRequestId: 'request-first',
+        createdAt: '2026-07-19T09:59:59Z',
+        name: 'first.txt',
+        status: 'completed',
+      });
+      JSON.stringify({
+        messages: container.querySelectorAll('[data-message-id="message-first"]').length,
+        uploads: container.querySelectorAll('[data-upload-id="upload-first"]').length,
+        projectedItems: container.querySelectorAll('.timeline-message').length,
+      });
+    """))
+
+    assert result == {"messages": 1, "uploads": 0, "projectedItems": 1}
+
+
+def test_timeline_initial_and_older_pages_share_deduped_sorting_path() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.timelinePages = [
+        {
+          items: [
+            { id: 'message-c', body: 'c', created_at: '2026-07-20T08:00:00Z' },
+            { id: 'message-b', body: 'b', created_at: '2026-07-19T08:00:00Z' },
+          ],
+          next_before: 'older-page',
+        },
+        {
+          items: [
+            { id: 'message-b', body: 'b updated', created_at: '2026-07-19T08:00:00Z' },
+            { id: 'message-a', body: 'a', created_at: '2026-07-19T07:00:00Z' },
+          ],
+          next_before: null,
+        },
+      ];
+    """)
+    load_js_module(context, "./timeline.js", read_web("js/timeline.js"))
+    context.eval(r"""
+      const container = document.getElementById('pagedTimeline');
+      globalThis.pagedTimeline = __modules['./timeline.js'].createTimeline({
+        container,
+        newMessageButton: null,
+        api: () => Promise.resolve(timelinePages.shift()),
+        onRestore: null,
+      });
+      pagedTimeline.loadInitial();
+    """)
+    drain_jobs(context)
+    context.eval("pagedTimeline.loadOlder();")
+    drain_jobs(context)
+    result = json.loads(context.eval(r"""
+      const resultContainer = document.getElementById('pagedTimeline');
+      JSON.stringify({
+        ids: resultContainer.querySelectorAll('.timeline-message').map(
+          element => element.dataset.messageId || element.dataset.uploadId
+        ),
+        dates: resultContainer.querySelectorAll('.timeline-date-separator').map(
+          element => element.dataset.date
+        ),
+        duplicateCount: resultContainer.querySelectorAll('[data-message-id="message-b"]').length,
+      });
+    """))
+
+    assert result == {
+        "ids": ["message-a", "message-b", "message-c"],
+        "dates": ["2026-07-19", "2026-07-20"],
+        "duplicateCount": 1,
+    }
+
+
+def test_composer_destroy_removes_every_input_handler_and_allows_clean_reinit() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.__modules['./api.js'] = {
+        sendText: () => Promise.resolve({ id: 'sent-message', created_at: '2026-07-20T00:00:00Z' }),
+      };
+      globalThis.enqueueCalls = 0;
+      globalThis.upsertCalls = 0;
+    """)
+    load_js_module(context, "./composer.js", read_web("js/composer.js"))
+    result = json.loads(context.eval(r"""
+      const form = document.getElementById('destroyComposerForm');
+      const textarea = document.getElementById('destroyComposerTextarea');
+      const fileInput = document.getElementById('destroyComposerInput');
+      const dropTarget = document.getElementById('destroyComposerDrop');
+      const options = {
+        form,
+        textarea,
+        fileInput,
+        dropTarget,
+        api: null,
+        timeline: { upsert() { upsertCalls += 1; } },
+        uploadCoordinator: { enqueueFiles() { enqueueCalls += 1; } },
+      };
+      const first = __modules['./composer.js'].createComposer(options);
+      first.destroy();
+      first.destroy();
+      const afterDestroy = {
+        keydown: (textarea.listeners.keydown || []).length,
+        submit: (form.listeners.submit || []).length,
+        change: (fileInput.listeners.change || []).length,
+        dragenter: (dropTarget.listeners.dragenter || []).length,
+        dragover: (dropTarget.listeners.dragover || []).length,
+        dragleave: (dropTarget.listeners.dragleave || []).length,
+        drop: (dropTarget.listeners.drop || []).length,
+        paste: (document.listeners.paste || []).length,
+        dragoverClass: dropTarget.classList.contains('dragover'),
+      };
+      const second = __modules['./composer.js'].createComposer(options);
+      textarea.value = 'once';
+      form.listeners.submit[0]({ preventDefault() {} });
+      second.destroy();
+      JSON.stringify({ afterDestroy, remainingSubmit: (form.listeners.submit || []).length });
+    """))
+    drain_jobs(context)
+
+    assert result == {
+        "afterDestroy": {
+            "keydown": 0,
+            "submit": 0,
+            "change": 0,
+            "dragenter": 0,
+            "dragover": 0,
+            "dragleave": 0,
+            "drop": 0,
+            "paste": 0,
+            "dragoverClass": False,
+        },
+        "remainingSubmit": 0,
+    }
+    assert context.eval("upsertCalls") == 0
+
+
+def test_timeline_destroy_disconnects_observer_listeners_and_timers() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.observerDisconnects = 0;
+      globalThis.clearedTimelineTimers = [];
+      globalThis.nextTimelineTimer = 0;
+      globalThis.IntersectionObserver = class IntersectionObserver {
+        observe() {}
+        disconnect() { observerDisconnects += 1; }
+      };
+      globalThis.setTimeout = window.setTimeout = () => ++nextTimelineTimer;
+      globalThis.clearTimeout = window.clearTimeout = id => clearedTimelineTimers.push(id);
+    """)
+    load_js_module(context, "./timeline.js", read_web("js/timeline.js"))
+    result = json.loads(context.eval(r"""
+      const container = document.getElementById('destroyTimeline');
+      const button = document.getElementById('destroyTimelineButton');
+      const timeline = __modules['./timeline.js'].createTimeline({
+        container,
+        newMessageButton: button,
+        api: () => Promise.resolve({ items: [], next_before: null }),
+        onRestore: null,
+      });
+      timeline.upsert({ id: 'destroy-message', body: 'destroy', created_at: '2026-07-20T00:00:00Z' });
+      timeline.focusMessage('destroy-message');
+      timeline.destroy();
+      timeline.destroy();
+      JSON.stringify({
+        scrollListeners: (container.listeners.scroll || []).length,
+        clickListeners: (button.listeners.click || []).length,
+        observerDisconnects,
+        clearedTimelineTimers,
+        eventApplied: timeline.mergeEvent({
+          sequence: 1,
+          event_type: 'message.created',
+          entity_id: 'after-destroy',
+          payload: { created_at: '2026-07-20T00:00:01Z' },
+        }),
+      });
+    """))
+
+    assert result == {
+        "scrollListeners": 0,
+        "clickListeners": 0,
+        "observerDisconnects": 1,
+        "clearedTimelineTimers": [1],
+        "eventApplied": False,
+    }
+
+
+def test_app_reinitialization_tears_down_previous_modules_and_submit_handler() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.submitCalls = 0;
+      globalThis.destroyCounts = { composer: 0, timeline: 0, coordinator: 0, library: 0, navigation: 0, unsubscribe: 0 };
+      globalThis.__modules['./api.js'] = {
+        request: () => Promise.resolve({}),
+        unlock: () => Promise.resolve({}),
+        logout: () => Promise.resolve({}),
+        getSession: () => Promise.reject(new Error('locked')),
+        ApiError: class ApiError extends Error {},
+        connectEvents: () => ({ close() {} }),
+        getLastSequence: () => 0,
+      };
+      globalThis.__modules['./timeline.js'] = { createTimeline: () => ({
+        loadInitial: () => Promise.resolve(), upsertUpload() {}, mergeEvent() {}, focusMessage() {},
+        destroy() { destroyCounts.timeline += 1; },
+      }) };
+      globalThis.__modules['./composer.js'] = { createComposer: ({ form }) => {
+        const onSubmit = event => { event.preventDefault(); submitCalls += 1; };
+        form.addEventListener('submit', onSubmit);
+        return { destroy() { form.removeEventListener('submit', onSubmit); destroyCounts.composer += 1; } };
+      } };
+      globalThis.__modules['./upload-coordinator.js'] = { createUploadCoordinator: () => ({
+        start: () => Promise.resolve(), reconcile: () => Promise.resolve(), getSnapshot: () => [],
+        subscribe() { return () => { destroyCounts.unsubscribe += 1; }; },
+        pauseAll() {}, resumeAll() {}, cancelAll() {}, applyRemoteEvent() {},
+        destroy() { destroyCounts.coordinator += 1; },
+      }) };
+      globalThis.__modules['./upload-persistence.js'] = { createUploadPersistence: () => ({}) };
+      globalThis.__modules['./library.js'] = { createLibrary: () => ({
+        load: () => Promise.resolve(), clearSelection() {}, applyEvent() {},
+        destroy() { destroyCounts.library += 1; },
+      }) };
+      globalThis.__modules['./navigation.js'] = { createNavigation: () => ({
+        start() {}, navigate: () => Promise.resolve(),
+        destroy() { destroyCounts.navigation += 1; },
+      }) };
+    """)
+    app_source = read_web("js/app.js")
+    load_js_module(context, "./app.js", app_source)
+    drain_jobs(context)
+    load_js_module(context, "./app.js", app_source)
+    drain_jobs(context)
+    result = json.loads(context.eval(r"""
+      const form = document.getElementById('composerForm');
+      form.listeners.submit[0]({ preventDefault() {} });
+      window.dispatchEvent(new CustomEvent('pagehide'));
+      window.dispatchEvent(new CustomEvent('beforeunload'));
+      JSON.stringify({
+        submitCalls,
+        submitListeners: (form.listeners.submit || []).length,
+        destroyCounts,
+      });
+    """))
+
+    assert result == {
+        "submitCalls": 1,
+        "submitListeners": 0,
+        "destroyCounts": {
+            "composer": 2,
+            "timeline": 2,
+            "coordinator": 2,
+            "library": 2,
+            "navigation": 2,
+            "unsubscribe": 2,
+        },
+    }

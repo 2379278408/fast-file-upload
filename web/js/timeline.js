@@ -3,6 +3,13 @@ import { UNDO_WINDOW_MS, HIGHLIGHT_DURATION_MS } from './config.js';
 export function createTimeline({ container, newMessageButton, api, onRestore, onUploadAction }) {
   const messages = new Map();
   const uploads = new Map();
+  const messageByUploadId = new Map();
+  const messageByClientRequestId = new Map();
+  const messageElements = new Map();
+  const uploadElements = new Map();
+  const undoNotices = new Map();
+  const undoTimers = new Map();
+  const timers = new Set();
   const appliedSequences = new Set();
   let lastSequence = 0;
   let nextBefore = null;
@@ -12,6 +19,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
   let observer = null;
   let atBottom = true;
   let newCount = 0;
+  let destroyed = false;
 
   const SCROLL_THRESHOLD = 48;
   const HTTP = 'http:';
@@ -42,21 +50,22 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     }
   }
 
-  if (container) {
-    container.addEventListener('scroll', () => {
-      atBottom = isNearBottom();
-      if (atBottom) {
-        newCount = 0;
-        updateNewButton();
-      }
-    });
+  function handleScroll() {
+    atBottom = isNearBottom();
+    if (atBottom) {
+      newCount = 0;
+      updateNewButton();
+    }
   }
 
+  function handleNewMessageClick() {
+    scrollToBottom(true);
+  }
+
+  if (container) container.addEventListener('scroll', handleScroll);
   if (newMessageButton) {
     newMessageButton.hidden = true;
-    newMessageButton.addEventListener('click', () => {
-      scrollToBottom(true);
-    });
+    newMessageButton.addEventListener('click', handleNewMessageClick);
   }
 
   function getLocalDate(ts) {
@@ -161,9 +170,8 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
         const deleted = await api(`/api/messages/${encodeURIComponent(msg.id)}`, {
           method: 'DELETE',
         });
-        messages.delete(msg.id);
-        const rendered = container && container.querySelector(`[data-message-id="${msg.id}"]`);
-        if (rendered) rendered.remove();
+        if (destroyed) return;
+        removeMessage(msg.id);
         showUndo({ ...msg, ...(deleted || {}) });
       } catch {
         // The event stream keeps the timeline consistent after request failures.
@@ -284,21 +292,33 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
   }
 
   function upsertUpload(snapshot) {
-    if (!snapshot || !snapshot.uploadId) return;
+    if (destroyed || !snapshot || !snapshot.uploadId) return false;
     const previous = uploads.get(snapshot.uploadId);
     const upload = { ...previous, ...snapshot };
+    const permanentMessage = findMessageForUpload(upload);
+    if (permanentMessage) {
+      removeUpload(upload.uploadId);
+      return false;
+    }
     uploads.set(upload.uploadId, upload);
-    if (!container) return;
-    const existing = container.querySelector(`[data-upload-id="${upload.uploadId}"]`);
+    if (!container) return true;
+    const existing = uploadElements.get(upload.uploadId);
     const element = renderUpload(upload);
-    if (existing) existing.replaceWith(element);
-    else container.append(element);
+    if (existing) existing.remove();
+    uploadElements.set(upload.uploadId, element);
+    container.append(element);
+    rebuildProjection();
+    return true;
   }
 
-  function removeUpload(uploadId) {
+  function removeUpload(uploadId, { rebuild = true } = {}) {
+    if (destroyed) return null;
     const upload = uploads.get(uploadId);
     uploads.delete(uploadId);
-    if (container) container.querySelector(`[data-upload-id="${uploadId}"]`)?.remove();
+    const element = uploadElements.get(uploadId);
+    uploadElements.delete(uploadId);
+    if (element) element.remove();
+    if (rebuild && container) rebuildProjection();
     return upload;
   }
 
@@ -314,12 +334,53 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     ) || null;
   }
 
+  function findMessageForUpload(upload) {
+    const messageId = messageByUploadId.get(upload.uploadId)
+      || messageByClientRequestId.get(upload.clientRequestId);
+    return messageId ? messages.get(messageId) || null : null;
+  }
+
+  function unindexMessage(message) {
+    if (!message) return;
+    if (message.upload_id && messageByUploadId.get(message.upload_id) === message.id) {
+      messageByUploadId.delete(message.upload_id);
+    }
+    if (
+      message.client_request_id
+      && messageByClientRequestId.get(message.client_request_id) === message.id
+    ) {
+      messageByClientRequestId.delete(message.client_request_id);
+    }
+  }
+
+  function indexMessage(message) {
+    if (message.upload_id) messageByUploadId.set(message.upload_id, message.id);
+    if (message.client_request_id) {
+      messageByClientRequestId.set(message.client_request_id, message.id);
+    }
+  }
+
+  function removeMessage(messageId, { rebuild = true } = {}) {
+    if (destroyed) return null;
+    const message = messages.get(messageId);
+    unindexMessage(message);
+    messages.delete(messageId);
+    const element = messageElements.get(messageId);
+    messageElements.delete(messageId);
+    if (element) element.remove();
+    if (rebuild && container) rebuildProjection();
+    return message;
+  }
+
   function showUndo(message) {
-    if (!container) return;
-    const existing = container.querySelector(
-      `.timeline-undo[data-undo-message-id="${message.id}"]`
-    );
+    if (destroyed || !container) return;
+    const existing = undoNotices.get(message.id);
     if (existing) existing.remove();
+    const existingTimer = undoTimers.get(message.id);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      timers.delete(existingTimer);
+    }
 
     const notice = document.createElement('div');
     notice.className = 'timeline-undo';
@@ -332,20 +393,33 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     undoButton.textContent = '撤销';
     notice.append(label, undoButton);
     container.append(notice);
+    undoNotices.set(message.id, notice);
 
     const deletedAt = Date.parse(message.deleted_at || '');
     const undoMilliseconds = Number.isFinite(deletedAt)
       ? Math.max(0, deletedAt + UNDO_WINDOW_MS - Date.now())
       : UNDO_WINDOW_MS;
-    const expiryTimer = setTimeout(() => notice.remove(), undoMilliseconds);
+    const expiryTimer = setTimeout(() => {
+      timers.delete(expiryTimer);
+      undoTimers.delete(message.id);
+      undoNotices.delete(message.id);
+      notice.remove();
+    }, undoMilliseconds);
+    timers.add(expiryTimer);
+    undoTimers.set(message.id, expiryTimer);
     undoButton.addEventListener('click', async () => {
+      if (destroyed) return;
       undoButton.disabled = true;
       try {
         const restored = await api(
           `/api/messages/${encodeURIComponent(message.id)}/restore`,
           { method: 'POST' }
         );
+        if (destroyed) return;
         clearTimeout(expiryTimer);
+        timers.delete(expiryTimer);
+        undoTimers.delete(message.id);
+        undoNotices.delete(message.id);
         notice.remove();
         upsertMessage(restored);
       } catch {
@@ -354,45 +428,52 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     });
   }
 
-  function insertMessageSorted(el) {
-    const children = Array.from(container.querySelectorAll('.timeline-message'));
-    const createdAt = el.dataset.createdAt || '';
-    const msgId = el.dataset.messageId || '';
-    let inserted = false;
-    for (const child of children) {
-      const childCreatedAt = child.dataset.createdAt || '';
-      const childMsgId = child.dataset.messageId || '';
-      if (createdAt < childCreatedAt || (createdAt === childCreatedAt && msgId < childMsgId)) {
-        container.insertBefore(el, child);
-        inserted = true;
-        break;
-      }
-    }
-    if (!inserted) {
-      container.append(el);
-    }
+  function stableElementId(element) {
+    if (element.dataset.messageId) return `message:${element.dataset.messageId}`;
+    return `upload:${element.dataset.uploadId || ''}`;
   }
 
-  function insertDateSeparator(dateStr) {
-    const existing = container.querySelector(`.timeline-date-separator[data-date="${dateStr}"]`);
-    if (existing) return;
-    const sep = createDateSeparator(dateStr);
-    sep.dataset.date = dateStr;
-    const separators = Array.from(container.querySelectorAll('.timeline-date-separator'));
-    let inserted = false;
-    for (const existingSep of separators) {
-      if (dateStr < (existingSep.dataset.date || '')) {
-        container.insertBefore(sep, existingSep);
-        inserted = true;
-        break;
+  function compareProjectedElements(left, right) {
+    const leftTimestamp = Date.parse(left.dataset.createdAt || '') || 0;
+    const rightTimestamp = Date.parse(right.dataset.createdAt || '') || 0;
+    if (leftTimestamp !== rightTimestamp) return leftTimestamp - rightTimestamp;
+    const leftId = stableElementId(left);
+    const rightId = stableElementId(right);
+    if (leftId < rightId) return -1;
+    if (leftId > rightId) return 1;
+    return 0;
+  }
+
+  function rebuildProjection() {
+    if (destroyed || !container) return;
+    // This static lookup also ensures a failed DOM application leaves the event retryable.
+    container.querySelector('.timeline-sentinel');
+    const elements = [
+      ...messageElements.values(),
+      ...uploadElements.values(),
+    ].sort(compareProjectedElements);
+    const notices = Array.from(undoNotices.values());
+
+    container.querySelectorAll('.timeline-date-separator').forEach(separator => separator.remove());
+    elements.forEach(element => element.remove());
+    notices.forEach(notice => notice.remove());
+
+    let previousDate = null;
+    for (const element of elements) {
+      const date = getLocalDate(element.dataset.createdAt || Date.now());
+      if (date !== previousDate) {
+        const separator = createDateSeparator(date);
+        separator.dataset.date = date;
+        container.append(separator);
+        previousDate = date;
       }
+      container.append(element);
     }
-    if (!inserted) {
-      container.append(sep);
-    }
+    notices.forEach(notice => container.append(notice));
   }
 
   function mergeEvent(event) {
+    if (destroyed || !event) return false;
     if (appliedSequences.has(event.sequence)) return false;
     let payload = event.payload;
     if (typeof payload === 'string') {
@@ -409,7 +490,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
         const msg = { ...payload, id: event.entity_id };
         const existed = messages.has(event.entity_id);
         upsertMessage(msg);
-        const existing = container?.querySelector(`[data-message-id="${event.entity_id}"]`);
+        const existing = messageElements.get(event.entity_id);
         if (existing) existing.dataset.sequence = String(event.sequence);
         if (!existed && !atBottom) {
           newCount++;
@@ -418,49 +499,25 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
         break;
       }
       case 'message.deleted': {
-        messages.delete(event.entity_id);
-        if (container) {
-          const el = container.querySelector(`[data-message-id="${event.entity_id}"]`);
-          if (el) {
-            const dateStr = el.dataset.createdAt
-              ? getLocalDate(el.dataset.createdAt)
-              : null;
-            el.remove();
-            if (dateStr) {
-              const remaining = container.querySelector(
-                `.timeline-message[data-created-at^="${dateStr}"]`
-              );
-              if (!remaining) {
-                const sep = container.querySelector(
-                  `.timeline-date-separator[data-date="${dateStr}"]`
-                );
-                if (sep) sep.remove();
-              }
-            }
-          }
-        }
+        removeMessage(event.entity_id);
         break;
       }
       case 'message.restored': {
         const msg = { ...payload, id: event.entity_id };
-        messages.set(event.entity_id, msg);
-        if (container) {
-          const undoNotice = container.querySelector(`.timeline-undo[data-undo-message-id="${event.entity_id}"]`);
-          if (undoNotice) undoNotice.remove();
-
-          const existing = container.querySelector(`[data-message-id="${event.entity_id}"]`);
-          if (existing) {
-            const replacement = renderMessage(msg);
-            replacement.dataset.sequence = existing.dataset.sequence;
-            existing.replaceWith(replacement);
-          } else {
-            const el = renderMessage(msg);
-            el.dataset.sequence = String(event.sequence);
-            const dateStr = getLocalDate(msg.created_at || Date.now());
-            insertDateSeparator(dateStr);
-            insertMessageSorted(el);
-          }
+        const undoNotice = undoNotices.get(event.entity_id);
+        if (undoNotice) {
+          undoNotices.delete(event.entity_id);
+          undoNotice.remove();
         }
+        const undoTimer = undoTimers.get(event.entity_id);
+        if (undoTimer) {
+          clearTimeout(undoTimer);
+          timers.delete(undoTimer);
+          undoTimers.delete(event.entity_id);
+        }
+        upsertMessage(msg);
+        const restoredElement = messageElements.get(event.entity_id);
+        if (restoredElement) restoredElement.dataset.sequence = String(event.sequence);
         break;
       }
       case 'file.finalized': {
@@ -468,14 +525,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
         for (const [msgId, msg] of messages) {
           if (msg.file && msg.file.id === fileId) {
             msg.file = { ...msg.file, ...payload, id: fileId };
-            if (container) {
-              const el = container.querySelector(`[data-message-id="${msgId}"]`);
-              if (el) {
-                const replacement = renderMessage(msg);
-                replacement.dataset.sequence = el.dataset.sequence;
-                el.replaceWith(replacement);
-              }
-            }
+            upsertMessage({ ...msg, id: msgId });
           }
         }
         break;
@@ -487,8 +537,8 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
   }
 
   function focusMessage(messageId) {
-    if (!container) return false;
-    const el = container.querySelector(`[data-message-id="${messageId}"]`);
+    if (destroyed || !container) return false;
+    const el = messageElements.get(messageId);
     if (el) {
       let scrollBehavior = 'smooth';
       try {
@@ -506,16 +556,29 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
       el.classList.add('timeline-message-highlight');
       el.setAttribute('tabindex', '-1');
       el.focus({ preventScroll: true });
-      setTimeout(() => el.classList.remove('timeline-message-highlight'), HIGHLIGHT_DURATION_MS);
+      const timer = setTimeout(() => {
+        timers.delete(timer);
+        el.classList.remove('timeline-message-highlight');
+      }, HIGHLIGHT_DURATION_MS);
+      timers.add(timer);
       return true;
     }
     return false;
   }
 
   async function loadInitial() {
-    if (!container) return;
+    if (destroyed || !container) return;
     container.innerHTML = '';
     messages.clear();
+    uploads.clear();
+    messageByUploadId.clear();
+    messageByClientRequestId.clear();
+    messageElements.clear();
+    uploadElements.clear();
+    undoNotices.clear();
+    undoTimers.clear();
+    timers.forEach(timer => clearTimeout(timer));
+    timers.clear();
     appliedSequences.clear();
     lastSequence = 0;
     nextBefore = null;
@@ -530,12 +593,14 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     if (observer) observer.observe(sentinel);
 
     await loadOlder();
+    if (destroyed) return;
     scrollToBottom(false);
 
     if (onRestore) await onRestore();
   }
 
   function loadOlder() {
+    if (destroyed) return Promise.resolve(false);
     if (loadingPromise) return loadingPromise;
     if (exhausted) return Promise.resolve(false);
     loading = true;
@@ -545,7 +610,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
           ? `/api/messages?limit=50&before=${encodeURIComponent(nextBefore)}`
           : '/api/messages?limit=50';
         const data = await api(url);
-        if (!data) return false;
+        if (destroyed || !data) return false;
         const items = data.items || [];
         if (items.length === 0) {
           nextBefore = null;
@@ -555,38 +620,20 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
         nextBefore = data.next_before || null;
         exhausted = !nextBefore;
         const prevScrollHeight = container ? container.scrollHeight : 0;
-        const pageNodes = [];
-        const pageDates = new Set();
-
         for (const msg of items) {
-          if (messages.has(msg.id)) continue;
-          messages.set(msg.id, msg);
-          if (container) {
-            const el = renderMessage(msg);
-            const dateStr = getLocalDate(msg.created_at || Date.now());
-            if (
-              !pageDates.has(dateStr)
-              && !container.querySelector(`.timeline-date-separator[data-date="${dateStr}"]`)
-            ) {
-              const separator = createDateSeparator(dateStr);
-              separator.dataset.date = dateStr;
-              pageNodes.push(separator);
-              pageDates.add(dateStr);
-            }
-            pageNodes.push(el);
-          }
+          upsertMessage(msg, { rebuild: false });
         }
 
         if (container) {
-          for (const node of pageNodes.reverse()) {
-            container.insertBefore(node, container.children[1] || null);
-          }
+          rebuildProjection();
           const newScrollHeight = container.scrollHeight;
           container.scrollTop += newScrollHeight - prevScrollHeight;
         }
         return true;
       } catch {
-        window.dispatchEvent(new CustomEvent('timeline-error', { detail: { message: '加载历史消息失败，请稍后重试。' } }));
+        if (!destroyed) {
+          window.dispatchEvent(new CustomEvent('timeline-error', { detail: { message: '加载历史消息失败，请稍后重试。' } }));
+        }
         return false;
       } finally {
         loading = false;
@@ -597,9 +644,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
   }
 
   function hasMessageElement(messageId) {
-    return Boolean(
-      container && container.querySelector(`[data-message-id="${messageId}"]`)
-    );
+    return !destroyed && messageElements.has(messageId);
   }
 
   async function ensureMessageLoaded(messageId) {
@@ -628,6 +673,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
       (entries) => {
         for (const entry of entries) {
           if (entry.isIntersecting) {
+            if (destroyed) return;
             loadOlder();
           }
         }
@@ -645,37 +691,49 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     lastSequence = sequence;
   }
 
-  function upsertMessage(message) {
-    if (!message || !message.id) return;
+  function upsertMessage(message, { rebuild = true } = {}) {
+    if (destroyed || !message || !message.id) return false;
     const existingMessage = messages.get(message.id);
     const merged = {
       ...existingMessage,
       ...message,
       file: message.file || (existingMessage && existingMessage.file) || null,
     };
+    unindexMessage(existingMessage);
     messages.set(message.id, merged);
-    if (!container) return;
+    indexMessage(merged);
+    if (!container) return true;
 
-    const existingElement = container.querySelector(`[data-message-id="${message.id}"]`);
+    const existingElement = messageElements.get(message.id);
     const element = renderMessage(merged);
-    if (existingElement) {
+    if (existingElement?.dataset.sequence) {
       element.dataset.sequence = existingElement.dataset.sequence;
-      existingElement.replaceWith(element);
-      return;
+    }
+    if (existingElement) {
+      existingElement.remove();
     }
 
     const matchingUpload = findUploadForMessage(merged);
     if (matchingUpload) {
-      const uploadElement = container.querySelector(`[data-upload-id="${matchingUpload.uploadId}"]`);
-      uploads.delete(matchingUpload.uploadId);
-      if (uploadElement) {
-        uploadElement.replaceWith(element);
-        return;
-      }
+      removeUpload(matchingUpload.uploadId, { rebuild: false });
     }
 
-    insertDateSeparator(getLocalDate(merged.created_at || Date.now()));
-    insertMessageSorted(element);
+    messageElements.set(message.id, element);
+    container.append(element);
+    if (rebuild) rebuildProjection();
+    return true;
+  }
+
+  function destroy() {
+    if (destroyed) return;
+    destroyed = true;
+    container?.removeEventListener('scroll', handleScroll);
+    newMessageButton?.removeEventListener('click', handleNewMessageClick);
+    observer?.disconnect();
+    observer = null;
+    timers.forEach(timer => clearTimeout(timer));
+    timers.clear();
+    loadingPromise = null;
   }
 
   return {
@@ -691,5 +749,6 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     upsertUpload,
     removeUpload,
     getUpload,
+    destroy,
   };
 }

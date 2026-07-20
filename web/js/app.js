@@ -10,6 +10,18 @@ import { TOAST_DURATION_MS } from './config.js';
 
 const DEVICE_ID_KEY = 'device-id';
 const DEVICE_NAME_KEY = 'device-name';
+const APP_INSTANCE_KEY = '__personalTransferAppInstance';
+
+window[APP_INSTANCE_KEY]?.destroy?.();
+
+const appListenerCleanups = [];
+let appDestroyed = false;
+
+function listen(target, type, listener, options) {
+  if (!target?.addEventListener) return;
+  target.addEventListener(type, listener, options);
+  appListenerCleanups.push(() => target.removeEventListener(type, listener, options));
+}
 
 export function captureTimelinePosition(container) {
   if (!container) return null;
@@ -189,6 +201,7 @@ function unlockOutsideDialog() {
 }
 
 function showLockOverlay() {
+  if (appDestroyed) return;
   closeEventConnection();
   isUnlocked = false;
   if (!sessionExpiredOverlay) return;
@@ -209,6 +222,7 @@ function showLockOverlay() {
 }
 
 function hideLockOverlay() {
+  if (appDestroyed) return;
   if (!sessionExpiredOverlay) return;
   sessionExpiredOverlay.classList.add('is-hidden');
   unlockOutsideDialog();
@@ -217,7 +231,7 @@ function hideLockOverlay() {
 }
 
 if (sessionExpiredOverlay) {
-  sessionExpiredOverlay.addEventListener('keydown', event => {
+  listen(sessionExpiredOverlay, 'keydown', event => {
     if (event.key !== 'Tab') return;
     const focusable = [accessTokenInput, deviceNameInput, unlockSubmit]
       .filter(element => element && !element.disabled && !element.hidden);
@@ -235,31 +249,36 @@ if (sessionExpiredOverlay) {
 }
 
 if (skipLink && mainContent) {
-  skipLink.addEventListener('click', event => {
+  listen(skipLink, 'click', event => {
     event.preventDefault();
     mainContent.focus();
   });
 }
 
 async function checkSession() {
+  if (appDestroyed) return;
   try {
     await getSession();
+    if (appDestroyed) return;
     isUnlocked = true;
     const storedName = getDeviceName();
     if (routeSource && storedName) routeSource.textContent = storedName;
     if (connectionDevice) connectionDevice.textContent = storedName || '-';
     await refreshAll();
+    if (appDestroyed) return;
     await timeline.loadInitial();
+    if (appDestroyed) return;
     await restoreUploads();
+    if (appDestroyed) return;
     hideLockOverlay();
     startEventConnection();
   } catch {
-    showLockOverlay();
+    if (!appDestroyed) showLockOverlay();
   }
 }
 
 if (unlockForm) {
-  unlockForm.addEventListener('submit', async (event) => {
+  listen(unlockForm, 'submit', async (event) => {
     event.preventDefault();
     const token = (accessTokenInput ? accessTokenInput.value : '').trim();
     const name = (deviceNameInput ? deviceNameInput.value : '').trim();
@@ -280,13 +299,18 @@ if (unlockForm) {
     const deviceId = getOrCreateDeviceId();
     try {
       await apiUnlock(token, deviceId, name);
+      if (appDestroyed) return;
       setDeviceName(name);
       await refreshAll();
+      if (appDestroyed) return;
       await timeline.loadInitial();
+      if (appDestroyed) return;
       await restoreUploads();
+      if (appDestroyed) return;
       hideLockOverlay();
       startEventConnection();
     } catch (err) {
+      if (appDestroyed) return;
       const message = err instanceof ApiError ? (err.body && err.body.detail || '验证失败') : '网络错误';
       if (unlockError) {
         unlockError.textContent = message;
@@ -296,11 +320,11 @@ if (unlockForm) {
   });
 }
 
-window.addEventListener('session-expired', closeEventConnection);
-window.addEventListener('session-expired', showLockOverlay);
-window.addEventListener('session-logout', async () => {
+listen(window, 'session-expired', closeEventConnection);
+listen(window, 'session-expired', showLockOverlay);
+listen(window, 'session-logout', async () => {
   closeEventConnection();
-  try { await apiLogout(); } finally { showLockOverlay(); }
+  try { await apiLogout(); } finally { if (!appDestroyed) showLockOverlay(); }
 });
 
 const timelineContainer = document.getElementById('timelineContainer');
@@ -313,6 +337,7 @@ const uploadCoordinator = createUploadCoordinator({
 let uploadCoordinatorStarted = false;
 
 async function restoreUploads() {
+  if (appDestroyed) return;
   try {
     if (!uploadCoordinatorStarted) {
       await uploadCoordinator.start();
@@ -320,9 +345,10 @@ async function restoreUploads() {
     } else {
       await uploadCoordinator.reconcile();
     }
+    if (appDestroyed) return;
     uploadCoordinator.getSnapshot().forEach(task => timeline.upsertUpload?.(task));
   } catch (error) {
-    showToast(error.message || '上传任务恢复失败', 'error');
+    if (!appDestroyed) showToast(error.message || '上传任务恢复失败', 'error');
   }
 }
 
@@ -331,11 +357,12 @@ const timeline = createTimeline({
   newMessageButton: newMessageButton,
   api: (url, options) => apiRequest(url, options),
   async onRestore() {
+    if (appDestroyed) return;
     const snapshot = savedTimelinePosition;
     try {
       await restoreTimelinePosition(timelineContainer, snapshot, timeline);
     } finally {
-      if (savedTimelinePosition === snapshot) savedTimelinePosition = null;
+      if (!appDestroyed && savedTimelinePosition === snapshot) savedTimelinePosition = null;
     }
   },
   onUploadAction({ action, uploadId }) {
@@ -372,7 +399,7 @@ const transferDropOverlay = document.getElementById('transferDropOverlay');
 const uploadLiveRegion = document.getElementById('uploadLiveRegion');
 const announcedUploadStates = new Map();
 
-uploadCoordinator.subscribe(tasks => {
+const unsubscribeUploadCoordinator = uploadCoordinator.subscribe(tasks => {
   tasks.forEach(task => {
     timeline.upsertUpload?.(task);
     const previousStatus = announcedUploadStates.get(task.uploadId);
@@ -390,9 +417,9 @@ uploadCoordinator.subscribe(tasks => {
     uploadSummaryText.textContent = `${activeTasks.length} 个活动任务 · ${uploading} 个上传中 · ${paused} 个已暂停`;
   }
 });
-pauseAllUploads?.addEventListener('click', () => uploadCoordinator.pauseAll());
-resumeAllUploads?.addEventListener('click', () => uploadCoordinator.resumeAll());
-cancelAllUploads?.addEventListener('click', () => uploadCoordinator.cancelAll());
+listen(pauseAllUploads, 'click', () => uploadCoordinator.pauseAll());
+listen(resumeAllUploads, 'click', () => uploadCoordinator.resumeAll());
+listen(cancelAllUploads, 'click', () => uploadCoordinator.cancelAll());
 
 const library = createLibrary({
   root: document.getElementById('libraryView'),
@@ -409,21 +436,21 @@ const library = createLibrary({
 });
 
 if (composerAttachBtn && composerFileInput) {
-  composerAttachBtn.addEventListener('click', () => composerFileInput.click());
+  listen(composerAttachBtn, 'click', () => composerFileInput.click());
 }
 
 if (transferPage && transferDropOverlay) {
   let dragDepth = 0;
-  transferPage.addEventListener('dragenter', event => {
+  listen(transferPage, 'dragenter', event => {
     event.preventDefault();
     dragDepth += 1;
     transferDropOverlay.classList.add('is-visible');
     transferDropOverlay.setAttribute('aria-hidden', 'false');
   });
-  transferPage.addEventListener('dragover', event => {
+  listen(transferPage, 'dragover', event => {
     event.preventDefault();
   });
-  transferPage.addEventListener('dragleave', event => {
+  listen(transferPage, 'dragleave', event => {
     event.preventDefault();
     dragDepth = Math.max(0, dragDepth - 1);
     if (dragDepth === 0) {
@@ -431,7 +458,7 @@ if (transferPage && transferDropOverlay) {
       transferDropOverlay.setAttribute('aria-hidden', 'true');
     }
   });
-  transferPage.addEventListener('drop', event => {
+  listen(transferPage, 'drop', event => {
       event.preventDefault();
       dragDepth = 0;
       transferDropOverlay.classList.remove('is-visible');
@@ -453,24 +480,26 @@ let healthState = null;
 const refreshHealthBtn = document.getElementById('refreshHealthBtn');
 const refreshOpsBtn = document.getElementById('refreshOpsBtn');
 
-if (refreshHealthBtn) refreshHealthBtn.addEventListener('click', loadHealth);
-if (refreshOpsBtn) refreshOpsBtn.addEventListener('click', loadOperations);
+listen(refreshHealthBtn, 'click', loadHealth);
+listen(refreshOpsBtn, 'click', loadOperations);
 
 const railRefresh = document.getElementById('railRefresh');
 const retryConnection = document.getElementById('retryConnection');
-if (railRefresh) railRefresh.addEventListener('click', () => { loadHealth(); startEventConnection(); });
-if (retryConnection) retryConnection.addEventListener('click', () => { startEventConnection(); });
+listen(railRefresh, 'click', () => { loadHealth(); startEventConnection(); });
+listen(retryConnection, 'click', () => { startEventConnection(); });
 
 async function loadHealth() {
   try {
-    healthState = await apiRequest('/api/health');
+    const nextHealthState = await apiRequest('/api/health');
+    if (appDestroyed) return;
+    healthState = nextHealthState;
     if (metricCount) metricCount.textContent = healthState.file_count ?? 0;
     if (metricSize) metricSize.textContent = healthState.total_size ?? '0 B';
     if (metricLimit) metricLimit.textContent = healthState.max_upload_size ?? '-';
     if (metricMode) metricMode.textContent = healthState.protected ? '受控' : '公开';
     if (modeState) modeState.textContent = healthState.protected ? '令牌访问' : '公开访问';
   } catch (error) {
-    showToast('健康信息读取失败', 'error');
+    if (!appDestroyed) showToast('健康信息读取失败', 'error');
   }
 }
 
@@ -487,9 +516,10 @@ async function loadOperations() {
       apiRequest('/api/admin/summary'),
       apiRequest('/api/audit')
     ]);
+    if (appDestroyed) return;
     renderOperations(summary, audit.events || []);
   } catch (error) {
-    renderOpsError('运营视图读取失败，请检查服务状态。');
+    if (!appDestroyed) renderOpsError('运营视图读取失败，请检查服务状态。');
   }
 }
 
@@ -613,7 +643,7 @@ function closeEventConnection() {
 }
 
 function updateConnectionStatus(status) {
-  if (!connectionStatusEl) return;
+  if (appDestroyed || !connectionStatusEl) return;
   const labels = {
     connecting: '连接中…',
     connected: '已连接',
@@ -648,7 +678,7 @@ function updateConnectionStatus(status) {
 }
 
 function applyIncomingEvent(event) {
-  if (!event) return false;
+  if (appDestroyed || !event) return false;
   if (event.event_type?.startsWith('upload.')) {
     uploadCoordinator.applyRemoteEvent(event.payload || event);
   }
@@ -660,6 +690,7 @@ function applyIncomingEvent(event) {
 }
 
 function startEventConnection() {
+  if (appDestroyed) return;
   closeEventConnection();
   eventConnection = connectEvents({
     after: () => getLastSequence(),
@@ -668,7 +699,7 @@ function startEventConnection() {
   });
 }
 
-window.addEventListener('timeline-error', (event) => {
+listen(window, 'timeline-error', (event) => {
   showToast(event.detail?.message || '操作失败', 'error');
 });
 
@@ -701,7 +732,7 @@ function applyTheme(theme) {
 try { applyTheme(getThemePreference()); } catch { /* noop */ }
 
 if (themeToggle) {
-  themeToggle.addEventListener('click', () => {
+  listen(themeToggle, 'click', () => {
     try {
       const current = document.documentElement.classList.contains('dark') ? 'dark' : 'light';
       const next = current === 'dark' ? 'light' : 'dark';
@@ -711,13 +742,14 @@ if (themeToggle) {
   });
 }
 
-document.getElementById('manageThemeToggle')?.addEventListener('click', () => themeToggle?.click());
-document.getElementById('logoutButton')?.addEventListener('click', () => {
+listen(document.getElementById('manageThemeToggle'), 'click', () => themeToggle?.click());
+listen(document.getElementById('logoutButton'), 'click', () => {
   window.dispatchEvent(new CustomEvent('session-logout'));
 });
 
 try {
-  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', event => {
+  const colorScheme = window.matchMedia('(prefers-color-scheme: dark)');
+  listen(colorScheme, 'change', event => {
     if (!localStorage.getItem(THEME_KEY)) {
       applyTheme(event.matches ? 'dark' : 'light');
     }
@@ -751,19 +783,19 @@ function updateClearFiltersVisibility() {
 }
 
 if (filterToggleBtn && filterGrid) {
-  filterToggleBtn.addEventListener('click', () => {
+  listen(filterToggleBtn, 'click', () => {
     const collapsed = filterGrid.classList.toggle('collapsed');
     filterToggleBtn.setAttribute('aria-expanded', String(!collapsed));
   });
 
   filterGrid.querySelectorAll('select, input').forEach(el => {
-    el.addEventListener('change', updateClearFiltersVisibility);
-    el.addEventListener('input', updateClearFiltersVisibility);
+    listen(el, 'change', updateClearFiltersVisibility);
+    listen(el, 'input', updateClearFiltersVisibility);
   });
 }
 
 if (clearFiltersBtn) {
-  clearFiltersBtn.addEventListener('click', () => {
+  listen(clearFiltersBtn, 'click', () => {
     if (filterGrid) {
       filterGrid.querySelectorAll('select').forEach(s => s.value = 'all');
       filterGrid.querySelectorAll('input[type="date"], input[type="text"]').forEach(i => i.value = '');
@@ -793,10 +825,10 @@ function updateBatchToolbar(count) {
   }
 }
 
-if (batchToolbarDownload) batchToolbarDownload.addEventListener('click', () => document.getElementById('batchDownload')?.click());
-if (batchToolbarCopy) batchToolbarCopy.addEventListener('click', () => document.getElementById('batchCopy')?.click());
-if (batchToolbarDelete) batchToolbarDelete.addEventListener('click', () => document.getElementById('batchDelete')?.click());
-if (batchToolbarClear) batchToolbarClear.addEventListener('click', () => document.getElementById('clearSelectionBtn')?.click());
+listen(batchToolbarDownload, 'click', () => document.getElementById('batchDownload')?.click());
+listen(batchToolbarCopy, 'click', () => document.getElementById('batchCopy')?.click());
+listen(batchToolbarDelete, 'click', () => document.getElementById('batchDelete')?.click());
+listen(batchToolbarClear, 'click', () => document.getElementById('clearSelectionBtn')?.click());
 
 // Expose updateBatchToolbar for library module
 window.__updateBatchToolbar = updateBatchToolbar;
@@ -810,8 +842,9 @@ function updateTimelineEmpty() {
   timelineEmpty.hidden = !!hasMessages;
 }
 
+let timelineObserver = null;
 try {
-  const timelineObserver = new MutationObserver(updateTimelineEmpty);
+  timelineObserver = new MutationObserver(updateTimelineEmpty);
   if (timelineContainer) {
     timelineObserver.observe(timelineContainer, { childList: true, subtree: true });
     updateTimelineEmpty();
@@ -819,5 +852,33 @@ try {
 } catch {
   // MutationObserver not available
 }
+
+export function destroyApp() {
+  if (appDestroyed) return;
+  appDestroyed = true;
+  closeEventConnection();
+  appListenerCleanups.splice(0).forEach(cleanup => cleanup());
+  unsubscribeUploadCoordinator();
+  composer.destroy?.();
+  timeline.destroy?.();
+  library.destroy?.();
+  navigation.destroy?.();
+  uploadCoordinator.destroy?.();
+  timelineObserver?.disconnect();
+  timelineObserver = null;
+  window.clearTimeout(showToast.timer);
+  announcedUploadStates.clear();
+  if (window.__updateBatchToolbar === updateBatchToolbar) {
+    window.__updateBatchToolbar = null;
+  }
+  if (window[APP_INSTANCE_KEY] === appInstance) {
+    window[APP_INSTANCE_KEY] = null;
+  }
+}
+
+const appInstance = { destroy: destroyApp };
+window[APP_INSTANCE_KEY] = appInstance;
+listen(window, 'beforeunload', destroyApp);
+listen(window, 'pagehide', destroyApp);
 
 checkSession();
