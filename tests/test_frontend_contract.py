@@ -2655,7 +2655,7 @@ def test_upload_live_region_combines_state_and_milestone_in_one_dom_announcement
     assert context.eval("region.children.length") == 1
 
 
-def test_upload_notify_announces_at_most_one_task_per_reconcile() -> None:
+def test_upload_notify_combines_all_changed_tasks_once_per_reconcile() -> None:
     context = create_js_context()
     context.eval(r"""
       globalThis.announcements = [];
@@ -2663,26 +2663,52 @@ def test_upload_notify_announces_at_most_one_task_per_reconcile() -> None:
       globalThis.remote = [
         { upload_id: 'one', original_name: 'one.bin', size_bytes: 100, status: 'uploading', confirmed_bytes: 25, confirmed_parts: [] },
         { upload_id: 'two', original_name: 'two.bin', size_bytes: 100, status: 'uploading', confirmed_bytes: 50, confirmed_parts: [] },
+        { upload_id: 'three', original_name: 'three.bin', size_bytes: 100, status: 'uploading', confirmed_bytes: 75, confirmed_parts: [] },
       ];
       globalThis.records = remote.map(item => ({
         uploadId: item.upload_id, name: item.original_name, sizeBytes: item.size_bytes,
         status: 'queued', confirmedBytes: 0, confirmedParts: [], isSourceDevice: false,
+        announcedStatus: 'queued',
       }));
       globalThis.api = { listActiveUploads: () => Promise.resolve(remote) };
       globalThis.persistence = {
         getAll: () => Promise.resolve(records), put: () => Promise.resolve(),
         remove: () => Promise.resolve(), close: () => {},
       };
+      globalThis.__modules['./api.js'] = {
+        request: () => Promise.resolve({}), unlock: () => Promise.resolve({}), logout: () => Promise.resolve({}),
+        getSession: () => Promise.reject(new Error('locked')), ApiError: class ApiError extends Error {},
+        connectEvents: () => ({ close() {} }), getLastSequence: () => 0,
+      };
+      globalThis.__modules['./timeline.js'] = { createTimeline: () => ({
+        loadInitial: () => Promise.resolve(), upsertUpload() {}, mergeEvent: () => true, focusMessage() {}, destroy() {},
+      }) };
+      globalThis.__modules['./composer.js'] = { createComposer: () => ({ destroy() {} }) };
+      globalThis.__modules['./upload-persistence.js'] = { createUploadPersistence: () => persistence };
+      globalThis.__modules['./library.js'] = { createLibrary: () => ({ load: () => Promise.resolve(), clearSelection() {}, applyEvent: () => true, destroy() {} }) };
+      globalThis.__modules['./navigation.js'] = { createNavigation: () => ({ start() {}, navigate: () => Promise.resolve(), destroy() {} }) };
     """)
     load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    load_js_module(context, "./app.js", read_web("js/app.js"))
+    drain_jobs(context)
     context.eval(r"""
+      globalThis.region = document.getElementById('multiUploadLiveRegion');
+      globalThis.announceToRegion = __modules['./app.js'].createLiveRegionAnnouncer(region);
       globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
-        api, persistence, cryptoObject, onAnnounce: message => announcements.push(message),
+        api, persistence, cryptoObject,
+        onAnnounce: message => { announcements.push(message); announceToRegion(message); },
       });
       coordinator.reconcile();
     """)
     drain_jobs(context)
     assert context.eval("announcements.length") == 1
+    combined_text = context.eval("region.children[0].textContent")
+    assert all(name in combined_text for name in ("one.bin", "two.bin", "three.bin"))
+    assert all(progress in combined_text for progress in ("25%", "50%", "75%"))
+    assert combined_text.count("上传中") == 3
+    context.eval("coordinator.applyRemoteEvent({ event_type: 'upload.progress', sequence: 2, payload: remote[0] });")
+    assert context.eval("announcements.length") == 1
+    assert context.eval("region.children.length") == 1
 
 
 def test_upload_coordinator_limits_active_files_and_one_part_per_file() -> None:
@@ -3414,11 +3440,12 @@ def test_library_contract_has_filters_batches_storage_and_timeline_location() ->
 
 
 def test_reconnect_and_responsive_contracts() -> None:
-    api, config, css, html = read_web("js/api.js"), read_web("js/config.js"), read_web("styles.css"), read_web("index.html")
+    api, app, config, css, html = read_web("js/api.js"), read_web("js/app.js"), read_web("js/config.js"), read_web("styles.css"), read_web("index.html")
     assert "RECONNECT_DELAYS" in api and "from './config.js'" in api
     assert "RECONNECT_DELAYS = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000]" in config
     assert "transfer-last-sequence" in api and "event.sequence" in api
     assert "reconnecting" in api and "after=" in api
+    assert "event.event_type === 'ready'" in app and "return true" in app
     assert "@media (max-width: 360px)" in css
     assert "@media (prefers-reduced-motion: reduce)" in css
     assert ":focus-visible" in css and "min-height: 44px" in css
@@ -4237,53 +4264,73 @@ def test_timeline_retries_event_after_first_dom_application_failure() -> None:
     }
 
 
-def test_connect_events_uses_per_tab_cursor_and_advances_only_after_successful_application() -> None:
+@pytest.mark.parametrize("failure_mode", ["false", "throw"])
+def test_connect_events_replays_failed_generation_from_last_successful_cursor(
+    failure_mode: str,
+) -> None:
     context = create_js_context()
+    set_json(context, "failureMode", failure_mode)
     context.eval(r"""
       globalThis.webSockets = [];
       globalThis.reconnectCallback = null;
       window.setTimeout = callback => { reconnectCallback = callback; return 1; };
       globalThis.WebSocket = class WebSocket {
-        constructor(url) { this.url = url; webSockets.push(this); }
-        close() {}
+        constructor(url) { this.url = url; this.closed = false; webSockets.push(this); }
+        close() { this.closed = true; }
       };
       localStorage.setItem('transfer-last-sequence', '999');
       sessionStorage.setItem('transfer-last-sequence', '3');
     """)
     load_js_module(context, "./api.js", read_web("js/api.js"))
     context.eval(r"""
-      globalThis.applyAttempts = 0;
+      globalThis.appliedSequences = [];
+      globalThis.failedOnce = false;
       globalThis.connection = __modules['./api.js'].connectEvents({
         after: () => __modules['./api.js'].getLastSequence(),
-        onEvent: () => (++applyAttempts > 1),
+        onEvent: event => {
+          appliedSequences.push(event.sequence);
+          if (event.sequence === 5 && !failedOnce) {
+            failedOnce = true;
+            if (failureMode === 'throw') throw new Error('projection failed');
+            return false;
+          }
+          return true;
+        },
         onStatus: () => {},
       });
-      const message = { data: JSON.stringify({ sequence: 9, event_type: 'message.created' }) };
-      webSockets[0].onmessage(message);
+      webSockets[0].onmessage({ data: JSON.stringify({ sequence: 4, event_type: 'message.created' }) });
+      webSockets[0].onmessage({ data: JSON.stringify({ sequence: 5, event_type: 'message.created' }) });
       globalThis.sequenceAfterFailure = sessionStorage.getItem('transfer-last-sequence');
-      webSockets[0].onmessage(message);
-      globalThis.sequenceAfterSuccess = sessionStorage.getItem('transfer-last-sequence');
+      webSockets[0].onmessage({ data: JSON.stringify({ sequence: 6, event_type: 'message.created' }) });
+      globalThis.firstSocketClosed = webSockets[0].closed;
+      globalThis.attemptsBeforeReplay = appliedSequences.slice();
       webSockets[0].onclose({ code: 1006 });
       reconnectCallback();
+      webSockets[1].onmessage({ data: JSON.stringify({ sequence: 5, event_type: 'message.created' }) });
+      globalThis.sequenceAfterReplay = sessionStorage.getItem('transfer-last-sequence');
     """)
     result = json.loads(context.eval(r"""
       JSON.stringify({
         initialUrl: webSockets[0].url,
         reconnectUrl: webSockets[1].url,
         sequenceAfterFailure,
-        sequenceAfterSuccess,
+        sequenceAfterReplay,
         legacySequence: localStorage.getItem('transfer-last-sequence'),
-        applyAttempts,
+        firstSocketClosed,
+        attemptsBeforeReplay,
+        appliedSequences,
       });
     """))
 
     assert result == {
         "initialUrl": "ws://testserver/api/events?after=3",
-        "reconnectUrl": "ws://testserver/api/events?after=9",
-        "sequenceAfterFailure": "3",
-        "sequenceAfterSuccess": "9",
+        "reconnectUrl": "ws://testserver/api/events?after=4",
+        "sequenceAfterFailure": "4",
+        "sequenceAfterReplay": "5",
         "legacySequence": "999",
-        "applyAttempts": 2,
+        "firstSocketClosed": True,
+        "attemptsBeforeReplay": [4, 5],
+        "appliedSequences": [4, 5, 5],
     }
 
 
@@ -4337,13 +4384,10 @@ def test_connect_events_cancels_stale_timer_and_preserves_reconnect() -> None:
       });
       webSockets[normalSocketIndex].onclose({ code: 1006 });
       webSockets[normalSocketIndex].onclose({ code: 1006 });
-      globalThis.activeTimersAfterReschedule = activeTimerIds.slice();
-      globalThis.statusesBeforeCanceledTimer = reconnectStatuses.slice();
+      globalThis.activeTimersAfterDuplicateClose = activeTimerIds.slice();
       runTimer(2);
-      globalThis.webSocketCountAfterCanceledTimer = webSockets.length;
-      globalThis.statusesAfterCanceledTimer = reconnectStatuses.slice();
-      globalThis.activeTimersAfterCanceledTimer = activeTimerIds.slice();
-      runTimer(activeTimerIds[0]);
+      webSockets[normalSocketIndex].onclose({ code: 1006 });
+      globalThis.activeTimersAfterStaleClose = activeTimerIds.slice();
       webSockets[webSockets.length - 1].onopen();
       globalThis.finalReconnectWebSocketCount = webSockets.length;
 
@@ -4365,11 +4409,8 @@ def test_connect_events_cancels_stale_timer_and_preserves_reconnect() -> None:
               clearedTimerIds,
               webSocketCountAfterStaleTimer,
               statusesAfterStaleTimer,
-              activeTimersAfterReschedule,
-              statusesBeforeCanceledTimer,
-              webSocketCountAfterCanceledTimer,
-              statusesAfterCanceledTimer,
-              activeTimersAfterCanceledTimer,
+              activeTimersAfterDuplicateClose,
+              activeTimersAfterStaleClose,
               reconnectStatuses,
               finalReconnectWebSocketCount,
               unauthorizedStatuses,
@@ -4381,25 +4422,13 @@ def test_connect_events_cancels_stale_timer_and_preserves_reconnect() -> None:
     assert result == {
         "stoppedStatuses": ["connecting", "reconnecting"],
         "staleTimerId": 1,
-        "clearedTimerIds": [1, 2],
+        "clearedTimerIds": [1],
         "webSocketCountAfterStaleTimer": 1,
         "statusesAfterStaleTimer": ["connecting", "reconnecting"],
-        "activeTimersAfterReschedule": [3],
-        "statusesBeforeCanceledTimer": [
-            "connecting",
-            "reconnecting",
-            "reconnecting",
-        ],
-        "webSocketCountAfterCanceledTimer": 2,
-        "statusesAfterCanceledTimer": [
-            "connecting",
-            "reconnecting",
-            "reconnecting",
-        ],
-        "activeTimersAfterCanceledTimer": [3],
+        "activeTimersAfterDuplicateClose": [2],
+        "activeTimersAfterStaleClose": [],
         "reconnectStatuses": [
             "connecting",
-            "reconnecting",
             "reconnecting",
             "reconnecting",
             "connected",

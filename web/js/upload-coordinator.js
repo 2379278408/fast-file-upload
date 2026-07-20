@@ -171,7 +171,6 @@ export function createUploadCoordinator({
   const pendingWorkers = new Set();
 
   const announceTask = task => {
-    if (typeof onAnnounce !== 'function') return false;
     let stateAnnouncement = null;
     if (task.announcedStatus === undefined) {
       task.announcedStatus = task.status;
@@ -190,11 +189,8 @@ export function createUploadCoordinator({
       progressAnnouncement = `上传进度 ${milestone}%`;
     }
     const announcement = [stateAnnouncement, progressAnnouncement].filter(Boolean).join('，');
-    if (announcement) {
-      try { onAnnounce(stateAnnouncement ? announcement : `${task.name} ${announcement}`); } catch {}
-      return true;
-    }
-    return false;
+    if (!announcement) return null;
+    return stateAnnouncement ? announcement : `${task.name} ${announcement}`;
   };
 
   const snapshot = () => Object.freeze(tasks.map(publicTask));
@@ -208,7 +204,12 @@ export function createUploadCoordinator({
   };
   const notify = (token = generation) => {
     if (!isCurrent(token)) return;
-    tasks.some(announceTask);
+    if (typeof onAnnounce === 'function') {
+      const announcement = tasks.map(announceTask).filter(Boolean).join('；');
+      if (announcement) {
+        try { onAnnounce(announcement); } catch {}
+      }
+    }
     const value = snapshot();
     for (const listener of listeners) {
       if (!isCurrent(token)) break;

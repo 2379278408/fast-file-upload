@@ -15,6 +15,7 @@ import pytest
 from playwright.sync_api import (
     Browser,
     BrowserContext,
+    CDPSession,
     Locator,
     Page,
     expect,
@@ -57,12 +58,37 @@ class BrowserSession:
     session_401_responses: list[str]
     allowed_console_messages: list[str]
     document_csp_headers: list[str]
+    cdp_sessions: list[CDPSession]
 
 
 class ServerStartError(RuntimeError):
     def __init__(self, message: str, *, address_in_use: bool = False) -> None:
         super().__init__(message)
         self.address_in_use = address_in_use
+
+
+def _cleanup_cdp_network_session(cdp: CDPSession) -> None:
+    try:
+        cdp.send(
+            "Network.emulateNetworkConditions",
+            {
+                "offline": False,
+                "latency": 0,
+                "downloadThroughput": -1,
+                "uploadThroughput": -1,
+                "connectionType": "none",
+            },
+        )
+    except Exception:
+        pass
+    try:
+        cdp.send("Network.disable")
+    except Exception:
+        pass
+    try:
+        cdp.detach()
+    except Exception:
+        pass
 
 
 def _unused_loopback_port() -> int:
@@ -209,6 +235,7 @@ def browser_session(
     session_401_responses: list[str] = []
     allowed_console_messages: list[str] = []
     document_csp_headers: list[str] = []
+    cdp_sessions: list[CDPSession] = []
     page.on(
         "console",
         lambda message: console_messages.append(f"{message.type}: {message.text}"),
@@ -249,9 +276,35 @@ def browser_session(
             session_401_responses=session_401_responses,
             allowed_console_messages=allowed_console_messages,
             document_csp_headers=document_csp_headers,
+            cdp_sessions=cdp_sessions,
         )
     finally:
+        for cdp in reversed(cdp_sessions):
+            _cleanup_cdp_network_session(cdp)
         context.close()
+
+
+def test_cdp_cleanup_attempts_disable_and_detach_when_network_restore_fails() -> None:
+    class FakeCdpSession:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object | None]] = []
+
+        def send(self, method: str, params: object | None = None) -> None:
+            self.calls.append((method, params))
+            if method == "Network.emulateNetworkConditions":
+                raise RuntimeError("target already closing")
+
+        def detach(self) -> None:
+            self.calls.append(("detach", None))
+
+    cdp = FakeCdpSession()
+    _cleanup_cdp_network_session(cdp)  # type: ignore[arg-type]
+
+    assert [method for method, _ in cdp.calls] == [
+        "Network.emulateNetworkConditions",
+        "Network.disable",
+        "detach",
+    ]
 
 
 def _open_locked_application(session: BrowserSession) -> None:
@@ -988,7 +1041,7 @@ def test_old_page_anchor_restoration_has_no_smooth_drift_and_focuses_fallback(
 
     _open_locked_application(browser_session)
     page.evaluate(
-        "localStorage.setItem('transfer-last-sequence', String(Number.MAX_SAFE_INTEGER))"
+        "sessionStorage.setItem('transfer-last-sequence', String(Number.MAX_SAFE_INTEGER))"
     )
     _unlock(page)
 
@@ -1152,7 +1205,7 @@ def test_upload_refresh_reselect_rejects_mismatch_and_sends_missing_parts_only(
     _assert_browser_clean(browser_session)
 
 
-def test_event_cursor_is_per_tab_and_reconnect_replays_that_tabs_gap(
+def test_window_open_copied_cursor_reconciles_then_tabs_advance_independently(
     browser_session: BrowserSession,
 ) -> None:
     page_a = browser_session.page
@@ -1161,13 +1214,65 @@ def test_event_cursor_is_per_tab_and_reconnect_replays_that_tabs_gap(
     _unlock(page_a)
     expect(page_a.locator("#connectionStatus")).to_have_text("已连接", timeout=10_000)
 
-    page_b = context.new_page()
+    active_response = context.request.post(
+        f"{browser_session.base_url}/api/uploads",
+        data={
+            "client_request_id": "window-open-active-upload",
+            "name": "window-open-active.bin",
+            "size_bytes": 4,
+            "mime_type": "application/octet-stream",
+            "last_modified_ms": 1_784_412_345_000,
+            "chunk_size_bytes": 8 * 1024 * 1024,
+            "sample_sha256": "0" * 64,
+        },
+    )
+    assert active_response.ok
+    upload_id = active_response.json()["upload_id"]
+    current_response = context.request.post(
+        f"{browser_session.base_url}/api/messages",
+        data={
+            "body": "state before window open",
+            "client_request_id": "state-before-window-open",
+        },
+    )
+    assert current_response.ok
+    current_message_id = current_response.json()["id"]
+    expect(page_a.locator(f'[data-upload-id="{upload_id}"]')).to_be_visible(timeout=10_000)
+    expect(page_a.locator(f'[data-message-id="{current_message_id}"]')).to_be_visible(
+        timeout=10_000
+    )
+    page_a.wait_for_function(
+        "Number(sessionStorage.getItem('transfer-last-sequence') || 0) > 0"
+    )
+    cursor_before_open = page_a.evaluate(
+        "Number(sessionStorage.getItem('transfer-last-sequence') || 0)"
+    )
+
+    with context.expect_page() as page_b_info:
+        page_a.evaluate("window.open('about:blank', 'copied-cursor-tab')")
+    page_b = page_b_info.value
+    page_b.wait_for_load_state("domcontentloaded")
+    copied_cursor = page_b.evaluate(
+        "Number(sessionStorage.getItem('transfer-last-sequence') || 0)"
+    )
+    assert copied_cursor == cursor_before_open
+
+    page_b_requests: list[str] = []
     page_b_websockets: list[str] = []
+    page_b.on("request", lambda request: page_b_requests.append(request.url))
     page_b.on("websocket", lambda websocket: page_b_websockets.append(websocket.url))
     try:
         page_b.goto("/", wait_until="domcontentloaded")
         expect(page_b.locator("#mainContent")).to_be_visible(timeout=10_000)
         expect(page_b.locator("#connectionStatus")).to_have_text("已连接", timeout=10_000)
+        expect(page_b.locator(f'[data-upload-id="{upload_id}"]')).to_be_visible(timeout=10_000)
+        expect(page_b.locator(f'[data-message-id="{current_message_id}"]')).to_be_visible(
+            timeout=10_000
+        )
+        assert any(url.endswith("/api/uploads/active") for url in page_b_requests)
+        assert any("/api/messages?limit=50" in url for url in page_b_requests)
+        assert page_b_websockets[-1].endswith(f"after={copied_cursor}")
+
         page_b.evaluate(
             "window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }))"
         )
@@ -1175,8 +1280,8 @@ def test_event_cursor_is_per_tab_and_reconnect_replays_that_tabs_gap(
         response = context.request.post(
             f"{browser_session.base_url}/api/messages",
             data={
-                "body": "tab-specific replay",
-                "client_request_id": "tab-specific-replay",
+                "body": "independent cursor replay",
+                "client_request_id": "independent-cursor-replay",
             },
         )
         assert response.ok
@@ -1191,6 +1296,7 @@ def test_event_cursor_is_per_tab_and_reconnect_replays_that_tabs_gap(
         cursor_b_before = page_b.evaluate(
             "Number(sessionStorage.getItem('transfer-last-sequence') || 0)"
         )
+        assert cursor_b_before == copied_cursor
         assert cursor_b_before < cursor_a
         expect(page_b.locator(f'[data-message-id="{message_id}"]')).to_have_count(0)
 
@@ -1220,51 +1326,54 @@ def test_observer_can_cancel_and_remote_cancellation_reaches_both_pages(
     _open_locked_application(browser_session)
     _unlock(source_page)
     expect(source_page.locator("#connectionStatus")).to_have_text("已连接", timeout=10_000)
-    cdp = browser_session.context.new_cdp_session(source_page)
-    cdp.send("Network.enable")
-    cdp.send(
-        "Network.emulateNetworkConditions",
-        {
-            "offline": False,
-            "latency": 0,
-            "downloadThroughput": -1,
-            "uploadThroughput": 32 * 1024,
-            "connectionType": "cellular3g",
-        },
-    )
     sent_parts: list[int] = []
     failed_requests: list[str] = []
     finished_requests: list[str] = []
+    cdp: CDPSession | None = None
+    observer_context: BrowserContext | None = None
 
     def part_index(request: object) -> int | None:
         match = re.search(r"/parts/(\d+)$", request.url)  # type: ignore[attr-defined]
         return int(match.group(1)) if match else None
 
-    source_page.on(
-        "request",
-        lambda request: sent_parts.append(index)
-        if (index := part_index(request)) is not None
-        else None,
-    )
-    source_page.on(
-        "requestfailed",
-        lambda request: failed_requests.append(request.url)  # type: ignore[attr-defined]
-        if part_index(request) is not None
-        else None,
-    )
-    source_page.on(
-        "requestfinished",
-        lambda request: finished_requests.append(request.url)  # type: ignore[attr-defined]
-        if part_index(request) is not None
-        else None,
-    )
-
-    observer_context = chromium_browser.new_context(
-        base_url=browser_session.base_url,
-        viewport={"width": 390, "height": 844},
-    )
-    observer_page = observer_context.new_page()
     try:
+        cdp = browser_session.context.new_cdp_session(source_page)
+        browser_session.cdp_sessions.append(cdp)
+        cdp.send("Network.enable")
+        cdp.send(
+            "Network.emulateNetworkConditions",
+            {
+                "offline": False,
+                "latency": 0,
+                "downloadThroughput": -1,
+                "uploadThroughput": 32 * 1024,
+                "connectionType": "cellular3g",
+            },
+        )
+        source_page.on(
+            "request",
+            lambda request: sent_parts.append(index)
+            if (index := part_index(request)) is not None
+            else None,
+        )
+        source_page.on(
+            "requestfailed",
+            lambda request: failed_requests.append(request.url)  # type: ignore[attr-defined]
+            if part_index(request) is not None
+            else None,
+        )
+        source_page.on(
+            "requestfinished",
+            lambda request: finished_requests.append(request.url)  # type: ignore[attr-defined]
+            if part_index(request) is not None
+            else None,
+        )
+
+        observer_context = chromium_browser.new_context(
+            base_url=browser_session.base_url,
+            viewport={"width": 390, "height": 844},
+        )
+        observer_page = observer_context.new_page()
         with source_page.expect_request(
             lambda request: request.method == "PUT" and part_index(request) == 0,
             timeout=60_000,
@@ -1302,7 +1411,7 @@ def test_observer_can_cancel_and_remote_cancellation_reaches_both_pages(
         except AssertionError as error:
             details = source_page.evaluate("""
               () => ({
-                sequence: localStorage.getItem('transfer-last-sequence'),
+                sequence: sessionStorage.getItem('transfer-last-sequence'),
                 connection: document.getElementById('connectionStatus').textContent,
               })
             """)
@@ -1316,17 +1425,10 @@ def test_observer_can_cancel_and_remote_cancellation_reaches_both_pages(
         source_page.wait_for_timeout(250)
         assert sent_parts == [0]
     finally:
-        observer_context.close()
-        cdp.send(
-            "Network.emulateNetworkConditions",
-            {
-                "offline": False,
-                "latency": 0,
-                "downloadThroughput": -1,
-                "uploadThroughput": -1,
-                "connectionType": "none",
-            },
-        )
-        cdp.send("Network.disable")
-        cdp.detach()
+        try:
+            if observer_context is not None:
+                observer_context.close()
+        finally:
+            if cdp is not None:
+                _cleanup_cdp_network_session(cdp)
     _assert_browser_clean(browser_session)

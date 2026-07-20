@@ -39,26 +39,34 @@ export function connectEvents({ after, onEvent, onStatus }) {
     if (stopped) return;
     clearReconnectTimer();
     onStatus(attempt ? 'reconnecting' : 'connecting');
-    socket = new WebSocket(`${location.origin.replace(/^http/, 'ws')}/api/events?after=${lastAppliedSequence}`);
-    socket.onopen = () => {
-      if (stopped) return;
+    const currentSocket = new WebSocket(`${location.origin.replace(/^http/, 'ws')}/api/events?after=${lastAppliedSequence}`);
+    const generation = { failed: false, closed: false };
+    socket = currentSocket;
+    currentSocket.onopen = () => {
+      if (stopped || socket !== currentSocket || generation.failed) return;
       clearReconnectTimer();
       attempt = 0;
       onStatus('connected');
     };
-    socket.onmessage = message => {
-      const event = JSON.parse(message.data);
-      const applied = onEvent(event);
-      if (applied === true && event.sequence !== undefined) {
+    currentSocket.onmessage = message => {
+      if (stopped || socket !== currentSocket || generation.failed) return;
+      try {
+        const event = JSON.parse(message.data);
+        if (onEvent(event) !== true) throw new Error('Event application failed');
+        if (event.sequence === undefined) return;
         const sequence = normalizeSequence(event.sequence);
         if (sequence > lastAppliedSequence) {
           lastAppliedSequence = sequence;
           storeLastSequence(sequence);
         }
+      } catch {
+        generation.failed = true;
+        currentSocket.close();
       }
     };
-    socket.onclose = event => {
-      if (stopped) return;
+    currentSocket.onclose = event => {
+      if (stopped || socket !== currentSocket || generation.closed) return;
+      generation.closed = true;
       if (event.code === 4401) {
         clearReconnectTimer();
         return onStatus('closed');

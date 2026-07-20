@@ -718,6 +718,7 @@ function updateConnectionStatus(status) {
 
 function applyIncomingEvent(event) {
   if (appDestroyed || !event) return false;
+  if (event.event_type === 'ready') return true;
   if (event.event_type?.startsWith('upload.')) {
     return uploadCoordinator.applyRemoteEvent(event);
   }
