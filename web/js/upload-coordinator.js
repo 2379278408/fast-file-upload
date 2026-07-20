@@ -5,6 +5,12 @@ const IDENTITY_VERSION = 'sample-identity-v1';
 const LIVE_MILESTONES = [25, 50, 75, 100];
 const UPLOAD_ANNOUNCEMENT_INTERVAL_MS = 1000;
 const TERMINAL_UPLOAD_STATUSES = new Set(['complete', 'completed', 'cancelled', 'expired']);
+const SERVER_OWNED_UPLOAD_STATUSES = new Set(['verifying']);
+const BATCH_CONTROL_STATUSES = {
+  pause: new Set(['queued', 'uploading']),
+  resume: new Set(['paused', 'failed']),
+  cancel: new Set(['queued', 'uploading', 'paused', 'verifying', 'failed']),
+};
 const UPLOAD_STATUS_LABELS = {
   preparing: '正在准备', queued: '等待上传', uploading: '上传中', paused: '已暂停',
   verifying: '正在校验', completing: '正在校验', failed: '上传失败',
@@ -186,6 +192,9 @@ export function createUploadCoordinator({
   let resolveDestroy;
   const destroyPromise = new Promise(resolve => { resolveDestroy = resolve; });
   const pendingWorkers = new Set();
+  const controlSummary = () => Object.freeze({
+    hasPendingControl: tasks.some(task => Boolean(task.pendingAction)),
+  });
 
   const announceTask = task => {
     let stateAnnouncement = null;
@@ -228,9 +237,10 @@ export function createUploadCoordinator({
       }
     }
     const value = snapshot();
+    const summary = controlSummary();
     for (const listener of listeners) {
       if (!isCurrent(token)) break;
-      listener(value);
+      listener(value, summary);
     }
   };
   const persist = (task, token = generation) => {
@@ -340,6 +350,10 @@ export function createUploadCoordinator({
       return;
     }
     task.status = status;
+    if (SERVER_OWNED_UPLOAD_STATUSES.has(status)) {
+      task.errorCode = null;
+      task.errorMessage = null;
+    }
     touchTask(task);
   };
   const findTask = uploadId => tasks.find(task => task.uploadId === uploadId || task.clientRequestId === uploadId);
@@ -408,7 +422,9 @@ export function createUploadCoordinator({
       if (TERMINAL_UPLOAD_STATUSES.has(responseStatus)) {
         applyRemoteStatus(task, response);
       } else {
-        task.status = responseStatus || (action === 'pause' ? 'paused' : (action === 'cancel' ? 'cancelled' : 'queued'));
+        task.status = action === 'resume' && responseStatus === 'uploading'
+          ? 'queued'
+          : (responseStatus || (action === 'pause' ? 'paused' : (action === 'cancel' ? 'cancelled' : 'queued')));
         touchTask(task);
       }
       task.errorCode = null;
@@ -631,7 +647,10 @@ export function createUploadCoordinator({
         if (!isCurrent(token)) return;
         return;
       }
-      task.status = task.status === 'paused' || response.status === 'paused' ? 'paused' : 'queued';
+      const responseStatus = normalizedStatus(response.status);
+      task.status = SERVER_OWNED_UPLOAD_STATUSES.has(responseStatus)
+        ? responseStatus
+        : (task.status === 'paused' || responseStatus === 'paused' ? 'paused' : 'queued');
       touchTask(task);
       if (task.status === 'paused') {
         await raceWithDestroy(api.controlUpload(task.uploadId, 'pause')).catch(() => {});
@@ -704,6 +723,7 @@ export function createUploadCoordinator({
 
   async function coordinateSourceFile(task, token) {
     if (!task.isSourceDevice || TERMINAL_UPLOAD_STATUSES.has(task.status)) return;
+    if (SERVER_OWNED_UPLOAD_STATUSES.has(normalizedStatus(task.status))) return;
     if (!task.file && task.fileHandle && typeof task.fileHandle.queryPermission === 'function') {
       try {
         const permission = await raceWithDestroy(task.fileHandle.queryPermission({ mode: 'read' }));
@@ -720,6 +740,11 @@ export function createUploadCoordinator({
     }
     if (!isCurrent(token)) return;
     if (!task.file) {
+      if (BATCH_CONTROL_STATUSES.pause.has(normalizedStatus(task.status))) {
+        await runControl(task, 'pause', token);
+      }
+      if (!isCurrent(token) || SERVER_OWNED_UPLOAD_STATUSES.has(normalizedStatus(task.status))
+          || TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(task.status))) return;
       task.status = 'paused';
       task.errorCode = 'reselect_required';
       task.errorMessage = '请重新选择原文件以继续上传';
@@ -737,6 +762,9 @@ export function createUploadCoordinator({
   }
 
   async function settleControls(action, selectedTasks) {
+    if (controlSummary().hasPendingControl) {
+      return { action, total: 0, succeeded: 0, failed: 0, results: [] };
+    }
     const results = await Promise.allSettled(
       selectedTasks.map(task => coordinator[action](task.uploadId)),
     );
@@ -812,6 +840,9 @@ export function createUploadCoordinator({
       const task = findTask(uploadId);
       if (!task || !task.isSourceDevice) return false;
       if (TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(task.status))) throw operationError('上传任务已结束');
+      if (!BATCH_CONTROL_STATUSES.resume.has(normalizedStatus(task.status))) {
+        throw operationError('当前状态无法重新选择文件');
+      }
       const matches = await raceWithDestroy(matchesFileIdentity(file, task.identity, cryptoObject));
       if (!isCurrent(token)) throw coordinatorDestroyedError();
       if (!matches) {
@@ -823,28 +854,20 @@ export function createUploadCoordinator({
         notify(token);
         return false;
       }
-      let shouldResumeServer = true;
-      if (api.getUploadSession) {
-        const remote = await raceWithDestroy(api.getUploadSession(task.uploadId));
-        if (!isCurrent(token)) throw coordinatorDestroyedError();
-        applyServerState(task, remote, { authoritative: true });
-        shouldResumeServer = ['paused', 'failed'].includes(normalizedStatus(remote.status));
-        if (TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(remote.status))) {
-          applyRemoteStatus(task, remote);
-          notify(token);
-          throw operationError('上传任务已结束');
-        }
+      const remote = await raceWithDestroy(api.getUploadSession(task.uploadId));
+      if (!isCurrent(token)) throw coordinatorDestroyedError();
+      applyServerState(task, remote, { authoritative: true });
+      applyRemoteStatus(task, remote);
+      const remoteStatus = normalizedStatus(remote.status);
+      if (!BATCH_CONTROL_STATUSES.resume.has(remoteStatus)) {
+        if (!TERMINAL_UPLOAD_STATUSES.has(remoteStatus)) await persist(task, token);
+        notify(token);
+        if (TERMINAL_UPLOAD_STATUSES.has(remoteStatus)) throw operationError('上传任务已结束');
+        throw operationError('服务端当前状态无法重新选择文件');
       }
       task.file = file;
       touchTask(task);
-      if (shouldResumeServer && api.controlUpload) {
-        await runControl(task, 'resume', token);
-      } else {
-        task.status = 'queued';
-        task.errorCode = null;
-        task.errorMessage = null;
-        touchTask(task);
-      }
+      await runControl(task, 'resume', token);
       if (!isCurrent(token)) throw coordinatorDestroyedError();
       await persist(task, token);
       notify(token);
@@ -868,22 +891,14 @@ export function createUploadCoordinator({
       if (task.worker || task.inFlightBytes || task.status === 'uploading') throw operationError('上传任务仍在运行');
       applyServerState(task, response, { authoritative: true });
       const remoteStatus = normalizedStatus(response.status);
-      if (TERMINAL_UPLOAD_STATUSES.has(remoteStatus)) {
-        applyRemoteStatus(task, response);
+      applyRemoteStatus(task, response);
+      if (remoteStatus !== 'failed') {
+        if (!TERMINAL_UPLOAD_STATUSES.has(remoteStatus)) await persist(task, token);
         notify(token);
-        throw operationError('上传任务已结束');
+        if (TERMINAL_UPLOAD_STATUSES.has(remoteStatus)) throw operationError('上传任务已结束');
+        throw operationError('仅服务端失败任务可以重试');
       }
-      if (remoteStatus === 'paused' || remoteStatus === 'failed') {
-        await runControl(task, 'resume', token);
-      } else {
-        task.status = 'queued';
-        task.errorCode = null;
-        task.errorMessage = null;
-        touchTask(task);
-        persist(task, token);
-        notify(token);
-        pump();
-      }
+      await runControl(task, 'resume', token);
       return publicTask(task);
     },
     prioritize(uploadId) {
@@ -898,14 +913,14 @@ export function createUploadCoordinator({
     },
     async pauseAll() {
       return settleControls('pause', tasks.filter(task => task.isSourceDevice
-        && !TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(task.status))));
+        && BATCH_CONTROL_STATUSES.pause.has(normalizedStatus(task.status))));
     },
     async resumeAll() {
       return settleControls('resume', tasks.filter(task => task.isSourceDevice
-        && ['paused', 'failed'].includes(task.status)));
+        && BATCH_CONTROL_STATUSES.resume.has(normalizedStatus(task.status))));
     },
     async cancelAll() {
-      return settleControls('cancel', tasks.filter(task => !TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(task.status))));
+      return settleControls('cancel', tasks.filter(task => BATCH_CONTROL_STATUSES.cancel.has(normalizedStatus(task.status))));
     },
     async reconcile() {
       const token = generation;
@@ -1009,10 +1024,11 @@ export function createUploadCoordinator({
     subscribe(listener) {
       if (destroyed) return () => {};
       listeners.add(listener);
-      listener(snapshot());
+      listener(snapshot(), controlSummary());
       return () => listeners.delete(listener);
     },
     getSnapshot: snapshot,
+    getSummary: controlSummary,
     destroy() {
       if (destroyed) return;
       destroyed = true;

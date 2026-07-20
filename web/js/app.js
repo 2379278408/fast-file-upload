@@ -449,9 +449,15 @@ listen(uploadReselectInput, 'change', async () => {
   }
 });
 
-const unsubscribeUploadCoordinator = uploadCoordinator.subscribe(tasks => {
+const unsubscribeUploadCoordinator = uploadCoordinator.subscribe((tasks, summary = {}) => {
   tasks.forEach(task => {
     timeline.upsertUpload?.(task);
+  });
+  const hasPendingControl = Boolean(summary.hasPendingControl);
+  [pauseAllUploads, resumeAllUploads, cancelAllUploads].forEach(button => {
+    if (!button) return;
+    button.disabled = hasPendingControl;
+    button.setAttribute('aria-disabled', String(hasPendingControl));
   });
   const activeStates = ['queued', 'uploading', 'paused', 'verifying', 'completing', 'failed', 'needs-file'];
   const activeTasks = tasks.filter(task => activeStates.includes(task.status));

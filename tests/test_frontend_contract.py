@@ -2704,6 +2704,340 @@ def test_upload_controls_wait_for_server_and_recover_authoritative_failure() -> 
     assert context.eval("coordinator.getSnapshot()[0].errorCode") is None
 
 
+def test_upload_verifying_state_remains_server_owned_during_prepare_and_reconcile() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.uploadCalls = 0;
+      globalThis.controlCalls = 0;
+      globalThis.permissionCalls = 0;
+      globalThis.cryptoObject = {
+        randomUUID: () => 'verifying-with-file',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'verifying.bin', size: 4, type: '', lastModified: 1,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      };
+      globalThis.api = {
+        createUploadSession: () => Promise.resolve({ upload_id: 'verifying-with-file',
+          status: 'verifying', confirmed_parts: [], confirmed_bytes: 0, chunk_size_bytes: 4 }),
+        uploadPart() { uploadCalls += 1; return new Promise(() => {}); },
+        controlUpload() { controlCalls += 1; return Promise.resolve({}); },
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve([]), put: () => Promise.resolve(),
+        migrate: () => Promise.resolve(), remove: () => Promise.resolve(), close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, chunkSize: 4,
+      });
+      coordinator.enqueueFiles([file]);
+    """)
+    drain_jobs(context)
+    assert context.eval("coordinator.getSnapshot()[0].status") == "verifying"
+    assert context.eval("coordinator.getSnapshot()[0].errorCode") is None
+    assert context.eval("uploadCalls") == 0
+    assert context.eval("controlCalls") == 0
+
+    context.eval(r"""
+      globalThis.handle = {
+        queryPermission() { permissionCalls += 1; return Promise.resolve('granted'); },
+        getFile() { throw new Error('verifying must not request a file'); },
+      };
+      globalThis.reconcileApi = {
+        listActiveUploads: () => Promise.resolve([
+          { upload_id: 'verifying-handle', original_name: 'handle.bin', size_bytes: 4,
+            status: 'verifying', confirmed_parts: [0], confirmed_bytes: 4, chunk_size_bytes: 4 },
+          { upload_id: 'verifying-missing', original_name: 'missing.bin', size_bytes: 4,
+            status: 'verifying', confirmed_parts: [0], confirmed_bytes: 4, chunk_size_bytes: 4 },
+        ]),
+        uploadPart() { uploadCalls += 1; return new Promise(() => {}); },
+        controlUpload() { controlCalls += 1; return Promise.resolve({}); },
+      };
+      globalThis.reconcilePersistence = {
+        getAll: () => Promise.resolve([
+          { uploadId: 'verifying-handle', fileHandle: handle, name: 'handle.bin', sizeBytes: 4,
+            status: 'verifying', confirmedParts: [], confirmedBytes: 0, isSourceDevice: true,
+            sessionReady: true, chunkSize: 4 },
+          { uploadId: 'verifying-missing', name: 'missing.bin', sizeBytes: 4,
+            status: 'verifying', confirmedParts: [], confirmedBytes: 0, isSourceDevice: true,
+            sessionReady: true, chunkSize: 4 },
+        ]),
+        put: () => Promise.resolve(), remove: () => Promise.resolve(), close: () => {},
+      };
+      globalThis.reconciled = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api: reconcileApi, persistence: reconcilePersistence, cryptoObject, chunkSize: 4,
+      });
+      reconciled.start();
+    """)
+    drain_jobs(context)
+    snapshot = json.loads(context.eval("JSON.stringify(reconciled.getSnapshot())"))
+    assert [task["status"] for task in snapshot] == ["verifying", "verifying"]
+    assert [task["errorCode"] for task in snapshot] == [None, None]
+    assert context.eval("permissionCalls") == 0
+    assert context.eval("uploadCalls") == 0
+    assert context.eval("controlCalls") == 0
+
+
+def test_reselect_and_retry_require_server_controllable_source_states() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.controlCalls = [];
+      globalThis.uploadCalls = 0;
+      globalThis.remoteStatus = 'verifying';
+      globalThis.AbortController = class AbortController {
+        constructor() { this.signal = {}; }
+        abort() {}
+      };
+      globalThis.cryptoObject = {
+        randomUUID: () => 'retry-gate',
+        subtle: { digest: () => Promise.resolve(new Uint8Array([1]).buffer) },
+      };
+      globalThis.file = {
+        name: 'gate.bin', size: 4, type: '', lastModified: 1,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array([1]).buffer) }),
+      };
+      globalThis.api = {
+        createUploadSession: () => Promise.resolve({ upload_id: 'retry-gate', status: 'queued',
+          confirmed_parts: [], confirmed_bytes: 0, chunk_size_bytes: 4 }),
+        uploadPart() { uploadCalls += 1; return Promise.reject(new Error('offline')); },
+        getUploadSession: () => Promise.resolve({ upload_id: 'retry-gate', status: remoteStatus,
+          confirmed_parts: [], confirmed_bytes: 0, chunk_size_bytes: 4 }),
+        controlUpload(_id, action) { controlCalls.push(action); return Promise.resolve({ status: 'queued' }); },
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve([]), put: () => Promise.resolve(),
+        migrate: () => Promise.resolve(), remove: () => Promise.resolve(), close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, delay: () => Promise.resolve(), chunkSize: 4,
+      });
+      coordinator.enqueueFiles([file]);
+    """)
+    drain_jobs(context)
+    assert context.eval("coordinator.getSnapshot()[0].status") == "failed"
+    upload_calls_before_retry = context.eval("uploadCalls")
+    context.eval(r"""
+      globalThis.retryError = null;
+      coordinator.retry('retry-gate').catch(error => { retryError = error.message; });
+    """)
+    drain_jobs(context)
+    assert context.eval("retryError") == "仅服务端失败任务可以重试"
+    assert context.eval("coordinator.getSnapshot()[0].status") == "verifying"
+    assert json.loads(context.eval("JSON.stringify(controlCalls)")) == []
+    assert context.eval("uploadCalls") == upload_calls_before_retry
+
+    context.eval(r"""
+      globalThis.reselectApi = {
+        listActiveUploads: () => Promise.resolve([{ upload_id: 'reselect-gate',
+          original_name: 'gate.bin', size_bytes: 4, status: 'paused', confirmed_parts: [],
+          confirmed_bytes: 0, chunk_size_bytes: 4 }]),
+        getUploadSession: () => Promise.resolve({ upload_id: 'reselect-gate', status: 'verifying',
+          confirmed_parts: [0], confirmed_bytes: 4, chunk_size_bytes: 4 }),
+        uploadPart() { uploadCalls += 1; return new Promise(() => {}); },
+        controlUpload(_id, action) { controlCalls.push(action); return Promise.resolve({ status: 'queued' }); },
+      };
+      globalThis.reselectPersistence = {
+        getAll: () => Promise.resolve([{ uploadId: 'reselect-gate', identity: {
+          name: 'gate.bin', size: 4, lastModified: 1, sampleSha256: '01' }, name: 'gate.bin',
+          sizeBytes: 4, status: 'paused', confirmedParts: [], confirmedBytes: 0,
+          isSourceDevice: true, sessionReady: true, chunkSize: 4 }]),
+        put: () => Promise.resolve(), remove: () => Promise.resolve(), close: () => {},
+      };
+      globalThis.reselectCoordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api: reselectApi, persistence: reselectPersistence, cryptoObject, chunkSize: 4,
+      });
+      globalThis.reselectError = null;
+      reselectCoordinator.start()
+        .then(() => reselectCoordinator.reselect('reselect-gate', file))
+        .catch(error => { reselectError = error.message; });
+    """)
+    drain_jobs(context)
+    assert context.eval("reselectError") == "服务端当前状态无法重新选择文件"
+    assert context.eval("reselectCoordinator.getSnapshot()[0].status") == "verifying"
+    assert json.loads(context.eval("JSON.stringify(controlCalls)")) == []
+    assert context.eval("uploadCalls") == upload_calls_before_retry
+
+
+def test_batch_controls_follow_server_transitions_and_expose_pending_summary() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.nextId = 0;
+      globalThis.controlCalls = [];
+      globalThis.controlResolvers = [];
+      globalThis.cancelCalls = [];
+      globalThis.cancelResolvers = [];
+      globalThis.cryptoObject = {
+        randomUUID: () => `source-${nextId++}`,
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.makeFile = index => ({
+        name: `source-${index}.bin`, size: 4, type: '', lastModified: index,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      });
+      globalThis.api = {
+        createUploadSession: metadata => Promise.resolve({ upload_id: metadata.clientRequestId,
+          status: 'queued', confirmed_parts: [], confirmed_bytes: 0, chunk_size_bytes: 4 }),
+        controlUpload(id, action) {
+          controlCalls.push([id, action]);
+          return new Promise(resolve => controlResolvers.push({ id, action, resolve }));
+        },
+        cancelUpload(id) {
+          cancelCalls.push(id);
+          return new Promise(resolve => cancelResolvers.push({ id, resolve }));
+        },
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve([]), put: () => Promise.resolve(),
+        migrate: () => Promise.resolve(), remove: () => Promise.resolve(), close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, maxActive: -1, chunkSize: 4,
+      });
+      coordinator.enqueueFiles(Array.from({ length: 9 }, (_, index) => makeFile(index)));
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      globalThis.statuses = ['queued', 'uploading', 'paused', 'failed', 'verifying',
+        'preparing', 'completing', 'completed', 'cancelled'];
+      statuses.forEach((status, index) => coordinator.applyRemoteEvent({
+        event_type: 'upload.state_changed', sequence: index + 1,
+        payload: { upload_id: `source-${index}`, status, chunk_size_bytes: 4 },
+      }));
+      statuses.forEach((status, index) => coordinator.applyRemoteEvent({
+        event_type: 'upload.created', sequence: index + 20,
+        payload: { upload_id: `observer-${index}`, original_name: `observer-${index}.bin`,
+          size_bytes: 4, status, chunk_size_bytes: 4 },
+      }));
+      globalThis.summaryHistory = [];
+      coordinator.subscribe((_tasks, summary) => summaryHistory.push(summary?.hasPendingControl ?? false));
+      globalThis.pauseResult = null;
+      globalThis.crossResult = null;
+      coordinator.pauseAll().then(value => { pauseResult = value; });
+    """)
+    drain_jobs(context)
+    assert context.eval("coordinator.getSummary().hasPendingControl") is True
+    assert json.loads(context.eval("JSON.stringify(controlCalls)")) == [
+        ["source-0", "pause"], ["source-1", "pause"]
+    ]
+    context.eval("coordinator.resumeAll().then(value => { crossResult = value; })")
+    drain_jobs(context)
+    assert context.eval("crossResult.total") == 0
+    assert len(json.loads(context.eval("JSON.stringify(controlCalls)"))) == 2
+    context.eval(r"""
+      controlResolvers.forEach(item => item.resolve({ status: 'paused' }));
+    """)
+    drain_jobs(context)
+    assert context.eval("pauseResult.total") == 2
+    assert context.eval("pauseResult.failed") == 0
+    assert context.eval("coordinator.getSummary().hasPendingControl") is False
+
+    context.eval(r"""
+      controlCalls = []; controlResolvers = [];
+      statuses.forEach((status, index) => coordinator.applyRemoteEvent({
+        event_type: 'upload.state_changed', sequence: index + 100,
+        payload: { upload_id: `source-${index}`, status, chunk_size_bytes: 4 },
+      }));
+      globalThis.resumeResult = null;
+      coordinator.resumeAll().then(value => { resumeResult = value; });
+    """)
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(controlCalls)")) == [
+        ["source-2", "resume"], ["source-3", "resume"]
+    ]
+    context.eval("controlResolvers.forEach(item => item.resolve({ status: 'queued' }))")
+    drain_jobs(context)
+    assert context.eval("resumeResult.total") == 2
+    assert context.eval("resumeResult.failed") == 0
+
+    context.eval(r"""
+      statuses.forEach((status, index) => coordinator.applyRemoteEvent({
+        event_type: 'upload.state_changed', sequence: index + 200,
+        payload: { upload_id: `source-${index}`, status, chunk_size_bytes: 4 },
+      }));
+      globalThis.cancelResult = null;
+      coordinator.cancelAll().then(value => { cancelResult = value; });
+    """)
+    drain_jobs(context)
+    expected_cancelled = {
+        *(f"source-{index}" for index in range(5)),
+        *(f"observer-{index}" for index in range(5)),
+    }
+    assert set(json.loads(context.eval("JSON.stringify(cancelCalls)"))) == expected_cancelled
+    context.eval("cancelResolvers.forEach(item => item.resolve({ status: 'cancelled' }))")
+    drain_jobs(context)
+    assert context.eval("cancelResult.total") == 10
+    assert context.eval("cancelResult.failed") == 0
+    assert context.eval("summaryHistory.includes(true)") is True
+    assert context.eval("summaryHistory[summaryHistory.length - 1]") is False
+
+
+def test_app_disables_all_batch_controls_while_a_control_is_pending() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.controlSubscriber = null;
+      globalThis.__modules['./api.js'] = {
+        request: () => Promise.resolve({}), unlock: () => Promise.resolve({}),
+        logout: () => Promise.resolve({}), getSession: () => Promise.reject(new Error('locked')),
+        ApiError: class ApiError extends Error {},
+        connectEvents: () => ({ close() {} }), getLastSequence: () => 0,
+      };
+      globalThis.__modules['./timeline.js'] = { createTimeline: () => ({
+        loadInitial: () => Promise.resolve(), upsertUpload() {}, mergeEvent() {},
+        focusMessage() {}, destroy() {},
+      }) };
+      globalThis.__modules['./composer.js'] = { createComposer: () => ({ destroy() {} }) };
+      globalThis.__modules['./upload-coordinator.js'] = { createUploadCoordinator: () => ({
+        start: () => Promise.resolve(), reconcile: () => Promise.resolve(), getSnapshot: () => [],
+        subscribe(listener) {
+          controlSubscriber = listener;
+          listener([], { hasPendingControl: false });
+          return () => {};
+        },
+        pauseAll: () => Promise.resolve({ failed: 0 }),
+        resumeAll: () => Promise.resolve({ failed: 0 }),
+        cancelAll: () => Promise.resolve({ failed: 0 }),
+        applyRemoteEvent() {}, destroy() {},
+      }) };
+      globalThis.__modules['./upload-persistence.js'] = { createUploadPersistence: () => ({}) };
+      globalThis.__modules['./library.js'] = { createLibrary: () => ({
+        load: () => Promise.resolve(), clearSelection() {}, applyEvent() {}, destroy() {},
+      }) };
+      globalThis.__modules['./navigation.js'] = { createNavigation: () => ({
+        start() {}, navigate: () => Promise.resolve(), destroy() {},
+      }) };
+    """)
+    load_js_module(context, "./app.js", read_web("js/app.js"))
+    drain_jobs(context)
+
+    context.eval("controlSubscriber([], { hasPendingControl: true })")
+    pending = json.loads(context.eval(r"""
+      JSON.stringify(['pauseAllUploads', 'resumeAllUploads', 'cancelAllUploads'].map(id => {
+        const button = document.getElementById(id);
+        return [button.disabled, button.getAttribute('aria-disabled')];
+      }))
+    """))
+    assert pending == [[True, "true"], [True, "true"], [True, "true"]]
+
+    context.eval("controlSubscriber([], { hasPendingControl: false })")
+    settled = json.loads(context.eval(r"""
+      JSON.stringify(['pauseAllUploads', 'resumeAllUploads', 'cancelAllUploads'].map(id => {
+        const button = document.getElementById(id);
+        return [button.disabled, button.getAttribute('aria-disabled')];
+      }))
+    """))
+    assert settled == [[False, "false"], [False, "false"], [False, "false"]]
+
+
 def test_pending_control_revision_wins_over_stale_reconcile_snapshot() -> None:
     context = create_js_context()
     context.eval(r"""
@@ -2966,8 +3300,10 @@ def test_upload_coordinator_reselect_requires_exact_identity_and_sends_server_mi
       });
       globalThis.api = {
         listActiveUploads: () => Promise.resolve([{ upload_id: 'resume', client_request_id: 'request', original_name: 'resume.bin', size_bytes: 8, status: 'paused', confirmed_parts: [0], confirmed_bytes: 4 }]),
+        getUploadSession: () => Promise.resolve({ upload_id: 'resume', status: 'paused',
+          confirmed_parts: [0], confirmed_bytes: 4, chunk_size_bytes: 4 }),
         uploadPart(_id, index) { sent.push(index); return new Promise(() => {}); },
-        controlUpload(_id, action) { actions.push(action); return Promise.resolve({}); },
+        controlUpload(_id, action) { actions.push(action); return Promise.resolve({ status: 'uploading' }); },
       };
       globalThis.persistence = {
         getAll: () => Promise.resolve([{ uploadId: 'resume', clientRequestId: 'request', identity: { name: 'resume.bin', size: 8, lastModified: 11, sampleSha256: '01' }, name: 'resume.bin', sizeBytes: 8, status: 'paused', confirmedParts: [], confirmedBytes: 0, isSourceDevice: true }]),
@@ -3934,7 +4270,8 @@ def test_upload_coordinator_retry_uses_authoritative_missing_snapshot() -> None:
             ? Promise.reject(new Error('offline'))
             : Promise.resolve({ confirmed_parts: [index], confirmed_bytes: 8 });
         },
-        getUploadSession: () => Promise.resolve({ confirmed_parts: [1], confirmed_bytes: 4, updated_at: '2026-07-19T11:00:00Z', version: 5 }),
+        getUploadSession: () => Promise.resolve({ status: 'failed', confirmed_parts: [1],
+          confirmed_bytes: 4, updated_at: '2026-07-19T11:00:00Z', version: 5 }),
         completeUpload: () => new Promise(() => {}),
         controlUpload: () => Promise.resolve({}), cancelUpload: () => Promise.resolve({}),
       };

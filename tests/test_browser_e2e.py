@@ -1310,7 +1310,9 @@ def test_upload_refresh_reselect_rejects_mismatch_and_sends_missing_parts_only(
     reselect.click()
     page.locator("#uploadReselectInput").set_input_files(source_file)
     expect(page.locator(f'[data-upload-id="{upload_id}"]')).to_have_count(0, timeout=20_000)
-    expect(page.locator(f'[data-message-id] [href="/download/{upload_id}"]')).to_have_count(1)
+    expect(page.locator(f'[data-message-id] [href="/download/{upload_id}"]')).to_have_count(
+        1, timeout=20_000
+    )
     assert sent_parts == [1]
     browser_session.console_messages[:] = [
         message for message in browser_session.console_messages
@@ -1378,7 +1380,9 @@ def test_attachment_picker_persists_real_handle_and_reload_auto_resumes(
     page.reload(wait_until="domcontentloaded")
     page.unroute("**/api/uploads/*/parts/1")
     expect(page.locator(f'[data-upload-id="{upload_id}"]')).to_have_count(0, timeout=20_000)
-    expect(page.locator(f'[data-message-id] [href="/download/{upload_id}"]')).to_have_count(1)
+    expect(page.locator(f'[data-message-id] [href="/download/{upload_id}"]')).to_have_count(
+        1, timeout=20_000
+    )
     browser_session.console_messages[:] = [
         message for message in browser_session.console_messages
         if "net::ERR_FAILED" not in message

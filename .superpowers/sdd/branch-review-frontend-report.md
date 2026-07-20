@@ -36,18 +36,28 @@ Baseline: `61ec8db` (`fix(upload): preserve tasks across reconcile migration`)
 
 - Pending control transitions and every authoritative control result advance the existing per-task reconcile revision from `61ec8db`. A deferred reconcile test proves an older uploading snapshot cannot overwrite a pending pause or its confirmed paused result.
 
+### Follow-up Review: Verifying And Batch Control Safety
+
+- `verifying` is now preserved as a server-owned processing state during session preparation and source reconciliation. Source coordination skips handle permission checks, reselect prompts, resume PATCH requests, and upload pumping while the server completes verification.
+- A refreshed source task without its file first pauses a remote `queued` or `uploading` session through the server transition, then requests reselection. A successful resume response with server status `uploading` becomes local scheduler status `queued`, allowing the upload worker to continue with missing parts.
+- Reselect accepts local and remote `paused` or `failed` states. Retry accepts local and remote `failed` states. Both operations converge to the latest GET status and confirmed parts before rejecting an invalid transition.
+- Batch controls use explicit transition sets matching the server contract: pause selects source `queued` and `uploading`; resume selects source `paused` and `failed`; cancel selects source and observer `queued`, `uploading`, `paused`, `verifying`, and `failed`. Skipped states stay outside the settled result and failure count.
+- Coordinator subscriptions now include `{ hasPendingControl }`. A pending individual or batch control suppresses overlapping batch execution until every selected request settles.
+
 ## UX Decisions
 
 - Pending controls keep the last server-confirmed status and replace the card status text with `正在暂停`, `正在继续`, or `正在取消`.
 - Card actions are hidden while one control is pending, preventing conflicting operations and duplicate requests.
+- All three batch buttons use native `disabled` plus `aria-disabled` while any control is pending, then restore together after settlement.
 - Individual failures use the existing toast boundary and retain an inline task error. Batch controls show the number of failed tasks while preserving per-task results for callers.
 - Picker cancellation preserves the current composer without an error toast. Capability and permission failures return to the established accessible file input.
 
 ## Verification
 
-- Frontend contract suite: `163 passed, 1 warning in 4.26s`.
-- Browser E2E suite: `22 passed, 1 warning in 170.97s`.
-- Default full suite: `557 passed, 1 deselected, 1 warning in 201.74s`.
+- Frontend contract suite: `167 passed, 1 warning in 5.10s`.
+- Browser E2E suite: `22 passed, 1 warning in 153.64s`.
+- Focused production picker reload regression: `1 passed, 1 warning in 39.69s`. The two reload-completion message assertions now share the suite's 20-second asynchronous UI window.
+- Default full suite: `561 passed, 1 deselected, 1 warning in 213.49s`.
 - `python3 -m compileall -q app server.py tests`: passed. The environment has no `python` executable alias.
 - `git diff --check`: passed.
 - Local preview: root returned HTTP 200 through `https://8086-57e9f8b4df557af1.monkeycode-ai.online` using existing background terminal `term_1784550079788_23`.
