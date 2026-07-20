@@ -390,7 +390,7 @@ const timeline = createTimeline({
       if (!appDestroyed && savedTimelinePosition === snapshot) savedTimelinePosition = null;
     }
   },
-  onUploadAction({ action, uploadId }) {
+  async onUploadAction({ action, uploadId }) {
     if (action === 'reselect') {
       pendingReselectUploadId = uploadId;
       if (uploadReselectInput) {
@@ -400,7 +400,12 @@ const timeline = createTimeline({
       return;
     }
     const handler = uploadCoordinator[action];
-    if (typeof handler === 'function') handler.call(uploadCoordinator, uploadId);
+    if (typeof handler !== 'function') return;
+    try {
+      await handler.call(uploadCoordinator, uploadId);
+    } catch (error) {
+      if (!appDestroyed) showToast(error.message || '上传操作失败', 'error');
+    }
   },
 });
 
@@ -457,9 +462,18 @@ const unsubscribeUploadCoordinator = uploadCoordinator.subscribe(tasks => {
     uploadSummaryText.textContent = `${activeTasks.length} 个活动任务 · ${uploading} 个上传中 · ${paused} 个已暂停`;
   }
 });
-listen(pauseAllUploads, 'click', () => uploadCoordinator.pauseAll());
-listen(resumeAllUploads, 'click', () => uploadCoordinator.resumeAll());
-listen(cancelAllUploads, 'click', () => uploadCoordinator.cancelAll());
+listen(pauseAllUploads, 'click', async () => {
+  const summary = await uploadCoordinator.pauseAll();
+  if (summary.failed && !appDestroyed) showToast(`${summary.failed} 个任务暂停失败`, 'error');
+});
+listen(resumeAllUploads, 'click', async () => {
+  const summary = await uploadCoordinator.resumeAll();
+  if (summary.failed && !appDestroyed) showToast(`${summary.failed} 个任务继续失败`, 'error');
+});
+listen(cancelAllUploads, 'click', async () => {
+  const summary = await uploadCoordinator.cancelAll();
+  if (summary.failed && !appDestroyed) showToast(`${summary.failed} 个任务取消失败`, 'error');
+});
 
 const library = createLibrary({
   root: document.getElementById('libraryView'),
@@ -476,7 +490,9 @@ const library = createLibrary({
 });
 
 if (composerAttachBtn && composerFileInput) {
-  listen(composerAttachBtn, 'click', () => composerFileInput.click());
+  listen(composerAttachBtn, 'click', async () => {
+    if (!await composer.pickFiles()) composerFileInput.click();
+  });
 }
 
 if (transferPage && transferDropOverlay) {

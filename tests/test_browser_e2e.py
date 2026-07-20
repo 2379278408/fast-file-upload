@@ -1319,6 +1319,73 @@ def test_upload_refresh_reselect_rejects_mismatch_and_sends_missing_parts_only(
     _assert_browser_clean(browser_session)
 
 
+def test_attachment_picker_persists_real_handle_and_reload_auto_resumes(
+    browser_session: BrowserSession,
+) -> None:
+    page = browser_session.page
+    _open_locked_application(browser_session)
+    _unlock(page)
+    supported = page.evaluate(
+        """
+        async () => {
+          if (!navigator.storage?.getDirectory) return false;
+          const root = await navigator.storage.getDirectory();
+          const handle = await root.getFileHandle('picker-resume.bin', { create: true });
+          const writable = await handle.createWritable();
+          await writable.write(new Uint8Array(8 * 1024 * 1024 + 1));
+          await writable.close();
+          window.__productionPickerHandle = handle;
+          window.showOpenFilePicker = options => {
+            window.__productionPickerOptions = options;
+            return Promise.resolve([handle]);
+          };
+          return typeof handle.getFile === 'function';
+        }
+        """
+    )
+    if not supported:
+        pytest.skip("Chromium does not expose a cloneable FileSystemFileHandle")
+
+    page.route("**/api/uploads/*/parts/1", lambda route: route.abort())
+    page.locator("#composerAttachBtn").click()
+    active = _wait_for_active_upload(
+        browser_session.context,
+        browser_session.base_url,
+        lambda upload: upload.get("confirmed_parts") == [0],
+    )
+    upload_id = str(active["upload_id"])
+    assert page.evaluate("window.__productionPickerOptions.multiple") is True
+    persisted_handle = page.evaluate(
+        """
+        uploadId => new Promise((resolve, reject) => {
+          const open = indexedDB.open('personal-transfer-timeline', 1);
+          open.onerror = () => reject(open.error);
+          open.onsuccess = () => {
+            const request = open.result.transaction('upload-tasks', 'readonly')
+              .objectStore('upload-tasks').get(uploadId);
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => resolve({
+              kind: request.result?.fileHandle?.kind,
+              hasGetFile: typeof request.result?.fileHandle?.getFile === 'function',
+            });
+          };
+        })
+        """,
+        upload_id,
+    )
+    assert persisted_handle == {"kind": "file", "hasGetFile": True}
+
+    page.reload(wait_until="domcontentloaded")
+    page.unroute("**/api/uploads/*/parts/1")
+    expect(page.locator(f'[data-upload-id="{upload_id}"]')).to_have_count(0, timeout=20_000)
+    expect(page.locator(f'[data-message-id] [href="/download/{upload_id}"]')).to_have_count(1)
+    browser_session.console_messages[:] = [
+        message for message in browser_session.console_messages
+        if "net::ERR_FAILED" not in message
+    ]
+    _assert_browser_clean(browser_session)
+
+
 def test_window_open_copied_cursor_reconciles_then_tabs_advance_independently(
     browser_session: BrowserSession,
 ) -> None:

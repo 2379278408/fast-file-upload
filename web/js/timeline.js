@@ -72,8 +72,15 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
   }
 
   function getLocalDate(ts) {
-    const d = new Date(ts);
+    const timestamp = safeTimestamp(ts);
+    const d = new Date(timestamp);
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  function safeTimestamp(value) {
+    const numeric = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value;
+    const timestamp = new Date(numeric).getTime();
+    return Number.isFinite(timestamp) ? timestamp : 0;
   }
 
   const _escSpan = document.createElement('span');
@@ -196,6 +203,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
   }
 
   function uploadActions(upload) {
+    if (upload.pendingAction) return [];
     const actions = [];
     if (upload.isSourceDevice !== false) {
       if (['queued', 'uploading'].includes(upload.status)) actions.push(['pause', '暂停']);
@@ -230,9 +238,12 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     name.textContent = upload.name || '未命名文件';
     const status = document.createElement('span');
     status.className = 'upload-card-status';
-    status.textContent = upload.errorCode === 'reselect_required'
+    const pendingLabels = { pause: '正在暂停', resume: '正在继续', cancel: '正在取消' };
+    status.textContent = upload.pendingAction
+      ? pendingLabels[upload.pendingAction]
+      : (upload.errorCode === 'reselect_required'
       ? '需要重新选择原文件'
-      : (upload.errorCode === 'file_mismatch' ? '文件不匹配' : (uploadStatusLabels[upload.status] || upload.status || '等待上传'));
+      : (upload.errorCode === 'file_mismatch' ? '文件不匹配' : (uploadStatusLabels[upload.status] || upload.status || '等待上传')));
     heading.append(name, status);
     element.append(heading);
 
@@ -501,8 +512,8 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
   }
 
   function compareProjectedElements(left, right) {
-    const leftTimestamp = Date.parse(left.dataset.createdAt || '') || 0;
-    const rightTimestamp = Date.parse(right.dataset.createdAt || '') || 0;
+    const leftTimestamp = safeTimestamp(left.dataset.createdAt || '');
+    const rightTimestamp = safeTimestamp(right.dataset.createdAt || '');
     if (leftTimestamp !== rightTimestamp) return leftTimestamp - rightTimestamp;
     const leftId = stableElementId(left);
     const rightId = stableElementId(right);

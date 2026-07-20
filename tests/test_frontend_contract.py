@@ -2460,6 +2460,422 @@ def test_upload_persistence_only_clones_metadata_and_optional_handle() -> None:
     assert row["fileHandle"] == {"kind": "file"}
 
 
+def test_upload_persistence_migrates_keys_in_one_atomic_transaction() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.operations = [];
+      globalThis.transactions = [];
+      globalThis.database = {
+        transaction(_store, mode) {
+          const transaction = {
+            mode,
+            objectStore() {
+              return {
+                put(value) {
+                  operations.push(['put', value.uploadId]);
+                  const request = {};
+                  Promise.resolve().then(() => { request.result = value.uploadId; request.onsuccess(); });
+                  return request;
+                },
+                delete(key) {
+                  operations.push(['delete', key]);
+                  const request = {};
+                  Promise.resolve().then(() => { request.onsuccess(); });
+                  return request;
+                },
+              };
+            },
+          };
+          transactions.push(transaction);
+          return transaction;
+        },
+        close() {},
+      };
+      globalThis.indexedDB = { open() {
+        const request = {};
+        Promise.resolve().then(() => { request.result = database; request.onsuccess(); });
+        return request;
+      } };
+    """)
+    load_js_module(context, "./upload-persistence.js", read_web("js/upload-persistence.js"))
+    context.eval(r"""
+      globalThis.persistence = __modules['./upload-persistence.js'].createUploadPersistence({ indexedDB });
+      globalThis.migrated = false;
+      persistence.migrate('client-id', { uploadId: 'server-id', name: 'a.bin', fileHandle: { kind: 'file' } })
+        .then(() => { migrated = true; });
+    """)
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(operations)")) == [
+        ["put", "server-id"], ["delete", "client-id"]
+    ]
+    assert context.eval("transactions.length") == 1
+    assert context.eval("transactions[0].mode") == "readwrite"
+    assert context.eval("migrated") is False
+    context.eval("transactions[0].oncomplete()")
+    drain_jobs(context)
+    assert context.eval("migrated") is True
+
+
+def test_upload_sources_use_handles_and_progressive_picker_contract() -> None:
+    composer = read_web("js/composer.js")
+    app = read_web("js/app.js")
+    for token in (
+        "showOpenFilePicker",
+        "multiple: true",
+        "getAsFileSystemHandle",
+        "fileHandle: handle",
+        "error.name === 'AbortError'",
+    ):
+        assert token in composer
+    assert "await composer.pickFiles()" in app
+    assert "composerFileInput.click()" in app
+
+
+def test_composer_picker_and_drop_pass_real_handle_with_per_item_fallback() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.__modules['./api.js'] = { sendText: () => Promise.resolve({}) };
+      globalThis.enqueued = [];
+      globalThis.pickerOptions = null;
+      globalThis.fileA = { name: 'picker.bin', size: 1 };
+      globalThis.fileB = { name: 'drop.bin', size: 2 };
+      globalThis.fileC = { name: 'fallback.bin', size: 3 };
+      globalThis.handleA = { kind: 'file', getFile: () => Promise.resolve(fileA) };
+      globalThis.handleB = { kind: 'file', getFile: () => Promise.resolve(fileB) };
+      window.showOpenFilePicker = options => {
+        pickerOptions = options;
+        return Promise.resolve([handleA]);
+      };
+      globalThis.makeTarget = () => ({
+        handlers: {},
+        classList: { add() {}, remove() {} },
+        addEventListener(type, handler) { this.handlers[type] = handler; },
+        removeEventListener() {},
+      });
+      globalThis.textarea = makeTarget();
+      globalThis.dropTarget = makeTarget();
+      globalThis.uploadCoordinator = {
+        enqueueFiles(items) { enqueued.push(items); return []; },
+      };
+    """)
+    load_js_module(context, "./composer.js", read_web("js/composer.js"))
+    context.eval(r"""
+      globalThis.composer = __modules['./composer.js'].createComposer({
+        form: null, textarea, fileInput: null, dropTarget, api: () => Promise.resolve(),
+        timeline: {}, uploadCoordinator,
+      });
+      globalThis.pickerHandled = null;
+      composer.pickFiles().then(value => { pickerHandled = value; });
+    """)
+    drain_jobs(context)
+    assert context.eval("pickerHandled") is True
+    assert context.eval("pickerOptions.multiple") is True
+    assert context.eval("enqueued[0][0].file === fileA") is True
+    assert context.eval("enqueued[0][0].fileHandle === handleA") is True
+
+    context.eval(r"""
+      globalThis.dropPrevented = false;
+      dropTarget.handlers.drop({
+        preventDefault() { dropPrevented = true; },
+        dataTransfer: { items: [
+          { kind: 'file', getAsFileSystemHandle: () => Promise.resolve(handleB), getAsFile: () => null },
+          { kind: 'file', getAsFileSystemHandle: () => Promise.reject(new Error('unsupported')),
+            getAsFile: () => fileC },
+        ], files: [] },
+      });
+    """)
+    drain_jobs(context)
+    assert context.eval("dropPrevented") is True
+    assert context.eval("enqueued[1][0].file === fileB") is True
+    assert context.eval("enqueued[1][0].fileHandle === handleB") is True
+    assert context.eval("enqueued[1][1] === fileC") is True
+
+    context.eval(r"""
+      window.showOpenFilePicker = () => Promise.reject(Object.assign(new Error('cancelled'), { name: 'AbortError' }));
+      globalThis.cancelHandled = null;
+      composer.pickFiles().then(value => { cancelHandled = value; });
+    """)
+    drain_jobs(context)
+    assert context.eval("cancelHandled") is True
+
+
+def test_upload_controls_are_async_server_authoritative_contract() -> None:
+    coordinator = read_web("js/upload-coordinator.js")
+    app = read_web("js/app.js")
+    timeline = read_web("js/timeline.js")
+    for signature in ("async pause(uploadId)", "async resume(uploadId)", "async cancel(uploadId)"):
+        assert signature in coordinator
+    for token in (
+        "Promise.allSettled",
+        "pendingAction",
+        "TERMINAL_UPLOAD_STATUSES.has",
+        "task.status !== 'failed'",
+        "await raceWithDestroy(api.getUploadSession",
+    ):
+        assert token in coordinator
+    assert "await handler.call(uploadCoordinator, uploadId)" in app
+    assert "await uploadCoordinator.pauseAll()" in app
+    assert "upload.pendingAction" in timeline
+
+
+def test_upload_controls_wait_for_server_and_recover_authoritative_failure() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.controlCalls = [];
+      globalThis.controlResolvers = [];
+      globalThis.abortCalls = 0;
+      globalThis.removed = [];
+      globalThis.AbortController = class AbortController {
+        constructor() { this.signal = { aborted: false }; }
+        abort() { this.signal.aborted = true; abortCalls += 1; }
+      };
+      globalThis.cryptoObject = {
+        randomUUID: () => 'client-id',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'control.bin', size: 8, type: '', lastModified: 1,
+        slice(start, end) { return { size: end - start,
+          arrayBuffer: () => Promise.resolve(new Uint8Array(end - start).buffer) }; },
+      };
+      globalThis.api = {
+        createUploadSession: () => Promise.resolve({ upload_id: 'server-id', status: 'queued',
+          confirmed_parts: [], confirmed_bytes: 0, chunk_size_bytes: 4 }),
+        uploadPart: () => new Promise(() => {}),
+        controlUpload(_id, action) {
+          controlCalls.push(action);
+          return new Promise((resolve, reject) => controlResolvers.push({ action, resolve, reject }));
+        },
+        getUploadSession: () => Promise.resolve({ upload_id: 'server-id', status: 'paused',
+          confirmed_parts: [0], confirmed_bytes: 4, chunk_size_bytes: 4 }),
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve([]), put: () => Promise.resolve(),
+        migrate: () => Promise.resolve(),
+        remove(id) { removed.push(id); return Promise.resolve(); }, close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, chunkSize: 4, maxActive: 1,
+      });
+      coordinator.enqueueFiles([file]);
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      globalThis.pauseSettled = false;
+      coordinator.pause('server-id').then(() => { pauseSettled = true; });
+    """)
+    drain_jobs(context)
+    assert context.eval("pauseSettled") is False
+    assert context.eval("coordinator.getSnapshot()[0].pendingAction") == "pause"
+    assert context.eval("coordinator.getSnapshot()[0].status") == "uploading"
+    assert context.eval("abortCalls") == 1
+
+    context.eval("controlResolvers[0].resolve({ status: 'paused' })")
+    drain_jobs(context)
+    assert context.eval("pauseSettled") is True
+    assert context.eval("coordinator.getSnapshot()[0].status") == "paused"
+    assert context.eval("coordinator.getSnapshot()[0].pendingAction") is None
+
+    context.eval(r"""
+      globalThis.resumeRejected = null;
+      coordinator.resume('server-id').catch(error => { resumeRejected = error.message; });
+    """)
+    drain_jobs(context)
+    assert context.eval("coordinator.getSnapshot()[0].pendingAction") == "resume"
+    context.eval("controlResolvers[1].reject(new Error('resume denied'))")
+    drain_jobs(context)
+    assert context.eval("resumeRejected") == "resume denied"
+    assert context.eval("coordinator.getSnapshot()[0].status") == "paused"
+    assert json.loads(context.eval(
+        "JSON.stringify(coordinator.getSnapshot()[0].confirmedParts)"
+    )) == [0]
+    assert context.eval("coordinator.getSnapshot()[0].isSourceDevice") is True
+    context.eval(r"""
+      globalThis.secondResumeSettled = false;
+      coordinator.resume('server-id').then(() => { secondResumeSettled = true; });
+    """)
+    drain_jobs(context)
+    context.eval("controlResolvers[2].resolve({ status: 'queued' })")
+    drain_jobs(context)
+    assert context.eval("secondResumeSettled") is True
+    assert context.eval("coordinator.getSnapshot()[0].errorCode") is None
+
+
+def test_pending_control_revision_wins_over_stale_reconcile_snapshot() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.activeResolver = null;
+      globalThis.pauseResolver = null;
+      globalThis.rows = [];
+      globalThis.AbortController = class AbortController {
+        constructor() { this.signal = {}; }
+        abort() {}
+      };
+      globalThis.cryptoObject = {
+        randomUUID: () => 'client-revision',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'revision.bin', size: 4, type: '', lastModified: 1,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      };
+      globalThis.api = {
+        createUploadSession: () => Promise.resolve({ upload_id: 'server-revision', status: 'queued',
+          confirmed_parts: [], confirmed_bytes: 0, chunk_size_bytes: 4 }),
+        uploadPart: () => new Promise(() => {}),
+        listActiveUploads: () => new Promise(resolve => { activeResolver = resolve; }),
+        controlUpload: () => new Promise(resolve => { pauseResolver = resolve; }),
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve(rows.slice()),
+        put(record) { rows = rows.filter(row => row.uploadId !== record.uploadId); rows.push(record); return Promise.resolve(); },
+        migrate(oldKey, record) { rows = rows.filter(row => row.uploadId !== oldKey); rows.push(record); return Promise.resolve(); },
+        remove: () => Promise.resolve(), close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, chunkSize: 4,
+      });
+      coordinator.enqueueFiles([file]);
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      globalThis.reconcilePromise = coordinator.reconcile();
+      globalThis.pausePromise = coordinator.pause('server-revision');
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      activeResolver([{ upload_id: 'server-revision', client_request_id: 'client-revision',
+        original_name: 'revision.bin', size_bytes: 4, status: 'uploading', confirmed_parts: [],
+        confirmed_bytes: 0, chunk_size_bytes: 4 }]);
+    """)
+    drain_jobs(context)
+    assert context.eval("coordinator.getSnapshot()[0].pendingAction") == "pause"
+    context.eval("pauseResolver({ status: 'paused' })")
+    drain_jobs(context)
+    assert context.eval("coordinator.getSnapshot()[0].status") == "paused"
+    assert context.eval("coordinator.getSnapshot()[0].pendingAction") is None
+
+
+def test_prepare_pending_control_migrates_client_key_without_reload_ghost() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.createResolver = null;
+      globalThis.rows = [];
+      globalThis.migrations = [];
+      globalThis.cryptoObject = {
+        randomUUID: () => 'client-key',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'pending.bin', size: 4, type: '', lastModified: 1,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      };
+      globalThis.api = {
+        createUploadSession: () => new Promise(resolve => { createResolver = resolve; }),
+        controlUpload: () => Promise.resolve({ status: 'paused' }),
+        listActiveUploads: () => Promise.resolve([{ upload_id: 'server-key', original_name: 'pending.bin',
+          size_bytes: 4, status: 'paused', confirmed_parts: [], confirmed_bytes: 0,
+          chunk_size_bytes: 4 }]),
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve(rows.slice()),
+        put(record) {
+          rows = rows.filter(row => row.uploadId !== record.uploadId);
+          rows.push(record);
+          return Promise.resolve();
+        },
+        migrate(oldKey, record) {
+          migrations.push([oldKey, record.uploadId]);
+          rows = rows.filter(row => row.uploadId !== oldKey && row.uploadId !== record.uploadId);
+          rows.push(record);
+          return Promise.resolve();
+        },
+        remove: () => Promise.resolve(), close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, chunkSize: 4,
+      });
+      coordinator.enqueueFiles([file]);
+      globalThis.pausePromise = coordinator.pause('client-key');
+    """)
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(rows.map(row => row.uploadId))")) == ["client-key"]
+    context.eval(r"""
+      createResolver({ upload_id: 'server-key', status: 'queued', confirmed_parts: [],
+        confirmed_bytes: 0, chunk_size_bytes: 4 });
+    """)
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(migrations)")) == [["client-key", "server-key"]]
+    assert json.loads(context.eval("JSON.stringify(rows.map(row => row.uploadId))")) == ["server-key"]
+    context.eval("globalThis.reloadPromise = coordinator.reconcile()")
+    drain_jobs(context)
+    assert json.loads(context.eval(
+        "JSON.stringify(coordinator.getSnapshot().map(task => task.uploadId))"
+    )) == ["server-key"]
+
+
+def test_upload_created_at_is_normalized_to_iso_at_every_source() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.cryptoObject = {
+        randomUUID: () => 'new-id',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'new.bin', size: 1, type: '', lastModified: 1,
+        slice: () => ({ size: 1, arrayBuffer: () => Promise.resolve(new Uint8Array(1).buffer) }),
+      };
+      globalThis.api = {
+        listActiveUploads: () => Promise.resolve([
+          { upload_id: 'numeric', name: 'numeric.bin', size_bytes: 1, status: 'paused',
+            confirmed_parts: [], confirmed_bytes: 0, chunk_size_bytes: 1 },
+          { upload_id: 'numeric-string', name: 'string.bin', size_bytes: 1, status: 'paused',
+            confirmed_parts: [], confirmed_bytes: 0, chunk_size_bytes: 1 },
+        ]),
+        createUploadSession: () => new Promise(() => {}),
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve([
+          { uploadId: 'numeric', name: 'numeric.bin', sizeBytes: 1, status: 'paused',
+            confirmedParts: [], confirmedBytes: 0, isSourceDevice: true, createdAt: 1721433600000,
+            chunkSize: 1 },
+          { uploadId: 'numeric-string', name: 'string.bin', sizeBytes: 1, status: 'paused',
+            confirmedParts: [], confirmedBytes: 0, isSourceDevice: true, createdAt: '1721433601000',
+            chunkSize: 1 },
+        ]),
+        put: () => Promise.resolve(), remove: () => Promise.resolve(), close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, now: () => 1721433602000, chunkSize: 1,
+      });
+      coordinator.enqueueFiles([file]);
+      coordinator.reconcile();
+    """)
+    drain_jobs(context)
+    created = json.loads(context.eval(
+        "JSON.stringify(coordinator.getSnapshot().map(task => task.createdAt))"
+    ))
+    assert created == [
+        "2024-07-20T00:00:02.000Z",
+        "2024-07-20T00:00:00.000Z",
+        "2024-07-20T00:00:01.000Z",
+    ]
+    timeline = read_web("js/timeline.js")
+    assert "Number.isFinite(timestamp)" in timeline
+
+
 def test_upload_coordinator_reconcile_fetches_active_before_handles_and_restores_observers() -> None:
     context = create_js_context()
     context.eval(r"""

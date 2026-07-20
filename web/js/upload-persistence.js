@@ -5,7 +5,7 @@ const PERSISTED_FIELDS = [
   'uploadId', 'clientRequestId', 'fileHandle', 'identity', 'name', 'sizeBytes',
   'mimeType', 'status', 'confirmedParts', 'confirmedBytes', 'sourceDeviceId',
   'isSourceDevice', 'errorCode', 'errorMessage', 'createdAt',
-  'serverSequence', 'serverUpdatedAt', 'serverVersion',
+  'serverSequence', 'serverUpdatedAt', 'serverVersion', 'chunkSize',
 ];
 
 function closedError() {
@@ -85,33 +85,57 @@ export function createUploadPersistence({ indexedDB }) {
       transaction.onabort = rejectTransaction;
       transaction.onerror = rejectTransaction;
       try {
-        const request = operation(transaction.objectStore(STORE_NAME));
-        request.onsuccess = () => { result = request.result; };
-        request.onerror = () => {
-          requestError = request.error || new Error('IndexedDB request failed');
-        };
+        const operationResult = operation(transaction.objectStore(STORE_NAME));
+        const requests = Array.isArray(operationResult) ? operationResult : [operationResult];
+        requests.filter(Boolean).forEach(request => {
+          request.onsuccess = () => { result = request.result; };
+          request.onerror = () => {
+            requestError = request.error || new Error('IndexedDB request failed');
+          };
+        });
       } catch (error) {
+        try { transaction.abort(); } catch {}
         rejectOnce(error);
       }
     });
   };
 
+  const recordFor = task => {
+    const record = {};
+    PERSISTED_FIELDS.forEach(field => {
+      if (field !== 'fileHandle' && task[field] !== undefined) record[field] = task[field];
+    });
+    if (task.fileHandle !== undefined && task.fileHandle !== null) record.fileHandle = task.fileHandle;
+    return record;
+  };
+
+  const writeRecord = async record => {
+    try {
+      return await transact('readwrite', store => store.put(record));
+    } catch (error) {
+      if (closed || error.name !== 'DataCloneError'
+          || !Object.prototype.hasOwnProperty.call(record, 'fileHandle')) throw error;
+      const cloneableRecord = { ...record };
+      delete cloneableRecord.fileHandle;
+      return transact('readwrite', store => store.put(cloneableRecord));
+    }
+  };
+
   return {
     async put(task) {
-      const record = {};
-      PERSISTED_FIELDS.forEach(field => {
-        if (field !== 'fileHandle' && task[field] !== undefined) record[field] = task[field];
-      });
-      if (task.fileHandle !== undefined && task.fileHandle !== null) {
-        record.fileHandle = task.fileHandle;
-      }
+      return writeRecord(recordFor(task));
+    },
+    async migrate(previousUploadId, task) {
+      const record = recordFor(task);
+      if (!previousUploadId || previousUploadId === record.uploadId) return writeRecord(record);
       try {
-        return await transact('readwrite', store => store.put(record));
+        return await transact('readwrite', store => [store.put(record), store.delete(previousUploadId)]);
       } catch (error) {
         if (closed || error.name !== 'DataCloneError'
             || !Object.prototype.hasOwnProperty.call(record, 'fileHandle')) throw error;
-        delete record.fileHandle;
-        return transact('readwrite', store => store.put(record));
+        const cloneableRecord = { ...record };
+        delete cloneableRecord.fileHandle;
+        return transact('readwrite', store => [store.put(cloneableRecord), store.delete(previousUploadId)]);
       }
     },
     async getAll() {

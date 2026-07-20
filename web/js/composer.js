@@ -66,6 +66,22 @@ export function createComposer({ form, textarea, fileInput, dropTarget, api, tim
     event.target.value = '';
   }
 
+  async function pickFiles() {
+    if (typeof window.showOpenFilePicker !== 'function') return false;
+    try {
+      const handles = await window.showOpenFilePicker({ multiple: true });
+      const selected = await Promise.all(handles.map(async handle => ({
+        file: await handle.getFile(),
+        fileHandle: handle,
+      })));
+      enqueueFiles(selected);
+      return true;
+    } catch (error) {
+      if (error.name === 'AbortError') return true;
+      return false;
+    }
+  }
+
   function handleDragEnter(event) {
     event.preventDefault();
     dragCounter++;
@@ -85,11 +101,25 @@ export function createComposer({ form, textarea, fileInput, dropTarget, api, tim
     }
   }
 
-  function handleDrop(event) {
+  async function handleDrop(event) {
     event.preventDefault();
     dragCounter = 0;
     dropTarget.classList.remove('dragover');
-    enqueueFiles(Array.from(event.dataTransfer.files));
+    const items = Array.from(event.dataTransfer.items || []).filter(item => item.kind === 'file');
+    if (!items.length) {
+      enqueueFiles(Array.from(event.dataTransfer.files));
+      return;
+    }
+    const selected = await Promise.all(items.map(async item => {
+      if (typeof item.getAsFileSystemHandle === 'function') {
+        try {
+          const handle = await item.getAsFileSystemHandle();
+          if (handle?.kind === 'file') return { file: await handle.getFile(), fileHandle: handle };
+        } catch {}
+      }
+      return item.getAsFile();
+    }));
+    enqueueFiles(selected.filter(Boolean));
   }
 
   function handlePaste(event) {
@@ -142,6 +172,7 @@ export function createComposer({ form, textarea, fileInput, dropTarget, api, tim
 
   return {
     enqueueFiles,
+    pickFiles,
     destroy,
   };
 }
