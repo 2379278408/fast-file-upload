@@ -8,9 +8,28 @@ export class ApiError extends Error {
   }
 }
 const LAST_SEQ_KEY = 'transfer-last-sequence';
+const LEGACY_CURSOR_IGNORED_KEY = 'transfer-local-cursor-ignored-v1';
+
+function normalizeSequence(value) {
+  const sequence = Number(value);
+  return Number.isSafeInteger(sequence) && sequence >= 0 ? sequence : 0;
+}
+
+function ignoreLegacyCursorOnce() {
+  try {
+    if (sessionStorage.getItem(LEGACY_CURSOR_IGNORED_KEY)) return;
+    localStorage.getItem(LAST_SEQ_KEY);
+    sessionStorage.setItem(LEGACY_CURSOR_IGNORED_KEY, '1');
+  } catch {}
+}
+
+function storeLastSequence(sequence) {
+  try { sessionStorage.setItem(LAST_SEQ_KEY, String(sequence)); } catch {}
+}
 
 export function connectEvents({ after, onEvent, onStatus }) {
   let attempt = 0, stopped = false, socket, reconnectTimer = null;
+  let lastAppliedSequence = normalizeSequence(after());
   const clearReconnectTimer = () => {
     if (reconnectTimer === null) return;
     window.clearTimeout(reconnectTimer);
@@ -20,8 +39,7 @@ export function connectEvents({ after, onEvent, onStatus }) {
     if (stopped) return;
     clearReconnectTimer();
     onStatus(attempt ? 'reconnecting' : 'connecting');
-    const seq = after();
-    socket = new WebSocket(`${location.origin.replace(/^http/, 'ws')}/api/events?after=${seq}`);
+    socket = new WebSocket(`${location.origin.replace(/^http/, 'ws')}/api/events?after=${lastAppliedSequence}`);
     socket.onopen = () => {
       if (stopped) return;
       clearReconnectTimer();
@@ -32,7 +50,11 @@ export function connectEvents({ after, onEvent, onStatus }) {
       const event = JSON.parse(message.data);
       const applied = onEvent(event);
       if (applied === true && event.sequence !== undefined) {
-        try { localStorage.setItem(LAST_SEQ_KEY, String(event.sequence)); } catch {}
+        const sequence = normalizeSequence(event.sequence);
+        if (sequence > lastAppliedSequence) {
+          lastAppliedSequence = sequence;
+          storeLastSequence(sequence);
+        }
       }
     };
     socket.onclose = event => {
@@ -63,7 +85,8 @@ export function connectEvents({ after, onEvent, onStatus }) {
 }
 
 export function getLastSequence() {
-  try { return Number(localStorage.getItem(LAST_SEQ_KEY) || 0) || 0; } catch { return 0; }
+  ignoreLegacyCursorOnce();
+  try { return normalizeSequence(sessionStorage.getItem(LAST_SEQ_KEY)); } catch { return 0; }
 }
 
 export async function request(path, options = {}) {

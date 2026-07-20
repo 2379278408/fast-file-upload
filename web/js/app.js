@@ -24,6 +24,18 @@ function listen(target, type, listener, options) {
   appListenerCleanups.push(() => target.removeEventListener(type, listener, options));
 }
 
+export function createLiveRegionAnnouncer(region) {
+  let sequence = 0;
+  return message => {
+    if (!region || !message) return false;
+    const announcement = document.createElement('span');
+    announcement.dataset.announcementSequence = String(++sequence);
+    announcement.textContent = message;
+    region.replaceChildren(announcement);
+    return true;
+  };
+}
+
 export function captureTimelinePosition(container) {
   if (!container) return null;
   const scrollTop = container.scrollTop;
@@ -333,13 +345,12 @@ listen(window, 'session-logout', async () => {
 const timelineContainer = document.getElementById('timelineContainer');
 const newMessageButton = document.getElementById('newMessageButton');
 const uploadLiveRegion = document.getElementById('uploadLiveRegion');
+const announceUpload = createLiveRegionAnnouncer(uploadLiveRegion);
 const uploadPersistence = createUploadPersistence({ indexedDB: window.indexedDB });
 const uploadCoordinator = createUploadCoordinator({
   api: resumableApi,
   persistence: uploadPersistence,
-  onAnnounce(message) {
-    if (uploadLiveRegion) uploadLiveRegion.textContent = message;
-  },
+  onAnnounce: announceUpload,
   onCompleted(message) {
     timeline.upsert?.(message);
   },
@@ -708,13 +719,23 @@ function updateConnectionStatus(status) {
 function applyIncomingEvent(event) {
   if (appDestroyed || !event) return false;
   if (event.event_type?.startsWith('upload.')) {
-    uploadCoordinator.applyRemoteEvent(event);
+    return uploadCoordinator.applyRemoteEvent(event);
   }
-  timeline.mergeEvent(event);
-  if (library && typeof library.applyEvent === 'function') {
-    library.applyEvent(event);
+  if (event.event_type?.startsWith('message.')) {
+    const applied = timeline.mergeEvent(event);
+    if (library && typeof library.applyEvent === 'function') library.applyEvent(event);
+    return applied;
   }
-  return true;
+  if (event.event_type?.startsWith('file.')) {
+    const timelineApplied = timeline.mergeEvent(event);
+    const libraryApplied = library && typeof library.applyEvent === 'function'
+      ? library.applyEvent(event)
+      : false;
+    return event.event_type === 'file.finalized'
+      ? timelineApplied === true && libraryApplied === true
+      : libraryApplied === true;
+  }
+  return false;
 }
 
 function startEventConnection() {

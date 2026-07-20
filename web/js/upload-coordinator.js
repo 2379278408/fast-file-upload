@@ -171,22 +171,30 @@ export function createUploadCoordinator({
   const pendingWorkers = new Set();
 
   const announceTask = task => {
-    if (typeof onAnnounce !== 'function') return;
+    if (typeof onAnnounce !== 'function') return false;
+    let stateAnnouncement = null;
     if (task.announcedStatus === undefined) {
       task.announcedStatus = task.status;
     } else if (task.announcedStatus !== task.status) {
       task.announcedStatus = task.status;
-      try { onAnnounce(`${task.name} ${UPLOAD_STATUS_LABELS[task.status] || task.status}`); } catch {}
+      stateAnnouncement = `${task.name} ${UPLOAD_STATUS_LABELS[task.status] || task.status}`;
     }
     const milestone = LIVE_MILESTONES.filter(value => task.progressPercent >= value).pop() || 0;
     const lastMilestone = task.announcedMilestone || 0;
     const lastAt = task.progressAnnouncementAt ?? Number.NEGATIVE_INFINITY;
     const currentTime = now();
+    let progressAnnouncement = null;
     if (milestone > lastMilestone && currentTime - lastAt >= UPLOAD_ANNOUNCEMENT_INTERVAL_MS) {
       task.announcedMilestone = milestone;
       task.progressAnnouncementAt = currentTime;
-      try { onAnnounce(`${task.name} 上传进度 ${milestone}%`); } catch {}
+      progressAnnouncement = `上传进度 ${milestone}%`;
     }
+    const announcement = [stateAnnouncement, progressAnnouncement].filter(Boolean).join('，');
+    if (announcement) {
+      try { onAnnounce(stateAnnouncement ? announcement : `${task.name} ${announcement}`); } catch {}
+      return true;
+    }
+    return false;
   };
 
   const snapshot = () => Object.freeze(tasks.map(publicTask));
@@ -200,7 +208,7 @@ export function createUploadCoordinator({
   };
   const notify = (token = generation) => {
     if (!isCurrent(token)) return;
-    tasks.forEach(announceTask);
+    tasks.some(announceTask);
     const value = snapshot();
     for (const listener of listeners) {
       if (!isCurrent(token)) break;
@@ -766,7 +774,7 @@ export function createUploadCoordinator({
           task = observerTask(payload);
           tasks.push(task);
         } else if (!isFreshEvent(task, payload)) {
-          return false;
+          return true;
         }
         if (remoteUploadId) task.uploadId = remoteUploadId;
         if (remoteClientRequestId) task.clientRequestId = remoteClientRequestId;

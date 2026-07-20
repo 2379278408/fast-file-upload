@@ -495,7 +495,8 @@ export function createLibrary({ root, api, timeline, onAttach = () => {}, onLoca
   }
 
   function applyEvent(event) {
-    if (destroyed || !event) return;
+    if (destroyed || !event) return false;
+    let applied = true;
     switch (event.event_type) {
       case 'message.created':
       case 'message.restored': {
@@ -527,7 +528,8 @@ export function createLibrary({ root, api, timeline, onAttach = () => {}, onLoca
         renderFiles();
         break;
       }
-      case 'file.deleted': {
+      case 'file.deleted':
+      case 'file.purged': {
         const fileId = event.entity_id;
         const removed = filesState.filter((message) => message.file && message.file.id === fileId);
         filesState = filesState.filter((message) => !message.file || message.file.id !== fileId);
@@ -545,7 +547,10 @@ export function createLibrary({ root, api, timeline, onAttach = () => {}, onLoca
         renderFiles();
         break;
       }
+      default:
+        applied = false;
     }
+    return applied;
   }
 
   async function batchDownload() {

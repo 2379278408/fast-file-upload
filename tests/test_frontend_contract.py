@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from html.parser import HTMLParser
+import itertools
 from pathlib import Path
 import re
 
@@ -281,6 +282,13 @@ class Element {
     node.parentNode = this.parentNode;
     this.parentNode.children[index] = node;
   }
+  replaceChildren(...nodes) {
+    this.children.forEach(child => { child.parentNode = null; });
+    this.children = [];
+    this._textContent = '';
+    this._innerHTML = '';
+    this.append(...nodes);
+  }
   remove() { if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(child => child !== this); }
   setAttribute(name, value) { this.attributes[name] = String(value); this[name] = String(value); }
   getAttribute(name) { return this.attributes[name] ?? null; }
@@ -389,7 +397,8 @@ globalThis.setTimeout = window.setTimeout;
 globalThis.location = { origin: 'http://testserver', hash: '' };
 globalThis.history = { replaceState(_state, _title, hash) { location.hash = hash; } };
 globalThis.navigator = { clipboard: { writeText: () => Promise.resolve() } };
-globalThis.localStorage = { values: {}, getItem(key) { return this.values[key] || null; }, setItem(key, value) { this.values[key] = String(value); } };
+globalThis.localStorage = { values: {}, getItem(key) { return this.values[key] || null; }, setItem(key, value) { this.values[key] = String(value); }, removeItem(key) { delete this.values[key]; } };
+globalThis.sessionStorage = { values: {}, getItem(key) { return this.values[key] || null; }, setItem(key, value) { this.values[key] = String(value); }, removeItem(key) { delete this.values[key]; } };
 globalThis.crypto = { randomUUID: () => '00000000-0000-4000-8000-000000000001' };
 globalThis.CustomEvent = class CustomEvent { constructor(type, options = {}) { this.type = type; this.detail = options.detail; } };
 globalThis.URLSearchParams = class URLSearchParams { constructor() { this.values = []; } set(key, value) { this.values.push([key, value]); } toString() { return this.values.map(item => item.join('=')).join('&'); } };
@@ -2128,6 +2137,64 @@ def test_timeline_upload_projection_replaces_card_without_duplicate() -> None:
     assert context.eval("container.querySelectorAll('.timeline-date-separator').length") == 1
 
 
+@pytest.mark.parametrize(
+    "order",
+    list(itertools.permutations(("rest", "upload_completed", "message_created"))),
+)
+def test_timeline_completion_routes_converge_to_one_permanent_dom(order: tuple[str, ...]) -> None:
+    context = create_js_context()
+    context.set("completionOrder", json.dumps(order))
+    load_js_module(context, "./timeline.js", read_web("js/timeline.js"))
+    context.eval(r"""
+      globalThis.container = document.createElement('div');
+      globalThis.timeline = __modules['./timeline.js'].createTimeline({
+        container, newMessageButton: null, api: () => Promise.resolve({ items: [] }),
+        onRestore: () => {}, onUploadAction: () => {},
+      });
+      globalThis.upload = {
+        uploadId: 'upload-order', clientRequestId: 'request-order', name: 'ordered.txt',
+        sizeBytes: 4, status: 'uploading', confirmedBytes: 2, progressPercent: 50,
+        isSourceDevice: true,
+      };
+      globalThis.message = {
+        id: 'message-order', upload_id: 'upload-order', client_request_id: 'request-order',
+        created_at: '2026-07-20T00:00:00Z',
+        file: { id: 'upload-order', name: 'ordered.txt', size: '4 B', download_url: '/download/upload-order' },
+      };
+      timeline.upsertUpload(upload);
+      const operations = {
+        rest: () => timeline.upsert(message),
+        upload_completed: () => timeline.upsertUpload({ ...upload, status: 'completed', confirmedBytes: 4, progressPercent: 100 }),
+        message_created: () => timeline.mergeEvent({ sequence: 31, event_type: 'message.created', entity_id: message.id, payload: message }),
+      };
+      JSON.parse(completionOrder).forEach(name => operations[name]());
+    """)
+    assert context.eval("container.querySelectorAll('[data-message-id=\"message-order\"]').length") == 1
+    assert context.eval("container.querySelectorAll('[data-upload-id=\"upload-order\"]').length") == 0
+    assert context.eval("container.querySelectorAll('.timeline-message').length") == 1
+
+
+def test_timeline_duplicate_sequence_is_a_successful_idempotent_application() -> None:
+    context = create_js_context()
+    load_js_module(context, "./timeline.js", read_web("js/timeline.js"))
+    context.eval(r"""
+      globalThis.container = document.createElement('div');
+      globalThis.timeline = __modules['./timeline.js'].createTimeline({
+        container, newMessageButton: null, api: () => Promise.resolve({ items: [] }),
+        onRestore: () => {},
+      });
+      globalThis.event = {
+        sequence: 41, event_type: 'message.created', entity_id: 'idempotent-message',
+        payload: { body: 'once', created_at: '2026-07-20T00:00:00Z' },
+      };
+      globalThis.firstApplied = timeline.mergeEvent(event);
+      globalThis.replayApplied = timeline.mergeEvent(event);
+    """)
+    assert context.eval("firstApplied") is True
+    assert context.eval("replayApplied") is True
+    assert context.eval("container.querySelectorAll('[data-message-id=\"idempotent-message\"]').length") == 1
+
+
 def test_upload_cards_render_text_states_metrics_and_observer_permissions() -> None:
     context = create_js_context()
     load_js_module(context, "./timeline.js", read_web("js/timeline.js"))
@@ -2530,46 +2597,92 @@ def test_upload_coordinator_observer_guidance_terminal_order_and_remote_cancel_a
     drain_jobs(context)
     context.eval(r"""
       coordinator.applyRemoteEvent({ event_type: 'upload.cancelled', sequence: 10, payload: { upload_id: 'source', status: 'cancelled', updated_at: '2026-07-20T00:00:00Z' } });
-      coordinator.applyRemoteEvent({ event_type: 'upload.progress', sequence: 11, payload: { upload_id: 'source', status: 'uploading', confirmed_bytes: 4, updated_at: '2026-07-20T00:00:01Z' } });
+      globalThis.staleTerminalHandled = coordinator.applyRemoteEvent({ event_type: 'upload.progress', sequence: 11, payload: { upload_id: 'source', status: 'uploading', confirmed_bytes: 4, updated_at: '2026-07-20T00:00:01Z' } });
       coordinator.applyRemoteEvent({ event_type: 'upload.created', sequence: 12, payload: { upload_id: 'observer', original_name: 'remote.bin', size_bytes: 4, status: 'paused' } });
       coordinator.pause('observer');
       coordinator.resume('observer');
     """)
     assert context.eval("abortCalls") == 1
+    assert context.eval("staleTerminalHandled") is True
     assert context.eval("coordinator.getSnapshot().find(task => task.uploadId === 'source').status") == "cancelled"
     assert context.eval("coordinator.getSnapshot().find(task => task.uploadId === 'observer').errorCode") == "source_device_required"
     assert context.eval("coordinator.getSnapshot().find(task => task.uploadId === 'observer').errorMessage") == "源设备控制暂停和继续"
 
 
-def test_upload_live_region_announcements_are_stateful_coarse_and_throttled() -> None:
+def test_upload_live_region_combines_state_and_milestone_in_one_dom_announcement() -> None:
     context = create_js_context()
     context.eval(r"""
       globalThis.clock = 0;
-      globalThis.announcements = [];
+      globalThis.announcementCalls = 0;
       globalThis.cryptoObject = { randomUUID: () => 'unused', subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) } };
       globalThis.persistence = { getAll: () => Promise.resolve([]), put: () => Promise.resolve(), remove: () => Promise.resolve(), close: () => {} };
       globalThis.api = {};
+      globalThis.__modules['./api.js'] = {
+        request: () => Promise.resolve({}), unlock: () => Promise.resolve({}), logout: () => Promise.resolve({}),
+        getSession: () => Promise.reject(new Error('locked')), ApiError: class ApiError extends Error {},
+        connectEvents: () => ({ close() {} }), getLastSequence: () => 0,
+      };
+      globalThis.__modules['./timeline.js'] = { createTimeline: () => ({
+        loadInitial: () => Promise.resolve(), upsertUpload() {}, mergeEvent: () => true, focusMessage() {}, destroy() {},
+      }) };
+      globalThis.__modules['./composer.js'] = { createComposer: () => ({ destroy() {} }) };
+      globalThis.__modules['./upload-persistence.js'] = { createUploadPersistence: () => persistence };
+      globalThis.__modules['./library.js'] = { createLibrary: () => ({ load: () => Promise.resolve(), clearSelection() {}, applyEvent: () => true, destroy() {} }) };
+      globalThis.__modules['./navigation.js'] = { createNavigation: () => ({ start() {}, navigate: () => Promise.resolve(), destroy() {} }) };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    load_js_module(context, "./app.js", read_web("js/app.js"))
+    drain_jobs(context)
+    context.eval(r"""
+      globalThis.region = document.getElementById('uploadLiveRegion');
+      globalThis.announceToRegion = __modules['./app.js'].createLiveRegionAnnouncer(region);
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, now: () => clock,
+        onAnnounce: message => { announcementCalls += 1; announceToRegion(message); },
+      });
+      coordinator.applyRemoteEvent({ event_type: 'upload.created', sequence: 1, payload: { upload_id: 'remote', original_name: 'remote.bin', size_bytes: 100, status: 'queued', confirmed_bytes: 0 } });
+      clock = 1000;
+      coordinator.applyRemoteEvent({ event_type: 'upload.progress', sequence: 2, payload: { upload_id: 'remote', status: 'uploading', confirmed_bytes: 25 } });
+      globalThis.combinedText = region.children[0].textContent;
+      globalThis.firstNode = region.children[0];
+      announceToRegion(combinedText);
+      globalThis.repeatedNode = region.children[0];
+    """)
+    assert context.eval("announcementCalls") == 1
+    assert "上传中" in context.eval("combinedText")
+    assert "25%" in context.eval("combinedText")
+    assert context.eval("firstNode !== repeatedNode") is True
+    assert context.eval("region.children.length") == 1
+
+
+def test_upload_notify_announces_at_most_one_task_per_reconcile() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.announcements = [];
+      globalThis.cryptoObject = { randomUUID: () => 'unused', subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) } };
+      globalThis.remote = [
+        { upload_id: 'one', original_name: 'one.bin', size_bytes: 100, status: 'uploading', confirmed_bytes: 25, confirmed_parts: [] },
+        { upload_id: 'two', original_name: 'two.bin', size_bytes: 100, status: 'uploading', confirmed_bytes: 50, confirmed_parts: [] },
+      ];
+      globalThis.records = remote.map(item => ({
+        uploadId: item.upload_id, name: item.original_name, sizeBytes: item.size_bytes,
+        status: 'queued', confirmedBytes: 0, confirmedParts: [], isSourceDevice: false,
+      }));
+      globalThis.api = { listActiveUploads: () => Promise.resolve(remote) };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve(records), put: () => Promise.resolve(),
+        remove: () => Promise.resolve(), close: () => {},
+      };
     """)
     load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
     context.eval(r"""
       globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
-        api, persistence, cryptoObject, now: () => clock,
-        onAnnounce: message => announcements.push(message),
+        api, persistence, cryptoObject, onAnnounce: message => announcements.push(message),
       });
-      coordinator.applyRemoteEvent({ event_type: 'upload.created', sequence: 1, payload: { upload_id: 'remote', original_name: 'remote.bin', size_bytes: 100, status: 'queued', confirmed_bytes: 0 } });
-      coordinator.applyRemoteEvent({ event_type: 'upload.progress', sequence: 2, payload: { upload_id: 'remote', status: 'queued', confirmed_bytes: 25 } });
-      clock = 100;
-      coordinator.applyRemoteEvent({ event_type: 'upload.progress', sequence: 3, payload: { upload_id: 'remote', status: 'queued', confirmed_bytes: 50 } });
-      clock = 1100;
-      coordinator.applyRemoteEvent({ event_type: 'upload.progress', sequence: 4, payload: { upload_id: 'remote', status: 'queued', confirmed_bytes: 50 } });
-      coordinator.applyRemoteEvent({ event_type: 'upload.state_changed', sequence: 5, payload: { upload_id: 'remote', status: 'paused', confirmed_bytes: 50 } });
+      coordinator.reconcile();
     """)
-    announcements = json.loads(context.eval("JSON.stringify(announcements)"))
-    assert any("25%" in message for message in announcements)
-    assert any("50%" in message for message in announcements)
-    assert sum("50%" in message for message in announcements) == 1
-    assert any("已暂停" in message for message in announcements)
-    assert all("10%" not in message for message in announcements)
+    drain_jobs(context)
+    assert context.eval("announcements.length") == 1
 
 
 def test_upload_coordinator_limits_active_files_and_one_part_per_file() -> None:
@@ -4124,36 +4237,52 @@ def test_timeline_retries_event_after_first_dom_application_failure() -> None:
     }
 
 
-def test_connect_events_persists_sequence_only_after_successful_application() -> None:
+def test_connect_events_uses_per_tab_cursor_and_advances_only_after_successful_application() -> None:
     context = create_js_context()
     context.eval(r"""
       globalThis.webSockets = [];
+      globalThis.reconnectCallback = null;
+      window.setTimeout = callback => { reconnectCallback = callback; return 1; };
       globalThis.WebSocket = class WebSocket {
         constructor(url) { this.url = url; webSockets.push(this); }
         close() {}
       };
+      localStorage.setItem('transfer-last-sequence', '999');
+      sessionStorage.setItem('transfer-last-sequence', '3');
     """)
     load_js_module(context, "./api.js", read_web("js/api.js"))
     context.eval(r"""
       globalThis.applyAttempts = 0;
-      __modules['./api.js'].connectEvents({
-        after: () => 0,
+      globalThis.connection = __modules['./api.js'].connectEvents({
+        after: () => __modules['./api.js'].getLastSequence(),
         onEvent: () => (++applyAttempts > 1),
         onStatus: () => {},
       });
       const message = { data: JSON.stringify({ sequence: 9, event_type: 'message.created' }) };
       webSockets[0].onmessage(message);
-      globalThis.sequenceAfterFailure = localStorage.getItem('transfer-last-sequence');
+      globalThis.sequenceAfterFailure = sessionStorage.getItem('transfer-last-sequence');
       webSockets[0].onmessage(message);
-      globalThis.sequenceAfterSuccess = localStorage.getItem('transfer-last-sequence');
+      globalThis.sequenceAfterSuccess = sessionStorage.getItem('transfer-last-sequence');
+      webSockets[0].onclose({ code: 1006 });
+      reconnectCallback();
     """)
     result = json.loads(context.eval(r"""
-      JSON.stringify({ sequenceAfterFailure, sequenceAfterSuccess, applyAttempts });
+      JSON.stringify({
+        initialUrl: webSockets[0].url,
+        reconnectUrl: webSockets[1].url,
+        sequenceAfterFailure,
+        sequenceAfterSuccess,
+        legacySequence: localStorage.getItem('transfer-last-sequence'),
+        applyAttempts,
+      });
     """))
 
     assert result == {
-        "sequenceAfterFailure": None,
+        "initialUrl": "ws://testserver/api/events?after=3",
+        "reconnectUrl": "ws://testserver/api/events?after=9",
+        "sequenceAfterFailure": "3",
         "sequenceAfterSuccess": "9",
+        "legacySequence": "999",
         "applyAttempts": 2,
     }
 

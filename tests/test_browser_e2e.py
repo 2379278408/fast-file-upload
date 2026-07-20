@@ -1152,6 +1152,65 @@ def test_upload_refresh_reselect_rejects_mismatch_and_sends_missing_parts_only(
     _assert_browser_clean(browser_session)
 
 
+def test_event_cursor_is_per_tab_and_reconnect_replays_that_tabs_gap(
+    browser_session: BrowserSession,
+) -> None:
+    page_a = browser_session.page
+    context = browser_session.context
+    _open_locked_application(browser_session)
+    _unlock(page_a)
+    expect(page_a.locator("#connectionStatus")).to_have_text("已连接", timeout=10_000)
+
+    page_b = context.new_page()
+    page_b_websockets: list[str] = []
+    page_b.on("websocket", lambda websocket: page_b_websockets.append(websocket.url))
+    try:
+        page_b.goto("/", wait_until="domcontentloaded")
+        expect(page_b.locator("#mainContent")).to_be_visible(timeout=10_000)
+        expect(page_b.locator("#connectionStatus")).to_have_text("已连接", timeout=10_000)
+        page_b.evaluate(
+            "window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }))"
+        )
+
+        response = context.request.post(
+            f"{browser_session.base_url}/api/messages",
+            data={
+                "body": "tab-specific replay",
+                "client_request_id": "tab-specific-replay",
+            },
+        )
+        assert response.ok
+        message_id = response.json()["id"]
+        expect(page_a.locator(f'[data-message-id="{message_id}"]')).to_be_visible(timeout=10_000)
+        page_a.wait_for_function(
+            "Number(sessionStorage.getItem('transfer-last-sequence') || 0) > 0"
+        )
+        cursor_a = page_a.evaluate(
+            "Number(sessionStorage.getItem('transfer-last-sequence') || 0)"
+        )
+        cursor_b_before = page_b.evaluate(
+            "Number(sessionStorage.getItem('transfer-last-sequence') || 0)"
+        )
+        assert cursor_b_before < cursor_a
+        expect(page_b.locator(f'[data-message-id="{message_id}"]')).to_have_count(0)
+
+        websocket_count = len(page_b_websockets)
+        page_b.evaluate(
+            "window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }))"
+        )
+        expect(page_b.locator(f'[data-message-id="{message_id}"]')).to_be_visible(timeout=10_000)
+        page_b.wait_for_function(
+            "expected => Number(sessionStorage.getItem('transfer-last-sequence') || 0) >= expected",
+            arg=cursor_a,
+        )
+        assert len(page_b_websockets) > websocket_count
+        assert page_b_websockets[-1].endswith(f"after={cursor_b_before}")
+        assert page_b.locator(f'[data-message-id="{message_id}"]').count() == 1
+    finally:
+        page_b.close()
+    _assert_browser_clean(browser_session)
+
+
 def test_observer_can_cancel_and_remote_cancellation_reaches_both_pages(
     browser_session: BrowserSession, chromium_browser: Browser, tmp_path: Path
 ) -> None:
@@ -1161,15 +1220,44 @@ def test_observer_can_cancel_and_remote_cancellation_reaches_both_pages(
     _open_locked_application(browser_session)
     _unlock(source_page)
     expect(source_page.locator("#connectionStatus")).to_have_text("已连接", timeout=10_000)
-    source_page.route("**/api/uploads/*/parts/0", lambda route: route.abort())
-    source_page.locator("#composerFileInput").set_input_files(source_file)
-    active = _wait_for_active_upload(
-        browser_session.context,
-        browser_session.base_url,
-        lambda upload: upload.get("original_name") == source_file.name,
+    cdp = browser_session.context.new_cdp_session(source_page)
+    cdp.send("Network.enable")
+    cdp.send(
+        "Network.emulateNetworkConditions",
+        {
+            "offline": False,
+            "latency": 0,
+            "downloadThroughput": -1,
+            "uploadThroughput": 32 * 1024,
+            "connectionType": "cellular3g",
+        },
     )
-    upload_id = str(active["upload_id"])
-    expect(source_page.locator(f'[data-upload-id="{upload_id}"]')).to_be_visible()
+    sent_parts: list[int] = []
+    failed_requests: list[str] = []
+    finished_requests: list[str] = []
+
+    def part_index(request: object) -> int | None:
+        match = re.search(r"/parts/(\d+)$", request.url)  # type: ignore[attr-defined]
+        return int(match.group(1)) if match else None
+
+    source_page.on(
+        "request",
+        lambda request: sent_parts.append(index)
+        if (index := part_index(request)) is not None
+        else None,
+    )
+    source_page.on(
+        "requestfailed",
+        lambda request: failed_requests.append(request.url)  # type: ignore[attr-defined]
+        if part_index(request) is not None
+        else None,
+    )
+    source_page.on(
+        "requestfinished",
+        lambda request: finished_requests.append(request.url)  # type: ignore[attr-defined]
+        if part_index(request) is not None
+        else None,
+    )
 
     observer_context = chromium_browser.new_context(
         base_url=browser_session.base_url,
@@ -1177,6 +1265,17 @@ def test_observer_can_cancel_and_remote_cancellation_reaches_both_pages(
     )
     observer_page = observer_context.new_page()
     try:
+        with source_page.expect_request(
+            lambda request: request.method == "PUT" and part_index(request) == 0,
+            timeout=60_000,
+        ) as pending_request_info:
+            source_page.locator("#composerFileInput").set_input_files(source_file)
+        pending_request = pending_request_info.value
+        upload_id = pending_request.url.split("/api/uploads/", 1)[1].split("/", 1)[0]
+        expect(source_page.locator(f'[data-upload-id="{upload_id}"]')).to_be_visible()
+        assert pending_request.url not in finished_requests
+        assert pending_request.url not in failed_requests
+
         observer_page.goto("/", wait_until="domcontentloaded")
         _unlock(observer_page)
         expect(observer_page.locator("#connectionStatus")).to_have_text("已连接", timeout=10_000)
@@ -1208,10 +1307,26 @@ def test_observer_can_cancel_and_remote_cancellation_reaches_both_pages(
               })
             """)
             raise AssertionError(f"source did not apply cancellation: {details!r}") from error
+        for _ in range(200):
+            if pending_request.url in failed_requests:
+                break
+            source_page.wait_for_timeout(25)
+        assert pending_request.url in failed_requests
+        assert pending_request.url not in finished_requests
+        source_page.wait_for_timeout(250)
+        assert sent_parts == [0]
     finally:
         observer_context.close()
-    browser_session.console_messages[:] = [
-        message for message in browser_session.console_messages
-        if "net::ERR_FAILED" not in message
-    ]
+        cdp.send(
+            "Network.emulateNetworkConditions",
+            {
+                "offline": False,
+                "latency": 0,
+                "downloadThroughput": -1,
+                "uploadThroughput": -1,
+                "connectionType": "none",
+            },
+        )
+        cdp.send("Network.disable")
+        cdp.detach()
     _assert_browser_clean(browser_session)

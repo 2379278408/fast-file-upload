@@ -537,7 +537,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
 
   function mergeEvent(event) {
     if (destroyed || !event) return false;
-    if (appliedSequences.has(event.sequence)) return false;
+    if (appliedSequences.has(event.sequence)) return true;
     let payload = event.payload;
     if (typeof payload === 'string') {
       try {
