@@ -288,10 +288,13 @@ class ChunkStorage:
         self, session: Mapping[str, object], *, published: bool
     ) -> PendingFile:
         upload_id = str(session["upload_id"])
+        _validate_key(upload_id, 0)
         safe_name = sanitize_filename(str(session["original_name"]))
         storage_name = f"{upload_id}_{safe_name}"
         temporary_path = self._session_dir(upload_id) / "final.uploading"
         final_path = self.upload_dir / storage_name
+        if final_path.parent != self.upload_dir or final_path.name != storage_name:
+            raise PartIntegrityError("Assembled upload path is invalid")
         source_path = final_path if published else temporary_path
         if source_path.is_symlink():
             raise PartIntegrityError("Assembled upload cannot be a symbolic link")

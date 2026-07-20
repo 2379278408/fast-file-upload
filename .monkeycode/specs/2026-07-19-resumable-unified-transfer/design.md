@@ -138,7 +138,9 @@ Startup recovery reconciles SQLite and disk state:
 
 The periodic maintenance loop reuses the same expiry and cleanup operation.
 
-Cancellation commits the durable `cancelled` mutation before temporary cleanup. Cleanup failures are logged and leave the successful cancellation response unchanged; startup and periodic maintenance retry cancelled and expired residual cleanup. Every recovery change to confirmed parts, status, error code, or publication state creates its state event in the same database transaction. Lifespan broadcasts those committed mutations in global event-sequence order.
+Cancellation commits the durable `cancelled` mutation before temporary cleanup. Cleanup failures are logged and leave the successful cancellation response unchanged; startup and periodic maintenance retry cancelled and expired residual cleanup. A successful file rename can precede persistence of `file_published`, leaving durable state at `assembled`. Terminal cleanup therefore reconstructs the exact final name from durable upload identity and filename, constrains it to `UPLOAD_DIR`, and verifies its durable size and digest before deletion. Files that fail any proof remain untouched.
+
+Completed messages and final files remain authoritative even when resumable-directory cleanup fails. Startup recovery retries that cleanup for complete sessions, while periodic maintenance safely scans valid non-symlink resumable directories and selects matching complete sessions without changing their message or final file. Every recovery change to confirmed parts, status, error code, or publication state creates its state event in the same database transaction. Lifespan broadcasts those committed mutations in global event-sequence order.
 
 ## API Design
 

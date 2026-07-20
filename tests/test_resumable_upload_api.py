@@ -945,8 +945,11 @@ def test_cancel_file_published_session_removes_unavailable_final_file(
     assert not final_path.exists()
 
 
-def test_restart_finishes_cancelled_file_published_cleanup(
-    settings: Settings, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("durable_state", ("assembled", "file_published"))
+def test_restart_finishes_cancelled_publication_cleanup(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    durable_state: str,
 ) -> None:
     content = b"restart-cancel-cleanup"
     app = create_app(settings)
@@ -961,16 +964,33 @@ def test_restart_finishes_cancelled_file_published_cleanup(
         ).status_code == 200
         upload = create_upload(client, content=content)
         put_single_part(client, upload, content)
-        monkeypatch.setattr(
-            app.state.upload_repository,
-            "finalize_publication",
-            lambda *args, **kwargs: (_ for _ in ()).throw(
-                RuntimeError("injected database finalization failure")
-            ),
-        )
+        if durable_state == "assembled":
+            original_set_state = app.state.upload_repository.set_publication_state
+
+            def fail_file_published(*args, **kwargs):
+                if args[1] == "file_published":
+                    raise RuntimeError("injected state write failure after rename")
+                return original_set_state(*args, **kwargs)
+
+            monkeypatch.setattr(
+                app.state.upload_repository,
+                "set_publication_state",
+                fail_file_published,
+            )
+        else:
+            monkeypatch.setattr(
+                app.state.upload_repository,
+                "finalize_publication",
+                lambda *args, **kwargs: (_ for _ in ()).throw(
+                    RuntimeError("injected database finalization failure")
+                ),
+            )
         assert client.post(
             f"/api/uploads/{upload['upload_id']}/complete", json={}
         ).status_code == 500
+        assert app.state.upload_repository.get(str(upload["upload_id"]))[
+            "publication_state"
+        ] == durable_state
         final_path = settings.upload_dir / (
             f"{upload['upload_id']}_{upload['original_name']}"
         )
@@ -990,6 +1010,193 @@ def test_restart_finishes_cancelled_file_published_cleanup(
         pass
 
     assert not final_path.exists()
+
+
+def test_cancel_removes_verified_final_after_publish_state_write_failure(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"rename-before-state"
+    app = create_app(settings)
+    broadcasts: list[dict[str, object]] = []
+    original_set_state = app.state.upload_repository.set_publication_state
+
+    async def capture(event: dict[str, object]) -> None:
+        broadcasts.append(event)
+
+    def fail_file_published(*args, **kwargs):
+        if args[1] == "file_published":
+            raise RuntimeError("injected state write failure after rename")
+        return original_set_state(*args, **kwargs)
+
+    app.state.hub.broadcast = capture
+    monkeypatch.setattr(
+        app.state.upload_repository, "set_publication_state", fail_file_published
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert client.post(
+            "/api/session",
+            json={
+                "access_token": settings.auth_token,
+                "device_id": "source",
+                "device_name": "source",
+            },
+        ).status_code == 200
+        upload = create_upload(client, content=content)
+        upload_id = str(upload["upload_id"])
+        put_single_part(client, upload, content)
+
+        failed = client.post(f"/api/uploads/{upload_id}/complete", json={})
+        final_path = settings.upload_dir / f"{upload_id}_{upload['original_name']}"
+        session_dir = settings.upload_dir / ".resumable" / upload_id
+
+        assert failed.status_code == 500
+        assert app.state.upload_repository.get(upload_id)["publication_state"] == "assembled"
+        assert final_path.read_bytes() == content
+        assert session_dir.is_dir()
+
+        original_purge = app.state.upload_service.storage.purge_file
+        purge_calls = 0
+
+        def fail_once(storage_name: str) -> None:
+            nonlocal purge_calls
+            purge_calls += 1
+            if purge_calls == 1:
+                raise OSError("injected transient final cleanup failure")
+            original_purge(storage_name)
+
+        monkeypatch.setattr(app.state.upload_service.storage, "purge_file", fail_once)
+
+        cancelled = client.delete(f"/api/uploads/{upload_id}")
+
+        assert cancelled.status_code == 200
+        assert cancelled.json()["status"] == "cancelled"
+        assert final_path.is_file()
+        assert not session_dir.exists()
+        assert [event["event_type"] for event in broadcasts].count(
+            "upload.cancelled"
+        ) == 1
+
+        mutations = client.portal.call(
+            app.state.upload_service.expire, datetime.now(timezone.utc)
+        )
+
+        assert mutations == []
+        assert purge_calls == 2
+        assert not final_path.exists()
+        assert not session_dir.exists()
+
+
+def test_cancel_preserves_unverified_final_after_publish_state_write_failure(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"owned-content"
+    replacement = b"other-content"
+    app = create_app(settings)
+    original_set_state = app.state.upload_repository.set_publication_state
+
+    def fail_file_published(*args, **kwargs):
+        if args[1] == "file_published":
+            raise RuntimeError("injected state write failure after rename")
+        return original_set_state(*args, **kwargs)
+
+    monkeypatch.setattr(
+        app.state.upload_repository, "set_publication_state", fail_file_published
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert client.post(
+            "/api/session",
+            json={
+                "access_token": settings.auth_token,
+                "device_id": "source",
+                "device_name": "source",
+            },
+        ).status_code == 200
+        upload = create_upload(client, content=content)
+        upload_id = str(upload["upload_id"])
+        put_single_part(client, upload, content)
+        assert client.post(f"/api/uploads/{upload_id}/complete", json={}).status_code == 500
+        final_path = settings.upload_dir / f"{upload_id}_{upload['original_name']}"
+        final_path.write_bytes(replacement)
+
+        cancelled = client.delete(f"/api/uploads/{upload_id}")
+
+        assert cancelled.status_code == 200
+        assert final_path.read_bytes() == replacement
+
+
+def test_maintenance_retries_complete_session_chunk_cleanup(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"complete-cleanup-retry"
+    app = create_app(settings)
+    original_cleanup = app.state.upload_service.chunks.cleanup_session
+    cleanup_calls = 0
+
+    def fail_once(upload_id: str) -> None:
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_calls == 1:
+            raise OSError("injected transient cleanup failure")
+        original_cleanup(upload_id)
+
+    monkeypatch.setattr(app.state.upload_service.chunks, "cleanup_session", fail_once)
+    with authenticated_client(settings, app=app, device_id="source") as client:
+        upload = create_upload(client, content=content)
+        upload_id = str(upload["upload_id"])
+        put_single_part(client, upload, content)
+
+        completed = client.post(f"/api/uploads/{upload_id}/complete", json={})
+        session_dir = settings.upload_dir / ".resumable" / upload_id
+        final_path = settings.upload_dir / completed.json()["file"]["storage_name"]
+        messages_before = client.get("/api/messages?limit=50").json()["items"]
+
+        assert completed.status_code == 200
+        assert session_dir.is_dir()
+        assert final_path.read_bytes() == content
+
+        mutations = client.portal.call(
+            app.state.upload_service.expire, datetime.now(timezone.utc)
+        )
+
+        assert mutations == []
+        assert cleanup_calls == 2
+        assert not session_dir.exists()
+        assert final_path.read_bytes() == content
+        assert client.get("/api/messages?limit=50").json()["items"] == messages_before
+
+
+def test_startup_retries_complete_session_chunk_cleanup(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"complete-startup-cleanup"
+    app = create_app(settings)
+    monkeypatch.setattr(
+        app.state.upload_service.chunks,
+        "cleanup_session",
+        lambda upload_id: (_ for _ in ()).throw(
+            OSError("injected persistent cleanup failure")
+        ),
+    )
+    with authenticated_client(settings, app=app, device_id="source") as client:
+        upload = create_upload(client, content=content)
+        upload_id = str(upload["upload_id"])
+        put_single_part(client, upload, content)
+        completed = client.post(f"/api/uploads/{upload_id}/complete", json={})
+        session_dir = settings.upload_dir / ".resumable" / upload_id
+        final_path = settings.upload_dir / completed.json()["file"]["storage_name"]
+        messages_before = client.get("/api/messages?limit=50").json()["items"]
+
+        assert completed.status_code == 200
+        assert session_dir.is_dir()
+
+    with authenticated_client(
+        settings, app=create_app(settings), device_id="source"
+    ) as restarted:
+        messages_after = restarted.get("/api/messages?limit=50").json()["items"]
+
+    assert not session_dir.exists()
+    assert final_path.read_bytes() == content
+    assert messages_after == messages_before
 
 
 def test_expire_returns_recovery_mutation_for_maintenance_broadcast(

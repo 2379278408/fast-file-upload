@@ -118,13 +118,13 @@ class UploadService:
                 raise
 
     def _discard_unpublished_final(self, session: dict[str, object]) -> None:
-        if session["publication_state"] != "file_published":
+        if session["publication_state"] not in {"assembled", "file_published"}:
             return
-        upload_id = str(session["upload_id"])
-        storage_name = (
-            f"{upload_id}_{sanitize_filename(str(session['original_name']))}"
-        )
-        self.storage.purge_file(storage_name)
+        try:
+            pending = self.chunks.pending_from_session(session, published=True)
+        except PartIntegrityError:
+            return
+        self.storage.purge_file(pending.storage_name)
 
     def _result(self, session: dict[str, object]) -> dict[str, object]:
         result = dict(session)
@@ -542,6 +542,7 @@ class UploadService:
         state = str(original["publication_state"])
         status = str(original["status"])
         if status == "complete":
+            self.chunks.cleanup_session(upload_id)
             return mutations
         if status in {"cancelled", "expired"}:
             try:
@@ -677,11 +678,18 @@ class UploadService:
             if expired is not None:
                 mutations.extend(expired)
         sessions = await asyncio.to_thread(self.repository.list_sessions)
+        residual_ids = await asyncio.to_thread(self.chunks.orphan_sessions, set())
         cleanup_ids = {
             str(session["upload_id"])
             for session in sessions
             if session["status"] in {"cancelled", "expired"}
         }
+        cleanup_ids.update(
+            str(session["upload_id"])
+            for session in sessions
+            if session["status"] == "complete"
+            and str(session["upload_id"]) in residual_ids
+        )
         for upload_id in sorted(cleanup_ids):
             await self._run_isolated(
                 upload_id,

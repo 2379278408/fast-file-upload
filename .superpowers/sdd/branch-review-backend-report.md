@@ -57,3 +57,45 @@ Baseline: `58c9b5b` (`docs(test): use binary unit for large upload marker`)
 
 - The process-local completing guard coordinates threads in one application process. Durable publication state remains the cross-process recovery mechanism.
 - Cancellation and integrity repair intentionally prioritize durable state; repeated maintenance handles filesystem cleanup failures.
+
+## Follow-up Review Remediation
+
+Baseline: `e227557` (`fix(upload): harden completion recovery`)
+
+### Rename And State-Write Boundary
+
+- RED: fault injection after successful rename left durable publication state at `assembled`; DELETE broadcast cancellation and removed chunks while leaving the final file behind.
+- GREEN: terminal cleanup now accepts `assembled` and `file_published`, reconstructs the upload-scoped final name, validates upload ID and path constraints, and verifies durable size and SHA-256 before deleting the exact final name. A same-path replacement with a different digest is preserved.
+- Recovery: cancellation remains successful when the first cleanup attempt fails; periodic maintenance and startup recovery retry both durable publication states until verified final and chunk residue converge.
+
+### Complete Residual Cleanup
+
+- RED: a transient `cleanup_session()` failure after successful completion left the resumable directory permanently because maintenance excluded complete sessions.
+- GREEN: startup recovery cleans complete-session residue. Periodic maintenance scans only valid non-symlink resumable directories and selects matching complete sessions, preserving the permanent message and final file.
+
+### Follow-up Tests
+
+- `test_cancel_removes_verified_final_after_publish_state_write_failure`
+- `test_cancel_preserves_unverified_final_after_publish_state_write_failure`
+- `test_restart_finishes_cancelled_publication_cleanup`
+- `test_maintenance_retries_complete_session_chunk_cleanup`
+- `test_startup_retries_complete_session_chunk_cleanup`
+
+### Follow-up Verification
+
+- Initial fault-injection RED:
+  - `python3 -m pytest -q tests/test_resumable_upload_api.py::test_cancel_removes_verified_final_after_publish_state_write_failure tests/test_resumable_upload_api.py::test_cancel_preserves_unverified_final_after_publish_state_write_failure tests/test_resumable_upload_api.py::test_maintenance_retries_complete_session_chunk_cleanup`
+  - Result: `2 failed, 1 passed, 1 warning in 0.72s`; verified final cleanup and complete residual cleanup failed, while digest-mismatched replacement preservation already held.
+- Expanded recovery GREEN:
+  - Targeted startup, maintenance, cancellation, and integrity cases.
+  - Result: `6 passed, 1 warning in 1.06s`.
+- Focused backend regression suite:
+  - `python3 -m pytest -q tests/test_chunk_storage.py tests/test_upload_repository.py tests/test_resumable_upload_api.py`
+  - Result: `124 passed, 1 warning in 11.41s`.
+- Full default project suite:
+  - `python3 -m pytest -q`
+  - Result: `509 passed, 1 deselected, 1 warning in 210.26s`.
+- Python compilation and patch validation:
+  - `python3 -m compileall -q app server.py tests`
+  - `git diff --check`
+  - Result: exit code 0 with no output.
