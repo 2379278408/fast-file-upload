@@ -302,7 +302,7 @@ class Element {
     }
   }
   getBoundingClientRect() {
-    const key = this.dataset.messageId || this.id;
+    const key = this.dataset.messageId || this.dataset.uploadId || this.id;
     const configured = globalThis.__rects && globalThis.__rects[key];
     if (configured) return configured;
     return {
@@ -3245,12 +3245,12 @@ def test_timeline_delete_confirmation_and_thirty_second_restore_execute_in_quick
         onRestore: null,
       });
       deleteTimeline.upsert(message);
-      container.querySelector('.timeline-delete-btn').listeners.click[0]();
+      container.listeners.click[0]({ target: container.querySelector('.timeline-delete-btn') });
     """)
     drain_jobs(context)
     context.eval(r"""
-      document.getElementById('timelineDeleteContainer')
-        .querySelector('.timeline-undo-btn').listeners.click[0]();
+      const deleteContainer = document.getElementById('timelineDeleteContainer');
+      deleteContainer.listeners.click[0]({ target: deleteContainer.querySelector('.timeline-undo-btn') });
     """)
     drain_jobs(context)
     result = json.loads(context.eval(r"""
@@ -3315,13 +3315,13 @@ def test_app_timeline_api_preserves_delete_and_restore_methods_in_quickjs() -> N
         id: 'app-timeline-message', kind: 'text', body: 'integration',
         created_at: '2026-07-17T00:00:00+00:00', deleted_at: null, file: null,
       });
-      document.getElementById('timelineContainer')
-        .querySelector('.timeline-delete-btn').listeners.click[0]();
+      const appTimelineContainer = document.getElementById('timelineContainer');
+      appTimelineContainer.listeners.click[0]({ target: appTimelineContainer.querySelector('.timeline-delete-btn') });
     """)
     drain_jobs(context)
     context.eval(r"""
-      document.getElementById('timelineContainer')
-        .querySelector('.timeline-undo-btn').listeners.click[0]();
+      const appTimelineResultContainer = document.getElementById('timelineContainer');
+      appTimelineResultContainer.listeners.click[0]({ target: appTimelineResultContainer.querySelector('.timeline-undo-btn') });
     """)
     drain_jobs(context)
 
@@ -3408,6 +3408,7 @@ def test_timeline_pages_from_top_and_loads_until_real_dto(client: TestClient) ->
       globalThis.IntersectionObserver = class IntersectionObserver {
         constructor(callback) { this.callback = callback; }
         observe(element) { observedSentinels.push(element); }
+        disconnect() {}
       };
     """)
     load_js_module(context, "./timeline.js", read_web("js/timeline.js"))
@@ -4389,4 +4390,254 @@ def test_app_reinitialization_tears_down_previous_modules_and_submit_handler() -
             "navigation": 2,
             "unsubscribe": 2,
         },
+    }
+
+
+def test_app_bfcache_pagehide_preserves_instance_and_pageshow_resumes() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.lifecycle = {
+        sessions: 0, timelineLoads: 0, starts: 0, reconciles: 0,
+        connections: 0, closes: 0, destroys: 0,
+      };
+      globalThis.__modules['./api.js'] = {
+        request: path => Promise.resolve(path === '/api/health' ? {} : { events: [] }),
+        unlock: () => Promise.resolve({}),
+        logout: () => Promise.resolve({}),
+        getSession: () => { lifecycle.sessions += 1; return Promise.resolve({}); },
+        ApiError: class ApiError extends Error {},
+        connectEvents: () => {
+          lifecycle.connections += 1;
+          return { close() { lifecycle.closes += 1; } };
+        },
+        getLastSequence: () => 0,
+      };
+      globalThis.__modules['./timeline.js'] = { createTimeline: () => ({
+        loadInitial: () => { lifecycle.timelineLoads += 1; return Promise.resolve(); },
+        upsertUpload() {}, mergeEvent() {}, focusMessage() {},
+        destroy() { lifecycle.destroys += 1; },
+      }) };
+      globalThis.__modules['./composer.js'] = { createComposer: () => ({
+        destroy() { lifecycle.destroys += 1; },
+      }) };
+      globalThis.__modules['./upload-coordinator.js'] = { createUploadCoordinator: () => ({
+        start: () => { lifecycle.starts += 1; return Promise.resolve(); },
+        reconcile: () => { lifecycle.reconciles += 1; return Promise.resolve(); },
+        getSnapshot: () => [], subscribe: () => () => {},
+        pauseAll() {}, resumeAll() {}, cancelAll() {}, applyRemoteEvent() {},
+        destroy() { lifecycle.destroys += 1; },
+      }) };
+      globalThis.__modules['./upload-persistence.js'] = { createUploadPersistence: () => ({}) };
+      globalThis.__modules['./library.js'] = { createLibrary: () => ({
+        load: () => Promise.resolve(), clearSelection() {}, applyEvent() {},
+        destroy() { lifecycle.destroys += 1; },
+      }) };
+      globalThis.__modules['./navigation.js'] = { createNavigation: () => ({
+        start() {}, navigate: () => Promise.resolve(),
+        destroy() { lifecycle.destroys += 1; },
+      }) };
+    """)
+    load_js_module(context, "./app.js", read_web("js/app.js"))
+    drain_jobs(context)
+    context.eval(r"""
+      window.dispatchEvent({ type: 'pagehide', persisted: true });
+      globalThis.afterPersistedHide = JSON.stringify(lifecycle);
+      window.dispatchEvent({ type: 'pageshow', persisted: true });
+    """)
+    drain_jobs(context)
+    result = json.loads(context.eval(r"""
+      const afterResume = { ...lifecycle };
+      const listenerCounts = {
+        pagehide: (window.listeners.pagehide || []).length,
+        pageshow: (window.listeners.pageshow || []).length,
+      };
+      window.dispatchEvent({ type: 'pagehide', persisted: false });
+      window.dispatchEvent({ type: 'pageshow', persisted: true });
+      JSON.stringify({
+        afterPersistedHide: JSON.parse(afterPersistedHide),
+        afterResume,
+        afterFinalHide: lifecycle,
+        listenerCounts,
+      });
+    """))
+    drain_jobs(context)
+
+    assert result["afterPersistedHide"]["destroys"] == 0
+    assert result["afterResume"] == {
+        "sessions": 2,
+        "timelineLoads": 2,
+        "starts": 1,
+        "reconciles": 1,
+        "connections": 2,
+        "closes": 1,
+        "destroys": 0,
+    }
+    assert result["listenerCounts"] == {"pagehide": 1, "pageshow": 1}
+    assert result["afterFinalHide"]["destroys"] == 5
+    assert context.eval("lifecycle.sessions") == 2
+
+
+def test_timeline_destroy_disables_all_existing_delegated_action_buttons() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.restCalls = [];
+      globalThis.uploadActionCalls = 0;
+      globalThis.clipboardCalls = 0;
+      navigator.clipboard.writeText = () => { clipboardCalls += 1; return Promise.resolve(); };
+    """)
+    load_js_module(context, "./timeline.js", read_web("js/timeline.js"))
+    context.eval(r"""
+      const container = document.getElementById('delegatedTimeline');
+      globalThis.delegatedTimeline = __modules['./timeline.js'].createTimeline({
+        container,
+        newMessageButton: null,
+        api: (path, options = {}) => {
+          restCalls.push({ path, method: options.method || 'GET' });
+          return Promise.resolve({
+            id: 'delegated-message', body: 'delegated',
+            created_at: '2026-07-20T00:00:00Z', deleted_at: '2026-07-20T00:00:00Z',
+          });
+        },
+        onRestore: null,
+        onUploadAction: () => { uploadActionCalls += 1; },
+      });
+      delegatedTimeline.upsert({
+        id: 'delegated-message', body: 'delegated', created_at: '2026-07-20T00:00:00Z',
+      });
+      delegatedTimeline.upsertUpload({
+        uploadId: 'delegated-upload', name: 'upload.txt', status: 'queued',
+        createdAt: '2026-07-20T00:00:01Z', isSourceDevice: true,
+      });
+      globalThis.delegatedHandler = container.listeners.click[0];
+      globalThis.deleteButton = container.querySelector('.timeline-delete-btn');
+      delegatedHandler({ target: deleteButton });
+    """)
+    drain_jobs(context)
+    result = json.loads(context.eval(r"""
+      const resultContainer = document.getElementById('delegatedTimeline');
+      const undoButton = resultContainer.querySelector('.timeline-undo-btn');
+      const uploadButton = resultContainer.querySelector('[data-upload-action="pause"]');
+      const copyButton = deleteButton.parentNode.querySelector('.timeline-copy-btn');
+      delegatedTimeline.destroy();
+      delegatedTimeline.destroy();
+      [copyButton, deleteButton, uploadButton, undoButton].forEach(target => {
+        delegatedHandler({ target });
+      });
+      JSON.stringify({
+        restCalls,
+        uploadActionCalls,
+        clipboardCalls,
+        containerClickListeners: (resultContainer.listeners.click || []).length,
+        buttonListenerCounts: [copyButton, deleteButton, uploadButton, undoButton]
+          .map(button => (button.listeners.click || []).length),
+      });
+    """))
+    drain_jobs(context)
+
+    assert result == {
+        "restCalls": [
+            {"path": "/api/messages/delegated-message", "method": "DELETE"}
+        ],
+        "uploadActionCalls": 0,
+        "clipboardCalls": 0,
+        "containerClickListeners": 0,
+        "buttonListenerCounts": [0, 0, 0, 0],
+    }
+
+
+def test_timeline_older_page_preserves_first_visible_stable_anchor() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.__rects = {
+        anchorTimeline: { top: 0, bottom: 100, left: 0, right: 100, width: 100, height: 100 },
+        'anchor-message': { top: 10, bottom: 40, left: 0, right: 100, width: 100, height: 30 },
+        'later-message': { top: 50, bottom: 80, left: 0, right: 100, width: 100, height: 30 },
+      };
+    """)
+    load_js_module(context, "./timeline.js", read_web("js/timeline.js"))
+    context.eval(r"""
+      const container = document.getElementById('anchorTimeline');
+      container.scrollTop = 100;
+      container.scrollHeight = 300;
+      globalThis.anchorTimeline = __modules['./timeline.js'].createTimeline({
+        container,
+        newMessageButton: null,
+        api: () => {
+          __rects['anchor-message'] = { top: 55, bottom: 105, left: 0, right: 100, width: 100, height: 50 };
+          container.scrollHeight = 900;
+          return Promise.resolve({
+            items: [
+              { id: 'anchor-message', body: 'taller duplicate', created_at: '2026-07-20T01:00:00Z' },
+              { id: 'older-message', body: 'older', created_at: '2026-07-19T01:00:00Z' },
+            ],
+            next_before: null,
+          });
+        },
+        onRestore: null,
+      });
+      anchorTimeline.upsert({ id: 'anchor-message', body: 'anchor', created_at: '2026-07-20T01:00:00Z' });
+      anchorTimeline.upsert({ id: 'later-message', body: 'later', created_at: '2026-07-20T02:00:00Z' });
+      anchorTimeline.loadOlder();
+    """)
+    drain_jobs(context)
+    result = json.loads(context.eval(r"""
+      const resultContainer = document.getElementById('anchorTimeline');
+      JSON.stringify({
+        scrollTop: resultContainer.scrollTop,
+        ids: resultContainer.querySelectorAll('.timeline-message').map(
+          element => element.dataset.messageId || element.dataset.uploadId
+        ),
+        duplicateCount: resultContainer.querySelectorAll('[data-message-id="anchor-message"]').length,
+      });
+    """))
+
+    assert result == {
+        "scrollTop": 145,
+        "ids": ["older-message", "anchor-message", "later-message"],
+        "duplicateCount": 1,
+    }
+
+
+def test_timeline_repeated_initial_load_observes_only_latest_sentinel() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.observerInstances = [];
+      globalThis.IntersectionObserver = class IntersectionObserver {
+        constructor(callback) { this.callback = callback; this.targets = []; this.disconnects = 0; observerInstances.push(this); }
+        observe(target) { this.targets.push(target); }
+        disconnect() { this.disconnects += 1; this.targets = []; }
+      };
+    """)
+    load_js_module(context, "./timeline.js", read_web("js/timeline.js"))
+    context.eval(r"""
+      const container = document.getElementById('sentinelTimeline');
+      globalThis.sentinelTimeline = __modules['./timeline.js'].createTimeline({
+        container,
+        newMessageButton: null,
+        api: () => Promise.resolve({ items: [], next_before: null }),
+        onRestore: null,
+      });
+      sentinelTimeline.loadInitial();
+    """)
+    drain_jobs(context)
+    context.eval("sentinelTimeline.loadInitial();")
+    drain_jobs(context)
+    result = json.loads(context.eval(r"""
+      const observer = observerInstances[0];
+      const resultContainer = document.getElementById('sentinelTimeline');
+      JSON.stringify({
+        observerCount: observerInstances.length,
+        disconnects: observer.disconnects,
+        activeTargets: observer.targets.length,
+        activeIsCurrent: observer.targets[0] === resultContainer.querySelector('.timeline-sentinel'),
+        sentinelCount: resultContainer.querySelectorAll('.timeline-sentinel').length,
+      });
+    """))
+
+    assert result == {
+        "observerCount": 1,
+        "disconnects": 2,
+        "activeTargets": 1,
+        "activeIsCurrent": True,
+        "sentinelCount": 1,
     }

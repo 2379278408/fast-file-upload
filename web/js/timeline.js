@@ -8,6 +8,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
   const messageElements = new Map();
   const uploadElements = new Map();
   const undoNotices = new Map();
+  const undoMessages = new Map();
   const undoTimers = new Map();
   const timers = new Set();
   const appliedSequences = new Set();
@@ -63,6 +64,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
   }
 
   if (container) container.addEventListener('scroll', handleScroll);
+  if (container) container.addEventListener('click', handleContainerClick);
   if (newMessageButton) {
     newMessageButton.hidden = true;
     newMessageButton.addEventListener('click', handleNewMessageClick);
@@ -146,16 +148,6 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     copyBtn.dataset.timelineAction = 'copy';
     copyBtn.type = 'button';
     copyBtn.textContent = '复制';
-    copyBtn.addEventListener('click', async () => {
-      const text = msg.file
-        ? `${location.origin}${msg.file.download_url || `/download/${msg.file.id}`}`
-        : (msg.body || '');
-      try {
-        await navigator.clipboard.writeText(text);
-      } catch {
-        // fallback: select text
-      }
-    });
     actions.append(copyBtn);
 
     const deleteBtn = document.createElement('button');
@@ -163,20 +155,6 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     deleteBtn.dataset.timelineAction = 'delete';
     deleteBtn.type = 'button';
     deleteBtn.textContent = '删除';
-    deleteBtn.addEventListener('click', async () => {
-      const label = msg.file ? (msg.file.name || '这个文件') : '这条消息';
-      if (!confirm(`确定删除${label}吗？`)) return;
-      try {
-        const deleted = await api(`/api/messages/${encodeURIComponent(msg.id)}`, {
-          method: 'DELETE',
-        });
-        if (destroyed) return;
-        removeMessage(msg.id);
-        showUndo({ ...msg, ...(deleted || {}) });
-      } catch {
-        // The event stream keeps the timeline consistent after request failures.
-      }
-    });
     actions.append(deleteBtn);
     el.append(actions);
 
@@ -281,10 +259,6 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
       button.type = 'button';
       button.dataset.uploadAction = action;
       button.textContent = label;
-      button.addEventListener('click', () => onUploadAction?.({
-        action: button.dataset.uploadAction,
-        uploadId: button.closest('[data-upload-id]').dataset.uploadId,
-      }));
       actions.append(button);
     });
     element.append(actions);
@@ -390,10 +364,12 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     const undoButton = document.createElement('button');
     undoButton.className = 'btn btn-soft timeline-undo-btn';
     undoButton.type = 'button';
+    undoButton.dataset.timelineAction = 'undo';
     undoButton.textContent = '撤销';
     notice.append(label, undoButton);
     container.append(notice);
     undoNotices.set(message.id, notice);
+    undoMessages.set(message.id, message);
 
     const deletedAt = Date.parse(message.deleted_at || '');
     const undoMilliseconds = Number.isFinite(deletedAt)
@@ -403,29 +379,105 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
       timers.delete(expiryTimer);
       undoTimers.delete(message.id);
       undoNotices.delete(message.id);
+      undoMessages.delete(message.id);
       notice.remove();
     }, undoMilliseconds);
     timers.add(expiryTimer);
     undoTimers.set(message.id, expiryTimer);
-    undoButton.addEventListener('click', async () => {
+  }
+
+  async function copyMessage(message) {
+    const text = message.file
+      ? `${location.origin}${message.file.download_url || `/download/${message.file.id}`}`
+      : (message.body || '');
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Clipboard failures leave the timeline unchanged.
+    }
+  }
+
+  async function deleteMessage(message) {
+    const label = message.file ? (message.file.name || '这个文件') : '这条消息';
+    if (!confirm(`确定删除${label}吗？`)) return;
+    try {
+      const deleted = await api(`/api/messages/${encodeURIComponent(message.id)}`, {
+        method: 'DELETE',
+      });
       if (destroyed) return;
-      undoButton.disabled = true;
-      try {
-        const restored = await api(
-          `/api/messages/${encodeURIComponent(message.id)}/restore`,
-          { method: 'POST' }
-        );
-        if (destroyed) return;
+      removeMessage(message.id);
+      showUndo({ ...message, ...(deleted || {}) });
+    } catch {
+      // The event stream keeps the timeline consistent after request failures.
+    }
+  }
+
+  async function restoreMessage(messageId, button) {
+    const message = undoMessages.get(messageId);
+    if (!message) return;
+    button.disabled = true;
+    try {
+      const restored = await api(
+        `/api/messages/${encodeURIComponent(messageId)}/restore`,
+        { method: 'POST' }
+      );
+      if (destroyed) return;
+      const expiryTimer = undoTimers.get(messageId);
+      if (expiryTimer) {
         clearTimeout(expiryTimer);
         timers.delete(expiryTimer);
-        undoTimers.delete(message.id);
-        undoNotices.delete(message.id);
-        notice.remove();
-        upsertMessage(restored);
-      } catch {
-        undoButton.disabled = false;
       }
-    });
+      undoTimers.delete(messageId);
+      undoNotices.get(messageId)?.remove();
+      undoNotices.delete(messageId);
+      undoMessages.delete(messageId);
+      upsertMessage(restored);
+    } catch {
+      if (!destroyed) button.disabled = false;
+    }
+  }
+
+  function handleContainerClick(event) {
+    if (destroyed) return;
+    const target = event.target;
+    if (!target) return;
+
+    const uploadButton = closestWithDataset(target, 'uploadAction');
+    if (uploadButton) {
+      const uploadElement = closestWithDataset(uploadButton, 'uploadId');
+      if (uploadElement) {
+        onUploadAction?.({
+          action: uploadButton.dataset.uploadAction,
+          uploadId: uploadElement.dataset.uploadId,
+        });
+      }
+      return;
+    }
+
+    const actionButton = closestWithDataset(target, 'timelineAction');
+    if (!actionButton) return;
+    const action = actionButton.dataset.timelineAction;
+    if (action === 'undo') {
+      const notice = closestWithDataset(actionButton, 'undoMessageId');
+      if (notice) restoreMessage(notice.dataset.undoMessageId, actionButton);
+      return;
+    }
+
+    const messageElement = closestWithDataset(actionButton, 'messageId');
+    const message = messageElement && messages.get(messageElement.dataset.messageId);
+    if (!message) return;
+    if (action === 'copy') copyMessage(message);
+    if (action === 'delete') deleteMessage(message);
+  }
+
+  function closestWithDataset(element, key) {
+    let current = element;
+    while (current) {
+      if (current.dataset?.[key]) return current;
+      if (current === container) break;
+      current = current.parentNode;
+    }
+    return null;
   }
 
   function stableElementId(element) {
@@ -568,6 +620,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
 
   async function loadInitial() {
     if (destroyed || !container) return;
+    observer?.disconnect();
     container.innerHTML = '';
     messages.clear();
     uploads.clear();
@@ -576,6 +629,7 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     messageElements.clear();
     uploadElements.clear();
     undoNotices.clear();
+    undoMessages.clear();
     undoTimers.clear();
     timers.forEach(timer => clearTimeout(timer));
     timers.clear();
@@ -603,6 +657,9 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     if (destroyed) return Promise.resolve(false);
     if (loadingPromise) return loadingPromise;
     if (exhausted) return Promise.resolve(false);
+    const anchor = captureVisibleAnchor();
+    const previousScrollHeight = container ? container.scrollHeight : 0;
+    const previousScrollTop = container ? container.scrollTop : 0;
     loading = true;
     loadingPromise = (async () => {
       try {
@@ -619,15 +676,13 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
         }
         nextBefore = data.next_before || null;
         exhausted = !nextBefore;
-        const prevScrollHeight = container ? container.scrollHeight : 0;
         for (const msg of items) {
           upsertMessage(msg, { rebuild: false });
         }
 
         if (container) {
           rebuildProjection();
-          const newScrollHeight = container.scrollHeight;
-          container.scrollTop += newScrollHeight - prevScrollHeight;
+          restorePagingPosition(anchor, previousScrollHeight, previousScrollTop);
         }
         return true;
       } catch {
@@ -641,6 +696,38 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
       }
     })();
     return loadingPromise;
+  }
+
+  function captureVisibleAnchor() {
+    if (!container) return null;
+    const containerRect = container.getBoundingClientRect?.() || { top: 0, bottom: Infinity };
+    const elements = container.querySelectorAll('.timeline-message');
+    for (const element of elements) {
+      const rect = element.getBoundingClientRect?.();
+      if (rect && rect.bottom > containerRect.top && rect.top < containerRect.bottom) {
+        if (element.dataset.messageId) {
+          return { type: 'message', id: element.dataset.messageId, top: rect.top };
+        }
+        if (element.dataset.uploadId) {
+          return { type: 'upload', id: element.dataset.uploadId, top: rect.top };
+        }
+      }
+    }
+    return null;
+  }
+
+  function restorePagingPosition(anchor, previousScrollHeight, previousScrollTop) {
+    const anchorElement = anchor && (
+      anchor.type === 'message'
+        ? messageElements.get(anchor.id)
+        : uploadElements.get(anchor.id)
+    );
+    const currentTop = anchorElement?.getBoundingClientRect?.().top;
+    if (typeof currentTop === 'number') {
+      container.scrollTop = previousScrollTop + currentTop - anchor.top;
+      return;
+    }
+    container.scrollTop = previousScrollTop + container.scrollHeight - previousScrollHeight;
   }
 
   function hasMessageElement(messageId) {
@@ -728,11 +815,13 @@ export function createTimeline({ container, newMessageButton, api, onRestore, on
     if (destroyed) return;
     destroyed = true;
     container?.removeEventListener('scroll', handleScroll);
+    container?.removeEventListener('click', handleContainerClick);
     newMessageButton?.removeEventListener('click', handleNewMessageClick);
     observer?.disconnect();
     observer = null;
     timers.forEach(timer => clearTimeout(timer));
     timers.clear();
+    undoMessages.clear();
     loadingPromise = null;
   }
 

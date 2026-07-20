@@ -16,6 +16,7 @@ window[APP_INSTANCE_KEY]?.destroy?.();
 
 const appListenerCleanups = [];
 let appDestroyed = false;
+let resumePromise = null;
 
 function listen(target, type, listener, options) {
   if (!target?.addEventListener) return;
@@ -876,9 +877,43 @@ export function destroyApp() {
   }
 }
 
+function handlePageHide(event) {
+  if (!event.persisted) destroyApp();
+}
+
+function resumeFromBFCache() {
+  if (appDestroyed) return Promise.resolve(false);
+  if (resumePromise) return resumePromise;
+  resumePromise = (async () => {
+    try {
+      await getSession();
+      if (appDestroyed) return false;
+      isUnlocked = true;
+      await timeline.loadInitial();
+      if (appDestroyed) return false;
+      await restoreUploads();
+      if (appDestroyed) return false;
+      hideLockOverlay();
+      startEventConnection();
+      return true;
+    } catch {
+      if (!appDestroyed) showLockOverlay();
+      return false;
+    } finally {
+      resumePromise = null;
+    }
+  })();
+  return resumePromise;
+}
+
+function handlePageShow(event) {
+  if (event.persisted) resumeFromBFCache();
+}
+
 const appInstance = { destroy: destroyApp };
 window[APP_INSTANCE_KEY] = appInstance;
 listen(window, 'beforeunload', destroyApp);
-listen(window, 'pagehide', destroyApp);
+listen(window, 'pagehide', handlePageHide);
+listen(window, 'pageshow', handlePageShow);
 
 checkSession();
