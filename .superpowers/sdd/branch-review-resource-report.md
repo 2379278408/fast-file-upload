@@ -23,6 +23,12 @@ Baseline: `ab830c2` (`fix(resource): bound upload and event commitments`)
 - GREEN: a shared injected event writer trims within every append transaction, making `EVENT_RETENTION_LIMIT` a write-time hard upper bound across message, file, upload, and progress events. Replay emits a common `resync_required` control shape with `target_sequence` and `reset_cursor`; database resets can move a successfully reconciled browser cursor downward. Browser event callbacks execute through one queue across WebSocket generations, revalidate ownership after each await, and persist a cursor only after successful application. Authoritative timeline loads use strict error propagation. Active-upload reconcile replaces stale observers and persistence records while a live revision barrier protects observer and source-device updates newer than the snapshot start.
 - Coverage: all event append paths, concurrent writes, initial stale and ahead-of-database cursors, real commit-before-broadcast live gaps, cross-generation serialization, stale completion, downward reset, strict snapshot failure, active replace, observer/source snapshot races, and browser pagination after cursor reset are covered.
 
+### D. Upload Reconcile Identity Migration
+
+- RED: an active-upload snapshot could start while a local task still used its client request ID, then return empty after session creation migrated the task to its server upload ID. The snapshot treated the migrated task as stale, aborted its worker, removed its persisted file handle, and deleted it from the coordinator.
+- GREEN: each task now advances a reconcile version whenever identity, session readiness, status, confirmed progress, source-file state, or a remote projection changes. Reconcile captures task object identity, both IDs, and that version before requesting the authoritative snapshot; remote merging and stale cleanup proceed only while the complete baseline remains unchanged. Tasks restored from persistence during the same reconcile receive an explicit baseline so a stable empty snapshot still removes truly stale records.
+- Coverage: a deferred active-upload request now spans session creation, client-to-server ID migration, persistence, and a live multipart worker. The old empty snapshot preserves the source task, file handle, persistence, and worker; a later stable empty snapshot removes a stale observer.
+
 ## Protocol Decisions
 
 - Chunk size is optional in the creation request and authoritative in the response. Explicit mismatches retain the actionable 400 contract.
@@ -34,8 +40,9 @@ Baseline: `ab830c2` (`fix(resource): bound upload and event commitments`)
 ## Verification
 
 - Focused backend/frontend contract suite: `292 passed, 1 warning in 18.88s`.
-- Browser E2E suite: `21 passed, 1 warning in 172.33s`.
-- Default full suite: `547 passed, 1 deselected, 1 warning in 203.07s`.
+- Follow-up frontend contract suite: `155 passed, 1 warning in 4.11s`.
+- Browser E2E suite: `21 passed, 1 warning in 176.91s`.
+- Default full suite: `548 passed, 1 deselected, 1 warning in 207.02s`.
 - `python3 -m compileall -q app server.py tests`: passed.
 - `git diff --check`: passed.
 - Local preview: root returned HTTP 200 through `https://8086-57e9f8b4df557af1.monkeycode-ai.online` (background terminal `term_1784550079788_23`).

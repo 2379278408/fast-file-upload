@@ -168,6 +168,7 @@ export function createUploadCoordinator({
   let generation = 0;
   let persistenceClosed = false;
   let liveRevision = 0;
+  let taskRevision = 0;
   let resolveDestroy;
   const destroyPromise = new Promise(resolve => { resolveDestroy = resolve; });
   const pendingWorkers = new Set();
@@ -222,6 +223,16 @@ export function createUploadCoordinator({
     if (!isCurrent(token)) return Promise.resolve();
     return raceWithDestroy(persistence.put(persistedTask(task))).catch(() => {});
   };
+  const touchTask = task => { task.reconcileVersion = ++taskRevision; };
+  const taskBaseline = task => ({
+    uploadId: task.uploadId,
+    clientRequestId: task.clientRequestId,
+    reconcileVersion: task.reconcileVersion,
+  });
+  const matchesBaseline = (task, baseline) => Boolean(baseline)
+    && task.uploadId === baseline.uploadId
+    && task.clientRequestId === baseline.clientRequestId
+    && task.reconcileVersion === baseline.reconcileVersion;
   const updateProgress = task => {
     const transferred = Math.min(task.sizeBytes, task.confirmedBytes + task.inFlightBytes);
     task.progressPercent = task.sizeBytes ? Math.min(100, transferred * 100 / task.sizeBytes) : 100;
@@ -298,6 +309,7 @@ export function createUploadCoordinator({
     task.inFlightBytes = 0;
     recordServerRevision(task, response);
     updateProgress(task);
+    touchTask(task);
   };
 
   const applyRemoteStatus = (task, data) => {
@@ -309,10 +321,12 @@ export function createUploadCoordinator({
       task.status = status;
       task.errorCode = null;
       task.errorMessage = null;
+      touchTask(task);
       raceWithDestroy(persistence.remove(task.uploadId)).catch(() => {});
       return;
     }
     task.status = status;
+    touchTask(task);
   };
   const findTask = uploadId => tasks.find(task => task.uploadId === uploadId || task.clientRequestId === uploadId);
   const nextMissingPart = task => {
@@ -336,6 +350,7 @@ export function createUploadCoordinator({
     const partIndex = nextMissingPart(task);
     if (partIndex === null) {
       task.status = 'completing';
+      touchTask(task);
       notify(token);
       try {
         const message = await raceWithDestroy(api.completeUpload(task.uploadId));
@@ -344,6 +359,7 @@ export function createUploadCoordinator({
         task.status = 'completed';
         task.progressPercent = 100;
         task.etaSeconds = 0;
+        touchTask(task);
         await raceWithDestroy(persistence.remove(task.uploadId));
         if (!isCurrent(token)) return;
       } catch (error) {
@@ -351,6 +367,7 @@ export function createUploadCoordinator({
         task.status = 'failed';
         task.errorCode = 'complete-failed';
         task.errorMessage = error.message;
+        touchTask(task);
         persist(task, token);
       }
       notify(token);
@@ -358,6 +375,7 @@ export function createUploadCoordinator({
     }
 
     task.status = 'uploading';
+    touchTask(task);
     task.controller = abortControllerFactory();
     if (!task.samples.length) task.samples = [{ time: now(), bytes: task.confirmedBytes }];
     const start = partIndex * task.chunkSize;
@@ -378,6 +396,7 @@ export function createUploadCoordinator({
             if (!isCurrent(token) || task.status !== 'uploading') return;
             task.inFlightBytes = Math.min(blob.size ?? endExclusive - start, loaded);
             updateProgress(task);
+            touchTask(task);
             notify(token);
           },
           task.controller.signal,
@@ -387,17 +406,20 @@ export function createUploadCoordinator({
         if (task.status === 'uploading') task.status = 'queued';
         task.errorCode = null;
         task.errorMessage = null;
+        touchTask(task);
         persist(task, token);
         notify(token);
         break;
       } catch (error) {
         if (!isCurrent(token)) return;
         task.inFlightBytes = 0;
+        touchTask(task);
         if (task.status === 'paused' || task.status === 'cancelled' || error.name === 'AbortError') break;
         if (attempt >= UPLOAD_RETRY_DELAYS.length) {
           task.status = 'failed';
           task.errorCode = 'upload-failed';
           task.errorMessage = error.message;
+          touchTask(task);
           persist(task, token);
           notify(token);
           break;
@@ -452,6 +474,7 @@ export function createUploadCoordinator({
       sessionReady: false,
       chunkSize: Number.isInteger(chunkSize) && chunkSize > 0 ? chunkSize : null,
       liveRevision: 0,
+      reconcileVersion: 0,
       serverSequence: null, serverUpdatedAt: null, serverVersion: null,
     };
   }
@@ -462,11 +485,13 @@ export function createUploadCoordinator({
       task.status = 'failed';
       task.errorCode = 'file-too-large';
       task.errorMessage = '文件大小超过 512 MiB 限制';
+      touchTask(task);
       notify(token);
       return;
     }
     try {
       task.identity = await raceWithDestroy(sampleFileIdentity(task.file, cryptoObject));
+      touchTask(task);
       if (!isCurrent(token) || task.status === 'cancelled') return;
       const metadata = {
         clientRequestId: task.clientRequestId,
@@ -483,6 +508,7 @@ export function createUploadCoordinator({
       task.sessionReady = true;
       task.sourceDeviceId = response.source_device_id || response.sourceDeviceId || null;
       applyServerState(task, response, { authoritative: true });
+      touchTask(task);
       if (task.status === 'cancelled') {
         await raceWithDestroy(api.cancelUpload(task.uploadId)).catch(() => {});
         if (!isCurrent(token)) return;
@@ -491,6 +517,7 @@ export function createUploadCoordinator({
         return;
       }
       task.status = task.status === 'paused' || response.status === 'paused' ? 'paused' : 'queued';
+      touchTask(task);
       if (task.status === 'paused') {
         await raceWithDestroy(api.controlUpload(task.uploadId, 'pause')).catch(() => {});
       }
@@ -502,6 +529,7 @@ export function createUploadCoordinator({
       task.status = 'failed';
       task.errorCode = 'session-create-failed';
       task.errorMessage = error.message;
+      touchTask(task);
     }
     notify(token);
     pump();
@@ -517,6 +545,7 @@ export function createUploadCoordinator({
       isSourceDevice: Boolean(record.isSourceDevice), sessionReady: true,
       chunkSize: record.chunkSize ?? record.chunk_size_bytes ?? chunkSize,
       liveRevision: record.liveRevision ?? 0,
+      reconcileVersion: 0,
       serverSequence: record.serverSequence ?? null,
       serverUpdatedAt: record.serverUpdatedAt ?? null,
       serverVersion: record.serverVersion ?? null,
@@ -545,6 +574,7 @@ export function createUploadCoordinator({
       worker: null, sessionReady: true,
       chunkSize: data.chunk_size_bytes ?? data.chunkSize ?? chunkSize,
       liveRevision: 0,
+      reconcileVersion: 0,
       serverSequence: null, serverUpdatedAt: null, serverVersion: null,
     };
   }
@@ -558,7 +588,10 @@ export function createUploadCoordinator({
         if (permission === 'granted') {
           const file = await raceWithDestroy(task.fileHandle.getFile());
           if (!isCurrent(token)) return;
-          if (await raceWithDestroy(matchesFileIdentity(file, task.identity, cryptoObject))) task.file = file;
+          if (await raceWithDestroy(matchesFileIdentity(file, task.identity, cryptoObject))) {
+            task.file = file;
+            touchTask(task);
+          }
         }
       } catch {}
     }
@@ -567,11 +600,13 @@ export function createUploadCoordinator({
       task.status = 'paused';
       task.errorCode = 'reselect_required';
       task.errorMessage = '请重新选择原文件以继续上传';
+      touchTask(task);
       return;
     }
     task.status = 'queued';
     task.errorCode = null;
     task.errorMessage = null;
+    touchTask(task);
     if (api.controlUpload) await raceWithDestroy(api.controlUpload(task.uploadId, 'resume')).catch(() => {});
   }
 
@@ -604,11 +639,13 @@ export function createUploadCoordinator({
       if (!task.isSourceDevice) {
         task.errorCode = 'source_device_required';
         task.errorMessage = '源设备控制暂停和继续';
+        touchTask(task);
         notify();
         return;
       }
       task.status = 'paused';
       task.inFlightBytes = 0;
+      touchTask(task);
       task.controller?.abort();
       persist(task);
       if (task.sessionReady) raceWithDestroy(api.controlUpload(task.uploadId, 'pause')).catch(() => {});
@@ -621,6 +658,7 @@ export function createUploadCoordinator({
       if (!task.isSourceDevice) {
         task.errorCode = 'source_device_required';
         task.errorMessage = '源设备控制暂停和继续';
+        touchTask(task);
         notify();
         return;
       }
@@ -628,12 +666,14 @@ export function createUploadCoordinator({
         task.status = 'paused';
         task.errorCode = 'reselect_required';
         task.errorMessage = '请重新选择原文件以继续上传';
+        touchTask(task);
         notify();
         return;
       }
       task.status = 'queued';
       task.errorCode = null;
       task.errorMessage = null;
+      touchTask(task);
       if (task.sessionReady) raceWithDestroy(api.controlUpload(task.uploadId, 'resume')).catch(() => {});
       persist(task);
       notify();
@@ -650,6 +690,7 @@ export function createUploadCoordinator({
         task.status = 'paused';
         task.errorCode = 'file_mismatch';
         task.errorMessage = '所选文件与原文件不一致';
+        touchTask(task);
         persist(task, token);
         notify(token);
         return false;
@@ -670,6 +711,7 @@ export function createUploadCoordinator({
       task.status = 'queued';
       task.errorCode = null;
       task.errorMessage = null;
+      touchTask(task);
       if (shouldResumeServer && api.controlUpload) {
         await raceWithDestroy(api.controlUpload(task.uploadId, 'resume')).catch(() => {});
       }
@@ -685,6 +727,7 @@ export function createUploadCoordinator({
       if (!task) return;
       task.status = 'cancelled';
       task.inFlightBytes = 0;
+      touchTask(task);
       task.controller?.abort();
       if (task.sessionReady) raceWithDestroy(api.cancelUpload(task.uploadId)).catch(() => {});
       raceWithDestroy(persistence.remove(task.uploadId)).catch(() => {});
@@ -703,6 +746,7 @@ export function createUploadCoordinator({
         task.status = 'queued';
         task.errorCode = null;
         task.errorMessage = null;
+        touchTask(task);
         persist(task, token);
         notify(token);
         pump();
@@ -710,6 +754,7 @@ export function createUploadCoordinator({
         if (error.name === 'CoordinatorDestroyedError') throw error;
         if (!isCurrent(token)) throw coordinatorDestroyedError();
         task.errorMessage = error.message;
+        touchTask(task);
         notify();
       }
     },
@@ -728,7 +773,7 @@ export function createUploadCoordinator({
     cancelAll() { tasks.forEach(task => coordinator.cancel(task.uploadId)); },
     async reconcile() {
       const token = generation;
-      const reconcileRevision = liveRevision;
+      const baselines = new Map(tasks.map(task => [task, taskBaseline(task)]));
       if (!isCurrent(token)) throw coordinatorDestroyedError();
       const remote = api.listActiveUploads ? await raceWithDestroy(api.listActiveUploads()) : [];
       if (!isCurrent(token)) throw coordinatorDestroyedError();
@@ -746,11 +791,12 @@ export function createUploadCoordinator({
         if (!task) {
           task = restoredTask(record);
           tasks.push(task);
+          baselines.set(task, taskBaseline(task));
         }
         const data = remoteById.get(record.uploadId);
         if (data) {
           remoteById.delete(record.uploadId);
-          if (task.liveRevision <= reconcileRevision) {
+          if (matchesBaseline(task, baselines.get(task))) {
             task.clientRequestId = data.client_request_id || data.clientRequestId || task.clientRequestId;
             task.name = data.original_name || data.name || task.name;
             task.sizeBytes = data.size_bytes ?? data.sizeBytes ?? task.sizeBytes;
@@ -769,7 +815,7 @@ export function createUploadCoordinator({
       remoteById.forEach(data => {
         const existing = findTask(data.upload_id || data.uploadId)
           || findTask(data.client_request_id || data.clientRequestId);
-        if (!existing || existing.liveRevision <= reconcileRevision) {
+        if (!existing || matchesBaseline(existing, baselines.get(existing))) {
           coordinator.applyRemoteEvent({ event_type: 'upload.created', payload: data });
         }
       });
@@ -777,7 +823,7 @@ export function createUploadCoordinator({
       for (let index = tasks.length - 1; index >= 0; index -= 1) {
         const task = tasks[index];
         if (!task.sessionReady || activeUploadIds.has(task.uploadId)
-            || task.liveRevision > reconcileRevision) continue;
+            || !matchesBaseline(task, baselines.get(task))) continue;
         task.controller?.abort();
         tasks.splice(index, 1);
         await raceWithDestroy(persistence.remove(task.uploadId)).catch(() => {});

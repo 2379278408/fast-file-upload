@@ -2671,6 +2671,106 @@ def test_upload_reconcile_does_not_pause_source_task_updated_after_snapshot_star
     assert context.eval("coordinator.getSnapshot()[0].confirmedBytes") == 3
 
 
+def test_upload_reconcile_preserves_task_that_migrates_to_server_id_after_snapshot_start() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.createResolver = null;
+      globalThis.activeResolvers = [];
+      globalThis.partResolvers = [];
+      globalThis.sliceCalls = [];
+      globalThis.abortCalls = 0;
+      globalThis.removed = [];
+      globalThis.persisted = [];
+      globalThis.fileHandle = { kind: 'file', name: 'source.bin' };
+      globalThis.AbortController = class AbortController {
+        constructor() { this.signal = { aborted: false }; }
+        abort() { this.signal.aborted = true; abortCalls += 1; }
+      };
+      globalThis.cryptoObject = {
+        randomUUID: () => 'client-id',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'source.bin', size: 8, type: 'application/octet-stream', lastModified: 1,
+        slice(start, end) {
+          sliceCalls.push([start, end]);
+          return { size: end - start,
+            arrayBuffer: () => Promise.resolve(new Uint8Array(end - start).buffer) };
+        },
+      };
+      globalThis.api = {
+        listActiveUploads: () => new Promise(resolve => { activeResolvers.push(resolve); }),
+        createUploadSession: () => new Promise(resolve => { createResolver = resolve; }),
+        uploadPart: (uploadId, partIndex) => new Promise(resolve => {
+          partResolvers.push({ uploadId, partIndex, resolve });
+        }),
+        completeUpload: () => Promise.resolve({}),
+        controlUpload: () => Promise.resolve({}),
+        cancelUpload: () => Promise.resolve({}),
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve(persisted.slice()),
+        put(record) {
+          persisted = persisted.filter(item => item.uploadId !== record.uploadId);
+          persisted.push(record);
+          return Promise.resolve();
+        },
+        remove(uploadId) {
+          removed.push(uploadId);
+          persisted = persisted.filter(item => item.uploadId !== uploadId);
+          return Promise.resolve();
+        },
+        close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, chunkSize: 4,
+      });
+      coordinator.enqueueFiles([{ file, fileHandle }]);
+    """)
+    drain_jobs(context)
+    context.eval("globalThis.firstReconcile = coordinator.reconcile()")
+    drain_jobs(context)
+    context.eval(r"""
+      createResolver({ upload_id: 'server-id', status: 'queued', confirmed_parts: [],
+        confirmed_bytes: 0, chunk_size_bytes: 4 });
+    """)
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(sliceCalls)")) == [[0, 8], [0, 4]]
+    context.eval("activeResolvers[0]([])")
+    drain_jobs(context)
+
+    assert json.loads(context.eval(
+        "JSON.stringify(coordinator.getSnapshot().map(task => task.uploadId))"
+    )) == ["server-id"]
+    assert context.eval("abortCalls") == 0
+    assert json.loads(context.eval("JSON.stringify(removed)")) == []
+    assert context.eval(
+        "persisted.some(record => record.uploadId === 'server-id' && record.fileHandle === fileHandle)"
+    ) is True
+
+    context.eval("partResolvers[0].resolve({ confirmed_parts: [0], confirmed_bytes: 4, chunk_size_bytes: 4 })")
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(sliceCalls)")) == [[0, 8], [0, 4], [4, 8]]
+    assert context.eval("abortCalls") == 0
+
+    context.eval(r"""
+      coordinator.applyRemoteEvent({ event_type: 'upload.created', sequence: 3,
+        payload: { upload_id: 'observer-stale', original_name: 'remote.bin', size_bytes: 4,
+          status: 'uploading', chunk_size_bytes: 4 } });
+      globalThis.secondReconcile = coordinator.reconcile();
+    """)
+    drain_jobs(context)
+    context.eval("activeResolvers[1]([])")
+    drain_jobs(context)
+    assert context.eval(
+        "coordinator.getSnapshot().some(task => task.uploadId === 'observer-stale')"
+    ) is False
+    assert context.eval("removed.includes('observer-stale')") is True
+
+
 def test_upload_coordinator_observer_guidance_terminal_order_and_remote_cancel_abort() -> None:
     context = create_js_context()
     context.eval(r"""
