@@ -534,6 +534,9 @@ export function createUploadCoordinator({
         task.controller?.abort();
       }
       notify(token);
+      if (action === 'cancel' && task.cancelSettledRemotely) {
+        return finalizeSettledCancel(task, token);
+      }
       await persistStrict(task, token);
       if (action === 'cancel') {
         await resolveSessionForCancel(task, token);
@@ -1157,6 +1160,10 @@ export function createUploadCoordinator({
             task.mimeType = data.mime_type || data.mimeType || task.mimeType;
             task.sourceDeviceId = data.source_device_id || data.sourceDeviceId || task.sourceDeviceId;
             if (task.cancelRequested) {
+              if (task.cancelSettledRemotely) {
+                await removeTaskPersistence(task, token);
+                continue;
+              }
               const adoption = adoptRemoteSession(task, data, token);
               const adopted = await raceWithDestroy(waitForCancelAware(task, adoption));
               if (adopted === REMOTE_CANCEL_SETTLED || task.cancelSettledRemotely) {

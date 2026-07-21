@@ -3407,6 +3407,7 @@ def test_terminal_event_settles_cancel_before_initial_create_response_returns() 
       globalThis.cancelError = null;
       globalThis.cancelCalls = [];
       globalThis.uploadCalls = 0;
+      globalThis.putCalls = 0;
       globalThis.rows = [];
       globalThis.cryptoObject = {
         randomUUID: () => 'pending-client',
@@ -3423,7 +3424,7 @@ def test_terminal_event_settles_cancel_before_initial_create_response_returns() 
       };
       globalThis.persistence = {
         getAll: () => Promise.resolve(rows.slice()),
-        put(record) { rows = rows.filter(row => row.uploadId !== record.uploadId); rows.push(record); return Promise.resolve(); },
+        put(record) { putCalls += 1; rows = rows.filter(row => row.uploadId !== record.uploadId); rows.push(record); return Promise.resolve(); },
         migrate(previousUploadId, record) {
           rows = rows.filter(row => row.uploadId !== previousUploadId && row.uploadId !== record.uploadId);
           rows.push(record);
@@ -3465,11 +3466,13 @@ def test_terminal_event_settles_cancel_before_initial_create_response_returns() 
     assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == []
     assert context.eval("uploadCalls") == 0
     assert json.loads(context.eval("JSON.stringify(rows)")) == []
+    context.eval("globalThis.putCallsBeforeSecondCancel = putCalls")
     context.eval(r"""
       coordinator.cancel('pending-server').then(result => { secondCancelResult = result; });
     """)
     drain_jobs(context)
     assert context.eval("secondCancelResult.status") == "cancelled"
+    assert context.eval("putCalls") == context.eval("putCallsBeforeSecondCancel")
     assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == []
     assert json.loads(context.eval("JSON.stringify(rows)")) == []
 
