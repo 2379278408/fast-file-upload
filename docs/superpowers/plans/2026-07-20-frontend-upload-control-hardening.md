@@ -144,3 +144,50 @@
 - [x] Run frontend contract, browser E2E, default full suite, compileall, and `git diff --check`.
 - [x] Update the review report with retry matrix, preparing/completing cancellation semantics, exact test results, and residual concerns.
 - [x] Inspect status, diff, and log; stage only intended files and create one new commit without amend.
+
+### Task 9: Lost create response cancellation recovery
+
+**Files:**
+- Modify: `tests/test_frontend_contract.py`
+- Modify: `web/js/upload-coordinator.js`
+
+**Interfaces:**
+- Refines: `cancel(uploadId): Promise<PublicUploadTask>`
+- Reuses: `api.createUploadSession(metadata)` with the original `clientRequestId` and identical file metadata.
+- Reuses: `persistence.migrate(previousUploadId, task)` for atomic client-ID to server-ID adoption.
+
+- [x] Add a contract test whose first create call registers a server session and rejects its response, then cancel retries the same metadata, atomically migrates to the returned server ID, DELETEs the session, removes persistence only after confirmation, and resolves `cancelled` without pumping.
+- [x] Run the focused test and confirm the current implementation rejects without issuing the idempotent create lookup.
+- [x] Keep stable create metadata on the task and add one authoritative session-resolution path shared by prepare and cancellation.
+- [x] Make preparing cancellation retry create after an ambiguous create failure, migrate persistence before DELETE, and commit terminal state only after DELETE succeeds.
+- [x] Run the focused test and confirm pass.
+
+### Task 10: Persistent cancellation intent across recovery
+
+**Files:**
+- Modify: `tests/test_frontend_contract.py`
+- Modify: `web/js/upload-coordinator.js`
+
+**Interfaces:**
+- Refines: `applyRemoteEvent(event): boolean`
+- Refines: `reconcile(): Promise<PublicUploadTask[]>`
+- Preserves: source `file`, `fileHandle`, client-key persistence, and `cancelRequested` while server identity remains unresolved.
+
+- [x] Add a contract test where the initial create and cancellation lookup both fail after server registration; assert cancel rejects, the task remains actionable and non-terminal, persistence and source payload remain, and cancellation intent survives.
+- [x] Extend the test with a matching `upload.created` event and active reconcile response; assert server ID adoption, atomic migration, authoritative DELETE, no upload pump, and final persistence removal.
+- [x] Add a second retry-cancel assertion for recovery without an event, proving the next cancel reuses the same metadata and completes DELETE.
+- [x] Run the focused tests and confirm the current terminal/status guards or rejected prepare promise prevent recovery.
+- [x] Implement a retryable cancellation state and one adoption-and-cancel scheduler used by event, reconcile, and repeated cancel.
+- [x] Run focused recovery tests and confirm pass.
+
+### Task 11: Batch settlement and final verification
+
+**Files:**
+- Modify: `tests/test_frontend_contract.py`
+- Modify: `.superpowers/sdd/branch-review-frontend-report.md`
+
+- [x] Add batch coverage mixing ambiguous preparing cancellation recovery with a normal cancellable task; assert exact `total`, `succeeded`, `failed`, per-task results, and cleared pending state.
+- [x] Run focused RED then GREEN tests and record exact evidence.
+- [ ] Run `pytest -q tests/test_frontend_contract.py`, `pytest -q tests/test_browser_e2e.py`, `pytest -q`, `python3 -m compileall -q app server.py tests`, and `git diff --check`.
+- [ ] Update the frontend review report with root cause, authoritative create recovery semantics, exact test results, and residual concerns.
+- [ ] Inspect status, complete diff, and recent log; stage only intended files and create one independent commit without amend.

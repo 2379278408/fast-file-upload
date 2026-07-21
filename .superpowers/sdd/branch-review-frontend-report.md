@@ -53,6 +53,16 @@ Baseline: `61ec8db` (`fix(upload): preserve tasks across reconcile migration`)
 - Cancelling during deferred completion deletes the server `verifying` session. A late complete response cannot publish a completed message or replace the confirmed cancelled state, and pending batch state clears after settlement.
 - TDD RED coverage produced `8 failed, 2 passed`; the focused GREEN run produced `10 passed, 165 deselected, 1 warning in 0.35s`.
 
+### Follow-up Review 3: Ambiguous Create Cancellation
+
+- Root cause: a successful create whose response was lost left `prepareError` set while `preparePromise` resolved. Preparing cancel then treated the missing client response as proof that no server session existed, committed local `cancelled`, removed persistence, and cleared the control as successful.
+- Create metadata is now stable for the task lifetime. Cancellation with an unresolved server identity repeats POST create with the same `client_request_id`, name, size, MIME type, last-modified value, sample hash, and chunk size to retrieve the idempotent server session.
+- Server identity adoption applies the authoritative snapshot and atomically migrates IndexedDB from client request ID to upload ID before DELETE. Local `cancelled` and persistence removal occur only after DELETE confirms the terminal transition.
+- Repeated create lookup failure rejects cancel while retaining a non-terminal task, source file and handle, client-key persistence, and persisted cancellation intent. A later cancel retries the same metadata.
+- Matching `upload.created` and active reconciliation adopt the server ID through the same migration path, await any concurrent adoption, and schedule the authoritative DELETE. Cancellation intent bypasses stale local terminal guards, and upload pumping remains suppressed throughout recovery.
+- Batch cancellation retains `Promise.allSettled` accounting. The ambiguous task reports failure while a confirmed peer reports success; pending state clears, and later reconciliation finishes the retained intent.
+- TDD RED produced `3 failed, 175 deselected, 1 warning in 0.51s`. Final focused recovery coverage produced `5 passed, 174 deselected, 1 warning in 0.93s`.
+
 ## UX Decisions
 
 - Pending controls keep the last server-confirmed status and replace the card status text with `正在暂停`, `正在继续`, or `正在取消`.
@@ -63,8 +73,8 @@ Baseline: `61ec8db` (`fix(upload): preserve tasks across reconcile migration`)
 
 ## Verification
 
-- Frontend contract suite: `175 passed, 1 warning in 4.56s`.
-- Browser E2E suite: `22 passed, 1 warning in 164.39s`.
+- Frontend contract suite: `179 passed, 1 warning in 31.24s`.
+- Browser E2E suite: `22 passed, 1 warning in 181.50s`.
 - Focused production picker reload regression: `1 passed, 1 warning in 15.46s`.
 - Default full suite: `569 passed, 1 deselected, 1 warning in 216.08s`.
 - `python3 -m compileall -q app server.py tests`: passed. The environment has no `python` executable alias.
@@ -77,3 +87,4 @@ Baseline: `61ec8db` (`fix(upload): preserve tasks across reconcile migration`)
 - IndexedDB implementations that cannot structured-clone a handle retain the existing metadata-only fallback. Real Chromium handle cloning and reload continuation are covered.
 - When both a control request and its recovery GET fail, the card retains the last confirmed local snapshot and displays the control error; the rejected promise drives the toast and a later reconcile can recover.
 - The first full browser run hit a Chromium OPFS fixture `FileSystemWritableFileStream` data-pipe `AbortError` before coordinator code executed. The focused OPFS regression and a complete browser rerun passed without product changes or relaxed assertions.
+- An unresolved create request still keeps cancel pending until the request rejects or an authoritative event/reconcile path supplies the session. Once either signal arrives, the coordinator converges through the shared adoption path without starting an upload worker.

@@ -166,6 +166,8 @@ function persistedTask(task) {
     serverUpdatedAt: task.serverUpdatedAt,
     serverVersion: task.serverVersion,
     chunkSize: task.chunkSize,
+    sessionReady: task.sessionReady,
+    cancelRequested: task.cancelRequested,
   };
 }
 
@@ -362,6 +364,66 @@ export function createUploadCoordinator({
     if (!isCurrent(token)) throw coordinatorDestroyedError();
     return raceWithDestroy(persistence.put(persistedTask(task)));
   };
+  const createMetadataFor = task => {
+    if (task.createMetadata) return task.createMetadata;
+    if (!task.identity) throw task.prepareError || operationError('上传文件身份尚未生成');
+    task.createMetadata = {
+      clientRequestId: task.clientRequestId,
+      name: task.name,
+      sizeBytes: task.sizeBytes,
+      mimeType: task.mimeType,
+      lastModified: task.identity.lastModified,
+      sampleSha256: task.identity.sampleSha256,
+    };
+    if (task.chunkSize !== null) task.createMetadata.chunkSize = task.chunkSize;
+    return task.createMetadata;
+  };
+  const adoptServerSession = async (task, response, token = generation) => {
+    if (!isCurrent(token)) throw coordinatorDestroyedError();
+    const remoteUploadId = response?.upload_id || response?.uploadId;
+    if (!remoteUploadId) throw operationError('服务端未返回上传会话 ID');
+    const previousUploadId = task.uploadId;
+    const previousSessionReady = task.sessionReady;
+    task.uploadId = remoteUploadId;
+    task.sessionReady = true;
+    task.prepareError = null;
+    task.sourceDeviceId = response.source_device_id || response.sourceDeviceId || task.sourceDeviceId;
+    applyServerState(task, response, { authoritative: true });
+    applyRemoteStatus(task, response);
+    touchTask(task);
+    try {
+      if (previousUploadId !== task.uploadId && persistence.migrate) {
+        await raceWithDestroy(persistence.migrate(previousUploadId, persistedTask(task)));
+      } else {
+        await persistStrict(task, token);
+      }
+    } catch (error) {
+      task.uploadId = previousUploadId;
+      task.sessionReady = previousSessionReady;
+      touchTask(task);
+      throw error;
+    }
+    if (!isCurrent(token)) throw coordinatorDestroyedError();
+    return task;
+  };
+  const resolveSessionForCancel = async (task, token = generation) => {
+    if (task.sessionAdoptionPromise) await raceWithDestroy(task.sessionAdoptionPromise);
+    if (task.sessionReady) return task;
+    if (task.preparePromise) await raceWithDestroy(task.preparePromise);
+    if (task.sessionAdoptionPromise) await raceWithDestroy(task.sessionAdoptionPromise);
+    if (task.sessionReady) return task;
+    let response;
+    try {
+      response = await raceWithDestroy(api.createUploadSession(createMetadataFor(task)));
+    } catch (error) {
+      if (task.sessionAdoptionPromise) await raceWithDestroy(task.sessionAdoptionPromise);
+      if (task.sessionReady) return task;
+      throw error;
+    }
+    if (task.sessionAdoptionPromise) await raceWithDestroy(task.sessionAdoptionPromise);
+    if (task.sessionReady) return task;
+    return adoptServerSession(task, response, token);
+  };
   const removeTaskPersistence = async (task, token = generation) => {
     const uploadIds = Array.from(new Set([task.uploadId, task.clientRequestId].filter(Boolean)));
     for (const uploadId of uploadIds) {
@@ -392,7 +454,8 @@ export function createUploadCoordinator({
   };
   const runControl = (task, action, token = generation) => {
     if (!isCurrent(token)) return Promise.reject(coordinatorDestroyedError());
-    if (TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(task.status))) {
+    if (TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(task.status))
+        && !(action === 'cancel' && task.cancelRequested && !task.sessionReady)) {
       return Promise.reject(operationError('上传任务已结束'));
     }
     if (task.actionPromise) {
@@ -404,10 +467,7 @@ export function createUploadCoordinator({
       task.pendingAction = action;
       task.errorCode = null;
       task.errorMessage = null;
-      if (action === 'cancel') {
-        task.cancelRequested = true;
-        if (task.status === 'preparing') task.status = 'cancelled';
-      }
+      if (action === 'cancel') task.cancelRequested = true;
       touchTask(task);
       if (action === 'pause' || action === 'cancel') {
         task.inFlightBytes = 0;
@@ -415,19 +475,12 @@ export function createUploadCoordinator({
       }
       notify(token);
       await persistStrict(task, token);
-      if (!task.sessionReady && task.preparePromise) await raceWithDestroy(task.preparePromise);
-      if (!isCurrent(token)) throw coordinatorDestroyedError();
-      if (action === 'cancel' && (!task.sessionReady || task.prepareError)) {
-        task.status = 'cancelled';
-        task.prepareError = null;
-        task.errorCode = null;
-        task.errorMessage = null;
-        task.pendingAction = null;
-        touchTask(task);
-        await removeTaskPersistence(task, token);
-        notify(token);
-        return publicTask(task);
+      if (action === 'cancel') {
+        await resolveSessionForCancel(task, token);
+      } else if (!task.sessionReady && task.preparePromise) {
+        await raceWithDestroy(task.preparePromise);
       }
+      if (!isCurrent(token)) throw coordinatorDestroyedError();
       if (task.prepareError) throw task.prepareError;
       if (!task.sessionReady) throw operationError(task.errorMessage || '上传会话尚未创建');
 
@@ -463,14 +516,19 @@ export function createUploadCoordinator({
       return publicTask(task);
     })().catch(async error => {
       if (error.name === 'CoordinatorDestroyedError') throw error;
-      if (task.prepareError !== error) {
+      if (action === 'cancel' && !task.sessionReady) {
+        if (TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(task.status))) task.status = 'failed';
+        task.errorCode = 'cancel-failed';
+        task.errorMessage = error.message;
+        touchTask(task);
+        await persistStrict(task, token);
+      } else if (task.prepareError !== error) {
         await recoverAuthoritativeState(task, token, error);
       } else {
         task.errorCode = 'session-create-failed';
         task.errorMessage = error.message;
         touchTask(task);
       }
-      if (action === 'cancel') task.cancelRequested = false;
       task.pendingAction = null;
       touchTask(task);
       notify(token);
@@ -480,6 +538,29 @@ export function createUploadCoordinator({
     });
     task.actionPromise = operation;
     return operation;
+  };
+  const adoptRemoteSession = (task, data, token = generation) => {
+    if (task.sessionAdoptionPromise) return task.sessionAdoptionPromise;
+    const operation = adoptServerSession(task, data, token).finally(() => {
+      if (task.sessionAdoptionPromise === operation) task.sessionAdoptionPromise = null;
+    });
+    task.sessionAdoptionPromise = operation;
+    return operation;
+  };
+  const scheduleAuthoritativeCancel = (task, data, token = generation) => {
+    adoptRemoteSession(task, data, token)
+      .then(() => {
+        if (!isCurrent(token) || !task.cancelRequested) return null;
+        return runControl(task, 'cancel', token);
+      })
+      .catch(error => {
+        if (!isCurrent(token) || error.name === 'CoordinatorDestroyedError') return;
+        task.errorCode = 'cancel-failed';
+        task.errorMessage = error.message;
+        touchTask(task);
+        persist(task, token);
+        notify(token);
+      });
   };
   const nextMissingPart = task => {
     const count = Math.ceil(task.sizeBytes / task.chunkSize);
@@ -626,7 +707,8 @@ export function createUploadCoordinator({
       sourceDeviceId: null, isSourceDevice: true, errorCode: null, errorMessage: null,
       createdAt: normalizeCreatedAt(now(), Date.now()), samples: [], controller: null, worker: null,
       pendingAction: null, actionPromise: null, cancelRequested: false,
-      preparePromise: null, prepareError: null,
+      preparePromise: null, prepareError: null, createMetadata: null,
+      sessionAdoptionPromise: null,
       sessionReady: false,
       chunkSize: Number.isInteger(chunkSize) && chunkSize > 0 ? chunkSize : null,
       liveRevision: 0,
@@ -648,24 +730,10 @@ export function createUploadCoordinator({
     try {
       task.identity = await raceWithDestroy(sampleFileIdentity(task.file, cryptoObject));
       touchTask(task);
-      if (!isCurrent(token) || task.status === 'cancelled') return;
-      const metadata = {
-        clientRequestId: task.clientRequestId,
-        name: task.name,
-        sizeBytes: task.sizeBytes,
-        mimeType: task.mimeType,
-        lastModified: task.identity.lastModified,
-        sampleSha256: task.identity.sampleSha256,
-      };
-      if (task.chunkSize !== null) metadata.chunkSize = task.chunkSize;
-      const response = await raceWithDestroy(api.createUploadSession(metadata));
       if (!isCurrent(token)) return;
-      const previousUploadId = task.uploadId;
-      task.uploadId = response.upload_id || response.uploadId || task.uploadId;
-      task.sessionReady = true;
-      task.sourceDeviceId = response.source_device_id || response.sourceDeviceId || null;
-      applyServerState(task, response, { authoritative: true });
-      touchTask(task);
+      const response = await raceWithDestroy(api.createUploadSession(createMetadataFor(task)));
+      if (!isCurrent(token)) return;
+      await adoptServerSession(task, response, token);
       if (task.cancelRequested) {
         return;
       }
@@ -678,11 +746,7 @@ export function createUploadCoordinator({
         await raceWithDestroy(api.controlUpload(task.uploadId, 'pause')).catch(() => {});
       }
       if (!isCurrent(token)) return;
-      if (previousUploadId !== task.uploadId && persistence.migrate) {
-        await raceWithDestroy(persistence.migrate(previousUploadId, persistedTask(task)));
-      } else {
-        await persist(task, token);
-      }
+      await persist(task, token);
       if (!isCurrent(token)) return;
     } catch (error) {
       if (!isCurrent(token)) return;
@@ -704,12 +768,14 @@ export function createUploadCoordinator({
       confirmedBytes: record.confirmedBytes || 0, inFlightBytes: 0,
       progressPercent: record.sizeBytes ? (record.confirmedBytes || 0) * 100 / record.sizeBytes : 0,
       speedBytesPerSecond: 0, etaSeconds: null, samples: [], controller: null, worker: null,
-      isSourceDevice: Boolean(record.isSourceDevice), sessionReady: true,
+      isSourceDevice: Boolean(record.isSourceDevice),
+      sessionReady: record.sessionReady ?? (record.uploadId !== record.clientRequestId),
       chunkSize: record.chunkSize ?? record.chunk_size_bytes ?? chunkSize,
       liveRevision: record.liveRevision ?? 0,
       reconcileVersion: 0,
-      pendingAction: null, actionPromise: null, cancelRequested: false,
-      preparePromise: Promise.resolve(), prepareError: null,
+      pendingAction: null, actionPromise: null, cancelRequested: Boolean(record.cancelRequested),
+      preparePromise: Promise.resolve(), prepareError: null, createMetadata: null,
+      sessionAdoptionPromise: null,
       serverSequence: record.serverSequence ?? null,
       serverUpdatedAt: record.serverUpdatedAt ?? null,
       serverVersion: record.serverVersion ?? null,
@@ -740,7 +806,8 @@ export function createUploadCoordinator({
       liveRevision: 0,
       reconcileVersion: 0,
       pendingAction: null, actionPromise: null, cancelRequested: false,
-      preparePromise: Promise.resolve(), prepareError: null,
+      preparePromise: Promise.resolve(), prepareError: null, createMetadata: null,
+      sessionAdoptionPromise: null,
       serverSequence: null, serverUpdatedAt: null, serverVersion: null,
     };
   }
@@ -976,6 +1043,10 @@ export function createUploadCoordinator({
         const data = eventData(item);
         return [data.upload_id || data.uploadId, data];
       }));
+      const remoteByClientRequestId = new Map(remote.map(item => {
+        const data = eventData(item);
+        return [data.client_request_id || data.clientRequestId, data];
+      }).filter(([clientRequestId]) => Boolean(clientRequestId)));
       const activeUploadIds = new Set(remoteById.keys());
 
       for (const record of records) {
@@ -986,15 +1057,21 @@ export function createUploadCoordinator({
           tasks.push(task);
           baselines.set(task, taskBaseline(task));
         }
-        const data = remoteById.get(record.uploadId);
+        const data = remoteById.get(record.uploadId)
+          || remoteByClientRequestId.get(record.clientRequestId);
         if (data) {
-          remoteById.delete(record.uploadId);
+          remoteById.delete(data.upload_id || data.uploadId);
           if (matchesBaseline(task, baselines.get(task))) {
             task.clientRequestId = data.client_request_id || data.clientRequestId || task.clientRequestId;
             task.name = data.original_name || data.name || task.name;
             task.sizeBytes = data.size_bytes ?? data.sizeBytes ?? task.sizeBytes;
             task.mimeType = data.mime_type || data.mimeType || task.mimeType;
             task.sourceDeviceId = data.source_device_id || data.sourceDeviceId || task.sourceDeviceId;
+            if (task.cancelRequested) {
+              await adoptRemoteSession(task, data, token);
+              await runControl(task, 'cancel', token);
+              continue;
+            }
             applyServerState(task, data, { authoritative: true });
             applyRemoteStatus(task, data);
             await coordinateSourceFile(task, token);
@@ -1037,7 +1114,13 @@ export function createUploadCoordinator({
         if (!task) {
           task = observerTask(payload);
           tasks.push(task);
-        } else if (!isFreshEvent(task, payload)) {
+        } else if (!task.cancelRequested && !isFreshEvent(task, payload)) {
+          return true;
+        }
+        if (task.cancelRequested && remoteUploadId) {
+          task.liveRevision = eventRevision;
+          scheduleAuthoritativeCancel(task, payload);
+          notify();
           return true;
         }
         if (remoteUploadId) task.uploadId = remoteUploadId;

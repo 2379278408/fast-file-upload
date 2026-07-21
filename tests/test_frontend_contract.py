@@ -2451,6 +2451,7 @@ def test_upload_persistence_only_clones_metadata_and_optional_handle() -> None:
       persistence.put({
         uploadId: 'u1', name: 'a.bin', status: 'paused', confirmedParts: [0],
         file: { forbidden: true }, fileHandle: { kind: 'file' }, runtimeOnly: 9,
+        sessionReady: false, cancelRequested: true,
       }).then(() => persistence.getAll()).then(value => { globalThis.persistedRows = value; });
     """)
     drain_jobs(context)
@@ -2458,6 +2459,8 @@ def test_upload_persistence_only_clones_metadata_and_optional_handle() -> None:
     assert "file" not in row
     assert "runtimeOnly" not in row
     assert row["fileHandle"] == {"kind": "file"}
+    assert row["sessionReady"] is False
+    assert row["cancelRequested"] is True
 
 
 def test_upload_persistence_migrates_keys_in_one_atomic_transaction() -> None:
@@ -3157,7 +3160,7 @@ def test_prepare_pending_control_migrates_client_key_without_reload_ghost() -> N
     )) == ["server-key"]
 
 
-def test_cancel_preparing_marks_cancelled_then_deletes_deferred_created_session() -> None:
+def test_cancel_preparing_stays_pending_then_deletes_deferred_created_session() -> None:
     context = create_js_context()
     context.eval(r"""
       globalThis.createResolver = null;
@@ -3212,7 +3215,7 @@ def test_cancel_preparing_marks_cancelled_then_deletes_deferred_created_session(
       coordinator.cancel('cancel-client').then(() => { cancelSettled = true; });
     """)
     drain_jobs(context)
-    assert context.eval("coordinator.getSnapshot()[0].status") == "cancelled"
+    assert context.eval("coordinator.getSnapshot()[0].status") == "preparing"
     assert context.eval("coordinator.getSnapshot()[0].pendingAction") == "cancel"
     assert context.eval("cancelSettled") is False
     assert context.eval("uploadCalls") == 0
@@ -3289,6 +3292,382 @@ def test_cancel_all_preempts_deferred_complete_and_suppresses_publication() -> N
     assert context.eval("coordinator.getSnapshot()[0].status") == "cancelled"
     assert context.eval("coordinator.getSummary().hasPendingControl") is False
     assert context.eval("removed.includes('cancel-complete')") is True
+
+
+def test_cancel_preparing_recovers_lost_create_response_before_terminal_commit() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.createReject = null;
+      globalThis.createAttempts = [];
+      globalThis.cancelCalls = [];
+      globalThis.migrations = [];
+      globalThis.uploadCalls = 0;
+      globalThis.rows = [];
+      globalThis.cancelResult = null;
+      globalThis.cancelError = null;
+      globalThis.handle = { kind: 'file', name: 'lost-response.bin' };
+      globalThis.cryptoObject = {
+        randomUUID: () => 'lost-client',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'lost-response.bin', size: 4, type: 'application/octet-stream', lastModified: 7,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      };
+      globalThis.api = {
+        createUploadSession(metadata) {
+          createAttempts.push(JSON.parse(JSON.stringify(metadata)));
+          if (createAttempts.length === 1) {
+            return new Promise((_resolve, reject) => { createReject = reject; });
+          }
+          return Promise.resolve({ upload_id: 'lost-server', client_request_id: 'lost-client',
+            status: 'queued', confirmed_parts: [], confirmed_bytes: 0, chunk_size_bytes: 4 });
+        },
+        uploadPart() { uploadCalls += 1; return Promise.resolve({}); },
+        cancelUpload(id) {
+          cancelCalls.push(id);
+          return Promise.resolve({ status: 'cancelled' });
+        },
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve(rows.slice()),
+        put(record) {
+          rows = rows.filter(row => row.uploadId !== record.uploadId);
+          rows.push(record);
+          return Promise.resolve();
+        },
+        migrate(previousUploadId, record) {
+          migrations.push([previousUploadId, record.uploadId]);
+          rows = rows.filter(row => row.uploadId !== previousUploadId && row.uploadId !== record.uploadId);
+          rows.push(record);
+          return Promise.resolve();
+        },
+        remove(id) {
+          rows = rows.filter(row => row.uploadId !== id);
+          return Promise.resolve();
+        },
+        close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, chunkSize: 4, maxActive: 1,
+      });
+      coordinator.enqueueFiles([{ file, fileHandle: handle }]);
+    """)
+    drain_jobs(context)
+    assert context.eval("createAttempts.length") == 1
+    context.eval(r"""
+      coordinator.cancel('lost-client')
+        .then(result => { cancelResult = result; })
+        .catch(error => { cancelError = error.message; });
+      createReject(new Error('response lost'));
+    """)
+    drain_jobs(context)
+
+    assert context.eval("cancelError") is None
+    assert context.eval("cancelResult.status") == "cancelled"
+    assert context.eval("coordinator.getSnapshot()[0].status") == "cancelled"
+    assert json.loads(context.eval("JSON.stringify(createAttempts[0])")) == json.loads(
+        context.eval("JSON.stringify(createAttempts[1])")
+    )
+    assert json.loads(context.eval("JSON.stringify(migrations)")) == [
+        ["lost-client", "lost-server"]
+    ]
+    assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == ["lost-server"]
+    assert json.loads(context.eval("JSON.stringify(rows)")) == []
+    assert context.eval("uploadCalls") == 0
+    assert context.eval("coordinator.getSummary().hasPendingControl") is False
+
+
+def test_lost_create_response_event_adopts_session_and_finishes_cancel() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.firstCreateReject = null;
+      globalThis.createAttempts = 0;
+      globalThis.cancelCalls = [];
+      globalThis.migrations = [];
+      globalThis.uploadCalls = 0;
+      globalThis.rows = [];
+      globalThis.cancelError = null;
+      globalThis.handle = { kind: 'file', name: 'event-recovery.bin' };
+      globalThis.cryptoObject = {
+        randomUUID: () => 'event-client',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'event-recovery.bin', size: 4, type: '', lastModified: 9,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      };
+      globalThis.api = {
+        createUploadSession() {
+          createAttempts += 1;
+          if (createAttempts === 1) {
+            return new Promise((_resolve, reject) => { firstCreateReject = reject; });
+          }
+          return Promise.reject(new Error('lookup offline'));
+        },
+        uploadPart() { uploadCalls += 1; return Promise.resolve({}); },
+        cancelUpload(id) {
+          cancelCalls.push(id);
+          return Promise.resolve({ status: 'cancelled' });
+        },
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve(rows.slice()),
+        put(record) {
+          rows = rows.filter(row => row.uploadId !== record.uploadId);
+          rows.push(record);
+          return Promise.resolve();
+        },
+        migrate(previousUploadId, record) {
+          migrations.push([previousUploadId, record.uploadId]);
+          rows = rows.filter(row => row.uploadId !== previousUploadId && row.uploadId !== record.uploadId);
+          rows.push(record);
+          return Promise.resolve();
+        },
+        remove(id) {
+          rows = rows.filter(row => row.uploadId !== id);
+          return Promise.resolve();
+        },
+        close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, chunkSize: 4, maxActive: 1,
+      });
+      coordinator.enqueueFiles([{ file, fileHandle: handle }]);
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      coordinator.cancel('event-client').catch(error => { cancelError = error.message; });
+      firstCreateReject(new Error('response lost'));
+    """)
+    drain_jobs(context)
+
+    assert context.eval("cancelError") == "lookup offline"
+    assert context.eval("createAttempts") == 2
+    assert context.eval("['cancelled', 'completed', 'expired'].includes(coordinator.getSnapshot()[0].status)") is False
+    assert context.eval("rows.length") == 1
+    assert context.eval("rows[0].uploadId") == "event-client"
+    assert context.eval("rows[0].fileHandle === handle") is True
+    assert context.eval("rows[0].cancelRequested") is True
+    assert context.eval("uploadCalls") == 0
+
+    context.eval(r"""
+      coordinator.applyRemoteEvent({ event_type: 'upload.created', payload: {
+        upload_id: 'event-server', client_request_id: 'event-client', status: 'queued',
+        original_name: 'event-recovery.bin', size_bytes: 4, confirmed_parts: [],
+        confirmed_bytes: 0, chunk_size_bytes: 4,
+      }});
+    """)
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(migrations)")) == [
+        ["event-client", "event-server"]
+    ]
+    assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == ["event-server"]
+    assert context.eval("coordinator.getSnapshot()[0].status") == "cancelled"
+    assert context.eval("coordinator.getSummary().hasPendingControl") is False
+    assert json.loads(context.eval("JSON.stringify(rows)")) == []
+    assert context.eval("uploadCalls") == 0
+
+
+def test_lost_create_response_next_cancel_retries_same_session_identity() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.firstCreateReject = null;
+      globalThis.createAttempts = [];
+      globalThis.cancelCalls = [];
+      globalThis.rows = [];
+      globalThis.firstCancelError = null;
+      globalThis.secondCancelResult = null;
+      globalThis.uploadCalls = 0;
+      globalThis.cryptoObject = {
+        randomUUID: () => 'repeat-client',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'repeat-cancel.bin', size: 4, type: '', lastModified: 10,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      };
+      globalThis.api = {
+        createUploadSession(metadata) {
+          createAttempts.push(JSON.parse(JSON.stringify(metadata)));
+          if (createAttempts.length === 1) {
+            return new Promise((_resolve, reject) => { firstCreateReject = reject; });
+          }
+          if (createAttempts.length === 2) return Promise.reject(new Error('lookup offline'));
+          return Promise.resolve({ upload_id: 'repeat-server', client_request_id: 'repeat-client',
+            status: 'queued', confirmed_parts: [], confirmed_bytes: 0, chunk_size_bytes: 4 });
+        },
+        uploadPart() { uploadCalls += 1; return Promise.resolve({}); },
+        cancelUpload(id) {
+          cancelCalls.push(id);
+          return Promise.resolve({ status: 'cancelled' });
+        },
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve(rows.slice()),
+        put(record) {
+          rows = rows.filter(row => row.uploadId !== record.uploadId);
+          rows.push(record);
+          return Promise.resolve();
+        },
+        migrate(previousUploadId, record) {
+          rows = rows.filter(row => row.uploadId !== previousUploadId && row.uploadId !== record.uploadId);
+          rows.push(record);
+          return Promise.resolve();
+        },
+        remove(id) {
+          rows = rows.filter(row => row.uploadId !== id);
+          return Promise.resolve();
+        },
+        close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, chunkSize: 4,
+      });
+      coordinator.enqueueFiles([file]);
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      coordinator.cancel('repeat-client').catch(error => { firstCancelError = error.message; });
+      firstCreateReject(new Error('response lost'));
+    """)
+    drain_jobs(context)
+    assert context.eval("firstCancelError") == "lookup offline"
+    assert context.eval("rows[0].cancelRequested") is True
+
+    context.eval(r"""
+      coordinator.cancel('repeat-client').then(result => { secondCancelResult = result; });
+    """)
+    drain_jobs(context)
+    assert context.eval("secondCancelResult.status") == "cancelled"
+    assert context.eval("createAttempts.length") == 3
+    assert context.eval("JSON.stringify(createAttempts[0]) === JSON.stringify(createAttempts[2])") is True
+    assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == ["repeat-server"]
+    assert json.loads(context.eval("JSON.stringify(rows)")) == []
+    assert context.eval("uploadCalls") == 0
+
+
+def test_ambiguous_cancel_batch_settles_then_reconcile_finishes_intent() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.identifiers = ['batch-client-a', 'batch-client-b'];
+      globalThis.firstCreateReject = null;
+      globalThis.createCounts = {};
+      globalThis.cancelCalls = [];
+      globalThis.migrations = [];
+      globalThis.rows = [];
+      globalThis.activeUploads = [];
+      globalThis.batchResult = null;
+      globalThis.uploadCalls = 0;
+      globalThis.cryptoObject = {
+        randomUUID: () => identifiers.shift(),
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.fileA = {
+        name: 'ambiguous.bin', size: 4, type: '', lastModified: 11,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      };
+      globalThis.fileB = {
+        name: 'normal.bin', size: 4, type: '', lastModified: 12,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      };
+      globalThis.api = {
+        createUploadSession(metadata) {
+          const id = metadata.clientRequestId;
+          createCounts[id] = (createCounts[id] || 0) + 1;
+          if (id === 'batch-client-a') {
+            if (createCounts[id] === 1) {
+              return new Promise((_resolve, reject) => { firstCreateReject = reject; });
+            }
+            return Promise.reject(new Error('lookup offline'));
+          }
+          return Promise.resolve({ upload_id: 'batch-server-b', client_request_id: id,
+            status: 'queued', confirmed_parts: [], confirmed_bytes: 0, chunk_size_bytes: 4 });
+        },
+        listActiveUploads: () => Promise.resolve(activeUploads.slice()),
+        uploadPart() { uploadCalls += 1; return Promise.resolve({}); },
+        cancelUpload(id) {
+          cancelCalls.push(id);
+          return Promise.resolve({ status: 'cancelled' });
+        },
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve(rows.slice()),
+        put(record) {
+          rows = rows.filter(row => row.uploadId !== record.uploadId);
+          rows.push(record);
+          return Promise.resolve();
+        },
+        migrate(previousUploadId, record) {
+          migrations.push([previousUploadId, record.uploadId]);
+          rows = rows.filter(row => row.uploadId !== previousUploadId && row.uploadId !== record.uploadId);
+          rows.push(record);
+          return Promise.resolve();
+        },
+        remove(id) {
+          rows = rows.filter(row => row.uploadId !== id);
+          return Promise.resolve();
+        },
+        close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, chunkSize: 4, maxActive: 0,
+      });
+      coordinator.enqueueFiles([fileA, fileB]);
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      coordinator.cancelAll().then(result => { batchResult = result; });
+      firstCreateReject(new Error('response lost'));
+    """)
+    drain_jobs(context)
+
+    assert context.eval("batchResult.total") == 2
+    assert context.eval("batchResult.succeeded") == 1
+    assert context.eval("batchResult.failed") == 1
+    assert context.eval("batchResult.results.length") == 2
+    assert context.eval("coordinator.getSummary().hasPendingControl") is False
+    assert context.eval("createCounts['batch-client-a']") == 2
+    assert context.eval("rows.some(row => row.uploadId === 'batch-client-a' && row.cancelRequested === true)") is True
+    assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == ["batch-server-b"]
+
+    context.eval(r"""
+      activeUploads = [{
+        upload_id: 'batch-server-a', client_request_id: 'batch-client-a', status: 'queued',
+        original_name: 'ambiguous.bin', size_bytes: 4, confirmed_parts: [],
+        confirmed_bytes: 0, chunk_size_bytes: 4,
+      }];
+      globalThis.reconcileResult = null;
+      coordinator.destroy();
+      globalThis.recoveryCoordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, chunkSize: 4, maxActive: 0,
+      });
+      recoveryCoordinator.start().then(result => { reconcileResult = result; });
+    """)
+    drain_jobs(context)
+    assert context.eval("reconcileResult[0].status") == "cancelled"
+    assert json.loads(context.eval("JSON.stringify(migrations)")) == [
+        ["batch-client-b", "batch-server-b"],
+        ["batch-client-a", "batch-server-a"],
+    ]
+    assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == [
+        "batch-server-b",
+        "batch-server-a",
+    ]
+    assert json.loads(context.eval("JSON.stringify(rows)")) == []
+    assert context.eval("uploadCalls") == 0
 
 
 def test_upload_created_at_is_normalized_to_iso_at_every_source() -> None:

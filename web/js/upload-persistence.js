@@ -6,6 +6,7 @@ const PERSISTED_FIELDS = [
   'mimeType', 'status', 'confirmedParts', 'confirmedBytes', 'sourceDeviceId',
   'isSourceDevice', 'errorCode', 'errorMessage', 'createdAt',
   'serverSequence', 'serverUpdatedAt', 'serverVersion', 'chunkSize',
+  'sessionReady', 'cancelRequested',
 ];
 
 function closedError() {
