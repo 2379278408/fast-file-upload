@@ -3403,6 +3403,7 @@ def test_terminal_event_settles_cancel_before_initial_create_response_returns() 
     context.eval(r"""
       globalThis.createResolve = null;
       globalThis.cancelResult = null;
+      globalThis.secondCancelResult = null;
       globalThis.cancelError = null;
       globalThis.cancelCalls = [];
       globalThis.uploadCalls = 0;
@@ -3463,6 +3464,13 @@ def test_terminal_event_settles_cancel_before_initial_create_response_returns() 
     assert context.eval("coordinator.getSnapshot().find(row => row.clientRequestId === 'pending-client').errorCode") is None
     assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == []
     assert context.eval("uploadCalls") == 0
+    assert json.loads(context.eval("JSON.stringify(rows)")) == []
+    context.eval(r"""
+      coordinator.cancel('pending-server').then(result => { secondCancelResult = result; });
+    """)
+    drain_jobs(context)
+    assert context.eval("secondCancelResult.status") == "cancelled"
+    assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == []
     assert json.loads(context.eval("JSON.stringify(rows)")) == []
 
 

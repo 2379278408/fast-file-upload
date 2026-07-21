@@ -380,6 +380,7 @@ export function createUploadCoordinator({
   };
   const REMOTE_CANCEL_SETTLED = {};
   const ensureCancelSettlement = task => {
+    if (task.cancelSettledRemotely) return Promise.resolve(REMOTE_CANCEL_SETTLED);
     if (task.cancelSettlementPromise) return task.cancelSettlementPromise;
     task.cancelSettlementPromise = new Promise(resolve => {
       task.resolveCancelSettlement = resolve;
@@ -424,6 +425,7 @@ export function createUploadCoordinator({
     return task;
   };
   const resolveSessionForCancel = async (task, token = generation) => {
+    if (task.cancelSettledRemotely) return task;
     if (task.sessionAdoptionPromise) {
       const result = await raceWithDestroy(waitForCancelAware(task, task.sessionAdoptionPromise));
       if (result === REMOTE_CANCEL_SETTLED) return task;
@@ -1155,7 +1157,12 @@ export function createUploadCoordinator({
             task.mimeType = data.mime_type || data.mimeType || task.mimeType;
             task.sourceDeviceId = data.source_device_id || data.sourceDeviceId || task.sourceDeviceId;
             if (task.cancelRequested) {
-              await adoptRemoteSession(task, data, token);
+              const adoption = adoptRemoteSession(task, data, token);
+              const adopted = await raceWithDestroy(waitForCancelAware(task, adoption));
+              if (adopted === REMOTE_CANCEL_SETTLED || task.cancelSettledRemotely) {
+                await removeTaskPersistence(task, token);
+                continue;
+              }
               await runControl(task, 'cancel', token);
               continue;
             }
