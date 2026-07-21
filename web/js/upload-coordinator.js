@@ -579,7 +579,8 @@ export function createUploadCoordinator({
   }
 
   async function uploadOne(task, token) {
-    if (!isCurrent(token) || task.status !== 'queued' || !task.file || !task.isSourceDevice) return;
+    if (!isCurrent(token) || task.status !== 'queued' || task.cancelRequested
+        || !task.file || !task.isSourceDevice) return;
     const partIndex = nextMissingPart(task);
     if (partIndex === null) {
       task.status = 'completing';
@@ -677,7 +678,8 @@ export function createUploadCoordinator({
         const active = tasks.filter(task => task.worker).length;
         const available = maxActive - active;
         if (available <= 0) break;
-        const ready = tasks.filter(task => task.status === 'queued' && !task.pendingAction && task.file
+        const ready = tasks.filter(task => task.status === 'queued' && !task.cancelRequested
+          && !task.pendingAction && task.file
           && task.isSourceDevice && !task.worker).slice(0, available);
         if (!ready.length) break;
         ready.forEach(task => {
@@ -1013,7 +1015,7 @@ export function createUploadCoordinator({
     prioritize(uploadId) {
       if (destroyed) return;
       const index = tasks.findIndex(task => task.uploadId === uploadId || task.clientRequestId === uploadId);
-      if (index < 1 || tasks[index].status !== 'queued') return;
+      if (index < 1 || tasks[index].status !== 'queued' || tasks[index].cancelRequested) return;
       const [task] = tasks.splice(index, 1);
       const firstQueued = tasks.findIndex(item => item.status === 'queued');
       tasks.splice(firstQueued < 0 ? tasks.length : firstQueued, 0, task);
@@ -1115,6 +1117,16 @@ export function createUploadCoordinator({
           task = observerTask(payload);
           tasks.push(task);
         } else if (!task.cancelRequested && !isFreshEvent(task, payload)) {
+          return true;
+        }
+        const remoteStatus = normalizedStatus(payload.status);
+        if (task.cancelRequested && TERMINAL_UPLOAD_STATUSES.has(remoteStatus)) {
+          if (remoteUploadId) task.uploadId = remoteUploadId;
+          if (remoteClientRequestId) task.clientRequestId = remoteClientRequestId;
+          applyServerState(task, payload);
+          applyRemoteStatus(task, payload);
+          task.liveRevision = eventRevision;
+          notify();
           return true;
         }
         if (task.cancelRequested && remoteUploadId) {

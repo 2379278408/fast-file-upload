@@ -3391,6 +3391,7 @@ def test_lost_create_response_event_adopts_session_and_finishes_cancel() -> None
       globalThis.uploadCalls = 0;
       globalThis.rows = [];
       globalThis.cancelError = null;
+      globalThis.migrateResolve = null;
       globalThis.handle = { kind: 'file', name: 'event-recovery.bin' };
       globalThis.cryptoObject = {
         randomUUID: () => 'event-client',
@@ -3423,9 +3424,13 @@ def test_lost_create_response_event_adopts_session_and_finishes_cancel() -> None
         },
         migrate(previousUploadId, record) {
           migrations.push([previousUploadId, record.uploadId]);
-          rows = rows.filter(row => row.uploadId !== previousUploadId && row.uploadId !== record.uploadId);
-          rows.push(record);
-          return Promise.resolve();
+          return new Promise(resolve => {
+            migrateResolve = () => {
+              rows = rows.filter(row => row.uploadId !== previousUploadId && row.uploadId !== record.uploadId);
+              rows.push(record);
+              resolve();
+            };
+          });
         },
         remove(id) {
           rows = rows.filter(row => row.uploadId !== id);
@@ -3439,6 +3444,11 @@ def test_lost_create_response_event_adopts_session_and_finishes_cancel() -> None
       globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
         api, persistence, cryptoObject, chunkSize: 4, maxActive: 1,
       });
+      coordinator.applyRemoteEvent({ event_type: 'upload.created', payload: {
+        upload_id: 'blocking-observer', client_request_id: 'blocking-observer', status: 'paused',
+        original_name: 'blocking.bin', size_bytes: 4, confirmed_parts: [],
+        confirmed_bytes: 0, chunk_size_bytes: 4,
+      }});
       coordinator.enqueueFiles([{ file, fileHandle: handle }]);
     """)
     drain_jobs(context)
@@ -3450,7 +3460,7 @@ def test_lost_create_response_event_adopts_session_and_finishes_cancel() -> None
 
     assert context.eval("cancelError") == "lookup offline"
     assert context.eval("createAttempts") == 2
-    assert context.eval("['cancelled', 'completed', 'expired'].includes(coordinator.getSnapshot()[0].status)") is False
+    assert context.eval("['cancelled', 'completed', 'expired'].includes(coordinator.getSnapshot().find(row => row.uploadId === 'event-client').status)") is False
     assert context.eval("rows.length") == 1
     assert context.eval("rows[0].uploadId") == "event-client"
     assert context.eval("rows[0].fileHandle === handle") is True
@@ -3465,14 +3475,31 @@ def test_lost_create_response_event_adopts_session_and_finishes_cancel() -> None
       }});
     """)
     drain_jobs(context)
+    context.eval("coordinator.prioritize('event-server')")
+    drain_jobs(context)
+    assert context.eval("uploadCalls") == 0
+    context.eval("migrateResolve()")
+    drain_jobs(context)
     assert json.loads(context.eval("JSON.stringify(migrations)")) == [
         ["event-client", "event-server"]
     ]
     assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == ["event-server"]
-    assert context.eval("coordinator.getSnapshot()[0].status") == "cancelled"
+    assert context.eval("coordinator.getSnapshot().find(row => row.uploadId === 'event-server').status") == "cancelled"
     assert context.eval("coordinator.getSummary().hasPendingControl") is False
     assert json.loads(context.eval("JSON.stringify(rows)")) == []
     assert context.eval("uploadCalls") == 0
+
+    context.eval(r"""
+      coordinator.applyRemoteEvent({ event_type: 'upload.cancelled', payload: {
+        upload_id: 'event-server', client_request_id: 'event-client', status: 'cancelled',
+        original_name: 'event-recovery.bin', size_bytes: 4, confirmed_parts: [],
+        confirmed_bytes: 0, chunk_size_bytes: 4,
+      }});
+    """)
+    drain_jobs(context)
+    assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == ["event-server"]
+    assert context.eval("coordinator.getSnapshot().find(row => row.uploadId === 'event-server').errorCode") is None
+    assert json.loads(context.eval("JSON.stringify(rows)")) == []
 
 
 def test_lost_create_response_next_cancel_retries_same_session_identity() -> None:
