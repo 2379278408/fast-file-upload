@@ -378,6 +378,23 @@ export function createUploadCoordinator({
     if (task.chunkSize !== null) task.createMetadata.chunkSize = task.chunkSize;
     return task.createMetadata;
   };
+  const REMOTE_CANCEL_SETTLED = {};
+  const ensureCancelSettlement = task => {
+    if (task.cancelSettlementPromise) return task.cancelSettlementPromise;
+    task.cancelSettlementPromise = new Promise(resolve => {
+      task.resolveCancelSettlement = resolve;
+    });
+    return task.cancelSettlementPromise;
+  };
+  const settleRemoteCancel = task => {
+    task.cancelSettledRemotely = true;
+    task.resolveCancelSettlement?.(REMOTE_CANCEL_SETTLED);
+    task.resolveCancelSettlement = null;
+  };
+  const waitForCancelAware = (task, promise) => Promise.race([
+    promise,
+    ensureCancelSettlement(task),
+  ]);
   const adoptServerSession = async (task, response, token = generation) => {
     if (!isCurrent(token)) throw coordinatorDestroyedError();
     const remoteUploadId = response?.upload_id || response?.uploadId;
@@ -407,22 +424,39 @@ export function createUploadCoordinator({
     return task;
   };
   const resolveSessionForCancel = async (task, token = generation) => {
-    if (task.sessionAdoptionPromise) await raceWithDestroy(task.sessionAdoptionPromise);
+    if (task.sessionAdoptionPromise) {
+      const result = await raceWithDestroy(waitForCancelAware(task, task.sessionAdoptionPromise));
+      if (result === REMOTE_CANCEL_SETTLED) return task;
+    }
     if (task.sessionReady) return task;
-    if (task.preparePromise) await raceWithDestroy(task.preparePromise);
-    if (task.sessionAdoptionPromise) await raceWithDestroy(task.sessionAdoptionPromise);
+    if (task.preparePromise) {
+      const result = await raceWithDestroy(waitForCancelAware(task, task.preparePromise));
+      if (result === REMOTE_CANCEL_SETTLED) return task;
+    }
+    if (task.sessionAdoptionPromise) {
+      const result = await raceWithDestroy(waitForCancelAware(task, task.sessionAdoptionPromise));
+      if (result === REMOTE_CANCEL_SETTLED) return task;
+    }
     if (task.sessionReady) return task;
     let response;
     try {
       response = await raceWithDestroy(api.createUploadSession(createMetadataFor(task)));
     } catch (error) {
-      if (task.sessionAdoptionPromise) await raceWithDestroy(task.sessionAdoptionPromise);
+      if (task.sessionAdoptionPromise) {
+        const result = await raceWithDestroy(waitForCancelAware(task, task.sessionAdoptionPromise));
+        if (result === REMOTE_CANCEL_SETTLED) return task;
+      }
       if (task.sessionReady) return task;
       throw error;
     }
-    if (task.sessionAdoptionPromise) await raceWithDestroy(task.sessionAdoptionPromise);
+    if (task.sessionAdoptionPromise) {
+      const result = await raceWithDestroy(waitForCancelAware(task, task.sessionAdoptionPromise));
+      if (result === REMOTE_CANCEL_SETTLED) return task;
+    }
     if (task.sessionReady) return task;
-    return adoptServerSession(task, response, token);
+    const adoption = adoptRemoteSession(task, response, token);
+    const result = await raceWithDestroy(waitForCancelAware(task, adoption));
+    return result === REMOTE_CANCEL_SETTLED ? task : result;
   };
   const removeTaskPersistence = async (task, token = generation) => {
     const uploadIds = Array.from(new Set([task.uploadId, task.clientRequestId].filter(Boolean)));
@@ -467,7 +501,10 @@ export function createUploadCoordinator({
       task.pendingAction = action;
       task.errorCode = null;
       task.errorMessage = null;
-      if (action === 'cancel') task.cancelRequested = true;
+      if (action === 'cancel') {
+        task.cancelRequested = true;
+        ensureCancelSettlement(task);
+      }
       touchTask(task);
       if (action === 'pause' || action === 'cancel') {
         task.inFlightBytes = 0;
@@ -481,13 +518,31 @@ export function createUploadCoordinator({
         await raceWithDestroy(task.preparePromise);
       }
       if (!isCurrent(token)) throw coordinatorDestroyedError();
+      if (action === 'cancel' && task.cancelSettledRemotely) {
+        task.pendingAction = null;
+        task.errorCode = null;
+        task.errorMessage = null;
+        touchTask(task);
+        await removeTaskPersistence(task, token);
+        notify(token);
+        return publicTask(task);
+      }
       if (task.prepareError) throw task.prepareError;
       if (!task.sessionReady) throw operationError(task.errorMessage || '上传会话尚未创建');
 
       const response = action === 'cancel'
-        ? await raceWithDestroy(api.cancelUpload(task.uploadId))
+        ? await raceWithDestroy(waitForCancelAware(task, api.cancelUpload(task.uploadId)))
         : await raceWithDestroy(api.controlUpload(task.uploadId, action));
       if (!isCurrent(token)) throw coordinatorDestroyedError();
+      if (response === REMOTE_CANCEL_SETTLED) {
+        task.pendingAction = null;
+        task.errorCode = null;
+        task.errorMessage = null;
+        touchTask(task);
+        await removeTaskPersistence(task, token);
+        notify(token);
+        return publicTask(task);
+      }
       if (response && (response.chunk_size_bytes !== undefined || response.chunkSize !== undefined
           || response.confirmed_parts !== undefined || response.confirmedParts !== undefined
           || response.confirmed_bytes !== undefined || response.confirmedBytes !== undefined)) {
@@ -550,7 +605,7 @@ export function createUploadCoordinator({
   const scheduleAuthoritativeCancel = (task, data, token = generation) => {
     adoptRemoteSession(task, data, token)
       .then(() => {
-        if (!isCurrent(token) || !task.cancelRequested) return null;
+        if (!isCurrent(token) || !task.cancelRequested || task.cancelSettledRemotely) return null;
         return runControl(task, 'cancel', token);
       })
       .catch(error => {
@@ -711,6 +766,7 @@ export function createUploadCoordinator({
       pendingAction: null, actionPromise: null, cancelRequested: false,
       preparePromise: null, prepareError: null, createMetadata: null,
       sessionAdoptionPromise: null,
+      cancelSettledRemotely: false, cancelSettlementPromise: null, resolveCancelSettlement: null,
       sessionReady: false,
       chunkSize: Number.isInteger(chunkSize) && chunkSize > 0 ? chunkSize : null,
       liveRevision: 0,
@@ -778,6 +834,7 @@ export function createUploadCoordinator({
       pendingAction: null, actionPromise: null, cancelRequested: Boolean(record.cancelRequested),
       preparePromise: Promise.resolve(), prepareError: null, createMetadata: null,
       sessionAdoptionPromise: null,
+      cancelSettledRemotely: false, cancelSettlementPromise: null, resolveCancelSettlement: null,
       serverSequence: record.serverSequence ?? null,
       serverUpdatedAt: record.serverUpdatedAt ?? null,
       serverVersion: record.serverVersion ?? null,
@@ -810,6 +867,7 @@ export function createUploadCoordinator({
       pendingAction: null, actionPromise: null, cancelRequested: false,
       preparePromise: Promise.resolve(), prepareError: null, createMetadata: null,
       sessionAdoptionPromise: null,
+      cancelSettledRemotely: false, cancelSettlementPromise: null, resolveCancelSettlement: null,
       serverSequence: null, serverUpdatedAt: null, serverVersion: null,
     };
   }
@@ -1125,12 +1183,14 @@ export function createUploadCoordinator({
           return true;
         }
         if (task.cancelRequested && TERMINAL_UPLOAD_STATUSES.has(remoteStatus)) {
+          settleRemoteCancel(task);
           if (remoteUploadId) task.uploadId = remoteUploadId;
           if (remoteClientRequestId) task.clientRequestId = remoteClientRequestId;
           applyServerState(task, payload);
           applyRemoteStatus(task, payload);
           task.liveRevision = eventRevision;
           removeTaskPersistence(task).catch(() => {});
+          task.sessionAdoptionPromise?.finally(() => removeTaskPersistence(task).catch(() => {}));
           notify();
           return true;
         }

@@ -3305,6 +3305,7 @@ def test_cancel_preparing_recovers_lost_create_response_before_terminal_commit()
       globalThis.rows = [];
       globalThis.cancelResult = null;
       globalThis.cancelError = null;
+      globalThis.migrateResolve = null;
       globalThis.handle = { kind: 'file', name: 'lost-response.bin' };
       globalThis.cryptoObject = {
         randomUUID: () => 'lost-client',
@@ -3338,9 +3339,13 @@ def test_cancel_preparing_recovers_lost_create_response_before_terminal_commit()
         },
         migrate(previousUploadId, record) {
           migrations.push([previousUploadId, record.uploadId]);
-          rows = rows.filter(row => row.uploadId !== previousUploadId && row.uploadId !== record.uploadId);
-          rows.push(record);
-          return Promise.resolve();
+          return new Promise(resolve => {
+            migrateResolve = () => {
+              rows = rows.filter(row => row.uploadId !== previousUploadId && row.uploadId !== record.uploadId);
+              rows.push(record);
+              resolve();
+            };
+          });
         },
         remove(id) {
           rows = rows.filter(row => row.uploadId !== id);
@@ -3366,6 +3371,15 @@ def test_cancel_preparing_recovers_lost_create_response_before_terminal_commit()
     """)
     drain_jobs(context)
 
+    assert context.eval("cancelResult") is None
+    context.eval(r"""
+      coordinator.applyRemoteEvent({ event_type: 'upload.cancelled', payload: {
+        upload_id: 'lost-server', client_request_id: 'lost-client', status: 'cancelled',
+        original_name: 'lost-response.bin', size_bytes: 4, confirmed_parts: [],
+        confirmed_bytes: 0, chunk_size_bytes: 4,
+      }});
+    """)
+    drain_jobs(context)
     assert context.eval("cancelError") is None
     assert context.eval("cancelResult.status") == "cancelled"
     assert context.eval("coordinator.getSnapshot()[0].status") == "cancelled"
@@ -3375,7 +3389,10 @@ def test_cancel_preparing_recovers_lost_create_response_before_terminal_commit()
     assert json.loads(context.eval("JSON.stringify(migrations)")) == [
         ["lost-client", "lost-server"]
     ]
-    assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == ["lost-server"]
+    assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == []
+    assert json.loads(context.eval("JSON.stringify(rows)")) == []
+    context.eval("migrateResolve()")
+    drain_jobs(context)
     assert json.loads(context.eval("JSON.stringify(rows)")) == []
     assert context.eval("uploadCalls") == 0
     assert context.eval("coordinator.getSummary().hasPendingControl") is False
