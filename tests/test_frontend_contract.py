@@ -3490,6 +3490,7 @@ def test_lost_create_response_event_adopts_session_and_finishes_cancel() -> None
     assert context.eval("uploadCalls") == 0
 
     context.eval(r"""
+      rows.push({ uploadId: 'event-client', clientRequestId: 'event-client', cancelRequested: true });
       coordinator.applyRemoteEvent({ event_type: 'upload.cancelled', payload: {
         upload_id: 'event-server', client_request_id: 'event-client', status: 'cancelled',
         original_name: 'event-recovery.bin', size_bytes: 4, confirmed_parts: [],
@@ -3499,6 +3500,18 @@ def test_lost_create_response_event_adopts_session_and_finishes_cancel() -> None
     drain_jobs(context)
     assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == ["event-server"]
     assert context.eval("coordinator.getSnapshot().find(row => row.uploadId === 'event-server').errorCode") is None
+    assert json.loads(context.eval("JSON.stringify(rows)")) == []
+
+    context.eval(r"""
+      coordinator.applyRemoteEvent({ event_type: 'upload.progress', payload: {
+        upload_id: 'event-server', client_request_id: 'event-client', status: 'uploading',
+        original_name: 'event-recovery.bin', size_bytes: 4, confirmed_parts: [],
+        confirmed_bytes: 0, chunk_size_bytes: 4,
+      }});
+    """)
+    drain_jobs(context)
+    assert context.eval("coordinator.getSnapshot().find(row => row.uploadId === 'event-server').status") == "cancelled"
+    assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == ["event-server"]
     assert json.loads(context.eval("JSON.stringify(rows)")) == []
 
 

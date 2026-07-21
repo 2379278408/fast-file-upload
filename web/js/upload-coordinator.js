@@ -1120,12 +1120,17 @@ export function createUploadCoordinator({
           return true;
         }
         const remoteStatus = normalizedStatus(payload.status);
+        if (TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(task.status))
+            && !TERMINAL_UPLOAD_STATUSES.has(remoteStatus)) {
+          return true;
+        }
         if (task.cancelRequested && TERMINAL_UPLOAD_STATUSES.has(remoteStatus)) {
           if (remoteUploadId) task.uploadId = remoteUploadId;
           if (remoteClientRequestId) task.clientRequestId = remoteClientRequestId;
           applyServerState(task, payload);
           applyRemoteStatus(task, payload);
           task.liveRevision = eventRevision;
+          removeTaskPersistence(task).catch(() => {});
           notify();
           return true;
         }
