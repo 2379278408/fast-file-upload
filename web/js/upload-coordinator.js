@@ -465,12 +465,30 @@ export function createUploadCoordinator({
       await raceWithDestroy(persistence.remove(uploadId));
     }
   };
+  const finalizeSettledCancel = async (task, token = generation) => {
+    task.pendingAction = null;
+    task.errorCode = null;
+    task.errorMessage = null;
+    touchTask(task);
+    await removeTaskPersistence(task, token);
+    notify(token);
+    return publicTask(task);
+  };
   const recoverAuthoritativeState = async (task, token, actionError) => {
     try {
-      const remote = await raceWithDestroy(api.getUploadSession(task.uploadId));
+      const request = api.getUploadSession(task.uploadId);
+      const remote = task.pendingAction === 'cancel'
+        ? await raceWithDestroy(waitForCancelAware(task, request))
+        : await raceWithDestroy(request);
+      if (remote === REMOTE_CANCEL_SETTLED) return true;
       if (!isCurrent(token)) throw coordinatorDestroyedError();
       applyServerState(task, remote, { authoritative: true });
       applyRemoteStatus(task, remote);
+      if (task.pendingAction === 'cancel' && TERMINAL_UPLOAD_STATUSES.has(task.status)) {
+        settleRemoteCancel(task);
+        await removeTaskPersistence(task, token);
+        return true;
+      }
       task.errorCode = `${task.pendingAction || 'control'}-failed`;
       task.errorMessage = actionError.message;
       touchTask(task);
@@ -479,11 +497,14 @@ export function createUploadCoordinator({
       } else {
         await persistStrict(task, token);
       }
+      return false;
     } catch (recoveryError) {
       if (recoveryError.name === 'CoordinatorDestroyedError') throw recoveryError;
+      if (task.cancelSettledRemotely) return true;
       task.errorCode = `${task.pendingAction || 'control'}-failed`;
       task.errorMessage = actionError.message;
       touchTask(task);
+      return false;
     }
   };
   const runControl = (task, action, token = generation) => {
@@ -519,13 +540,7 @@ export function createUploadCoordinator({
       }
       if (!isCurrent(token)) throw coordinatorDestroyedError();
       if (action === 'cancel' && task.cancelSettledRemotely) {
-        task.pendingAction = null;
-        task.errorCode = null;
-        task.errorMessage = null;
-        touchTask(task);
-        await removeTaskPersistence(task, token);
-        notify(token);
-        return publicTask(task);
+        return finalizeSettledCancel(task, token);
       }
       if (task.prepareError) throw task.prepareError;
       if (!task.sessionReady) throw operationError(task.errorMessage || '上传会话尚未创建');
@@ -535,13 +550,7 @@ export function createUploadCoordinator({
         : await raceWithDestroy(api.controlUpload(task.uploadId, action));
       if (!isCurrent(token)) throw coordinatorDestroyedError();
       if (response === REMOTE_CANCEL_SETTLED) {
-        task.pendingAction = null;
-        task.errorCode = null;
-        task.errorMessage = null;
-        touchTask(task);
-        await removeTaskPersistence(task, token);
-        notify(token);
-        return publicTask(task);
+        return finalizeSettledCancel(task, token);
       }
       if (response && (response.chunk_size_bytes !== undefined || response.chunkSize !== undefined
           || response.confirmed_parts !== undefined || response.confirmedParts !== undefined
@@ -571,6 +580,9 @@ export function createUploadCoordinator({
       return publicTask(task);
     })().catch(async error => {
       if (error.name === 'CoordinatorDestroyedError') throw error;
+      if (action === 'cancel' && task.cancelSettledRemotely) {
+        return finalizeSettledCancel(task, token);
+      }
       if (action === 'cancel' && !task.sessionReady) {
         if (TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(task.status))) task.status = 'failed';
         task.errorCode = 'cancel-failed';
@@ -578,7 +590,8 @@ export function createUploadCoordinator({
         touchTask(task);
         await persistStrict(task, token);
       } else if (task.prepareError !== error) {
-        await recoverAuthoritativeState(task, token, error);
+        const settled = await recoverAuthoritativeState(task, token, error);
+        if (action === 'cancel' && settled) return finalizeSettledCancel(task, token);
       } else {
         task.errorCode = 'session-create-failed';
         task.errorMessage = error.message;
@@ -610,6 +623,10 @@ export function createUploadCoordinator({
       })
       .catch(error => {
         if (!isCurrent(token) || error.name === 'CoordinatorDestroyedError') return;
+        if (task.cancelSettledRemotely) {
+          removeTaskPersistence(task, token).catch(() => {});
+          return;
+        }
         task.errorCode = 'cancel-failed';
         task.errorMessage = error.message;
         touchTask(task);
@@ -789,9 +806,18 @@ export function createUploadCoordinator({
       task.identity = await raceWithDestroy(sampleFileIdentity(task.file, cryptoObject));
       touchTask(task);
       if (!isCurrent(token)) return;
-      const response = await raceWithDestroy(api.createUploadSession(createMetadataFor(task)));
+      const createRequest = api.createUploadSession(createMetadataFor(task));
+      const response = task.cancelRequested
+        ? await raceWithDestroy(waitForCancelAware(task, createRequest))
+        : await raceWithDestroy(createRequest);
+      if (response === REMOTE_CANCEL_SETTLED) return;
       if (!isCurrent(token)) return;
-      await adoptServerSession(task, response, token);
+      if (task.cancelSettledRemotely) return;
+      const adoption = adoptRemoteSession(task, response, token);
+      const adopted = task.cancelRequested
+        ? await raceWithDestroy(waitForCancelAware(task, adoption))
+        : await raceWithDestroy(adoption);
+      if (adopted === REMOTE_CANCEL_SETTLED) return;
       if (task.cancelRequested) {
         return;
       }
@@ -808,6 +834,7 @@ export function createUploadCoordinator({
       if (!isCurrent(token)) return;
     } catch (error) {
       if (!isCurrent(token)) return;
+      if (task.cancelSettledRemotely) return;
       task.prepareError = error;
       task.status = 'failed';
       task.errorCode = 'session-create-failed';
@@ -1190,7 +1217,9 @@ export function createUploadCoordinator({
           applyRemoteStatus(task, payload);
           task.liveRevision = eventRevision;
           removeTaskPersistence(task).catch(() => {});
-          task.sessionAdoptionPromise?.finally(() => removeTaskPersistence(task).catch(() => {}));
+          task.sessionAdoptionPromise
+            ?.finally(() => removeTaskPersistence(task).catch(() => {}))
+            .catch(() => {});
           notify();
           return true;
         }

@@ -3398,6 +3398,74 @@ def test_cancel_preparing_recovers_lost_create_response_before_terminal_commit()
     assert context.eval("coordinator.getSummary().hasPendingControl") is False
 
 
+def test_terminal_event_settles_cancel_before_initial_create_response_returns() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.createResolve = null;
+      globalThis.cancelResult = null;
+      globalThis.cancelError = null;
+      globalThis.cancelCalls = [];
+      globalThis.uploadCalls = 0;
+      globalThis.rows = [];
+      globalThis.cryptoObject = {
+        randomUUID: () => 'pending-client',
+        subtle: { digest: () => Promise.resolve(new Uint8Array(32).buffer) },
+      };
+      globalThis.file = {
+        name: 'pending-create.bin', size: 4, type: '', lastModified: 3,
+        slice: () => ({ size: 4, arrayBuffer: () => Promise.resolve(new Uint8Array(4).buffer) }),
+      };
+      globalThis.api = {
+        createUploadSession: () => new Promise(resolve => { createResolve = resolve; }),
+        uploadPart: () => { uploadCalls += 1; return Promise.resolve({}); },
+        cancelUpload: id => { cancelCalls.push(id); return Promise.resolve({ status: 'cancelled' }); },
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve(rows.slice()),
+        put(record) { rows = rows.filter(row => row.uploadId !== record.uploadId); rows.push(record); return Promise.resolve(); },
+        migrate(previousUploadId, record) {
+          rows = rows.filter(row => row.uploadId !== previousUploadId && row.uploadId !== record.uploadId);
+          rows.push(record);
+          return Promise.resolve();
+        },
+        remove(id) { rows = rows.filter(row => row.uploadId !== id); return Promise.resolve(); },
+        close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, cryptoObject, chunkSize: 4,
+      });
+      coordinator.enqueueFiles([file]);
+    """)
+    drain_jobs(context)
+    context.eval(r"""
+      coordinator.cancel('pending-client')
+        .then(result => { cancelResult = result; })
+        .catch(error => { cancelError = error.message; });
+      coordinator.applyRemoteEvent({ event_type: 'upload.cancelled', payload: {
+        upload_id: 'pending-server', client_request_id: 'pending-client', status: 'cancelled',
+        original_name: 'pending-create.bin', size_bytes: 4, confirmed_parts: [],
+        confirmed_bytes: 0, chunk_size_bytes: 4,
+      }});
+    """)
+    drain_jobs(context)
+    assert context.eval("cancelError") is None
+    assert context.eval("cancelResult.status") == "cancelled"
+
+    context.eval(r"""
+      createResolve({ upload_id: 'pending-server', client_request_id: 'pending-client',
+        status: 'queued', confirmed_parts: [], confirmed_bytes: 0, chunk_size_bytes: 4 });
+    """)
+    drain_jobs(context)
+    assert context.eval("coordinator.getSnapshot().find(row => row.clientRequestId === 'pending-client').status") == "cancelled"
+    assert context.eval("coordinator.getSnapshot().find(row => row.clientRequestId === 'pending-client').errorCode") is None
+    assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == []
+    assert context.eval("uploadCalls") == 0
+    assert json.loads(context.eval("JSON.stringify(rows)")) == []
+
+
 def test_lost_create_response_event_adopts_session_and_finishes_cancel() -> None:
     context = create_js_context()
     context.eval(r"""
