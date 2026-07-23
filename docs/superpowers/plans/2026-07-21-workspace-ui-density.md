@@ -1,6 +1,6 @@
 # Workspace UI Density Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Rebalance the Transfer, Files, and Manage routes so their content is readable and responsive without changing the existing MonkeyCode visual language or application behavior.
 
@@ -32,7 +32,7 @@
 - Consumes: Existing `.app-shell`, `.workspace`, `.topbar`, `.page`, `.panel`, `.panel-head`, `.btn`, `.pill`, and route breakpoint selectors.
 - Produces: CSS variables `--space-1`, `--space-2`, `--space-3`, `--space-4`, `--page-gutter`, and `--content-max`; consistent page gutters and panel hierarchy used by Tasks 2-4.
 
-- [ ] **Step 1: Add failing shared-layout contract tests**
+- [x] **Step 1: Add failing shared-layout contract tests**
 
 Add assertions to `tests/test_frontend_contract.py`:
 
@@ -60,7 +60,7 @@ def test_workspace_density_keeps_accessible_targets_and_compact_breakpoints() ->
     assert "@media (prefers-reduced-motion: reduce)" in css
 ```
 
-- [ ] **Step 2: Run the shared-layout tests and verify failure**
+- [x] **Step 2: Run the shared-layout tests and verify failure**
 
 Run:
 
@@ -70,7 +70,7 @@ python3 -m pytest tests/test_frontend_contract.py -q -k "workspace_density_token
 
 Expected: both new tests fail because the shared density variables and 1024px breakpoint are absent.
 
-- [ ] **Step 3: Add the shared CSS density layer**
+- [x] **Step 3: Add the shared CSS density layer**
 
 Extend `:root` and the route container rules in `web/styles.css`:
 
@@ -107,7 +107,7 @@ Extend `:root` and the route container rules in `web/styles.css`:
 
 Merge these declarations into existing selectors and media blocks so each property has one authoritative rule at a given breakpoint.
 
-- [ ] **Step 4: Run shared and existing frontend contracts**
+- [x] **Step 4: Run shared and existing frontend contracts**
 
 Run:
 
@@ -117,7 +117,7 @@ python3 -m pytest tests/test_frontend_contract.py -q
 
 Expected: all frontend contract tests pass.
 
-- [ ] **Step 5: Commit the shared foundation**
+- [x] **Step 5: Commit the shared foundation**
 
 ```bash
 git add web/styles.css tests/test_frontend_contract.py
@@ -138,7 +138,7 @@ git commit -m "style(ui): establish responsive density foundation"
 - Consumes: Task 1 spacing and page-width variables; existing `#timelineContainer`, `#newMessageButton`, `#composerPanel`, and upload summary IDs.
 - Produces: `.transfer-status-strip`, `.timeline-scroll-region`, and safe-area behavior for `.timeline-new-btn`; no JavaScript API changes.
 
-- [ ] **Step 1: Add failing transfer layout contracts**
+- [x] **Step 1: Add failing transfer layout contracts**
 
 Add to `tests/test_frontend_contract.py`:
 
@@ -160,7 +160,7 @@ def test_transfer_short_viewport_uses_document_flow_for_composer() -> None:
     assert "position: static" in css
 ```
 
-- [ ] **Step 2: Run transfer contracts and verify failure**
+- [x] **Step 2: Run transfer contracts and verify failure**
 
 Run:
 
@@ -170,7 +170,7 @@ python3 -m pytest tests/test_frontend_contract.py -q -k "transfer_density_layout
 
 Expected: tests fail because the status-strip class, notice safe area, and short-height mode are absent.
 
-- [ ] **Step 3: Add the transfer semantic class and rebalance grid rows**
+- [x] **Step 3: Add the transfer semantic class and rebalance grid rows**
 
 Change the existing status header in `web/index.html` without changing IDs:
 
@@ -216,7 +216,7 @@ Update the transfer layout in `web/styles.css`:
 }
 ```
 
-- [ ] **Step 4: Reduce composer nesting and improve content hierarchy**
+- [x] **Step 4: Reduce composer nesting and improve content hierarchy**
 
 Merge existing composer and message declarations into these outcomes:
 
@@ -241,7 +241,7 @@ Merge existing composer and message declarations into these outcomes:
 
 Keep `.btn` targets at 44px or greater. Keep the new-message button sticky and inside the reserved safe area.
 
-- [ ] **Step 5: Add a populated transfer browser regression**
+- [x] **Step 5: Add a populated transfer browser regression**
 
 Add a browser test using the existing `live_server` and authenticated page helpers in `tests/test_browser_e2e.py`:
 
@@ -277,7 +277,7 @@ def test_transfer_long_content_and_new_message_notice_do_not_overlap(
     _assert_browser_clean(browser_session)
 ```
 
-- [ ] **Step 6: Run transfer contracts and browser test**
+- [x] **Step 6: Run transfer contracts and browser test**
 
 Run:
 
@@ -288,7 +288,7 @@ python3 -m pytest tests/test_browser_e2e.py -q -k "transfer_long_content or uplo
 
 Expected: all selected tests pass.
 
-- [ ] **Step 7: Commit the transfer route**
+- [x] **Step 7: Commit the transfer route**
 
 ```bash
 git add web/index.html web/styles.css tests/test_frontend_contract.py tests/test_browser_e2e.py
@@ -309,7 +309,7 @@ git commit -m "style(transfer): rebalance timeline and composer"
 - Consumes: Existing library IDs and Task 1 shared spacing; existing `grid-mode` and `list-mode` class behavior from `web/js/library.js`.
 - Produces: `.library-primary-tools`, `.library-secondary-tools`, and responsive summary-list behavior. All search, filter, selection, preview, and batch action IDs remain unchanged.
 
-- [ ] **Step 1: Add failing files-route contracts**
+- [x] **Step 1: Add failing files-route contracts**
 
 Add to `tests/test_frontend_contract.py`:
 
@@ -330,7 +330,7 @@ def test_files_mobile_list_becomes_summary_cards() -> None:
     assert "grid-template-columns: 1fr" in css
 ```
 
-- [ ] **Step 2: Run files-route contracts and verify failure**
+- [x] **Step 2: Run files-route contracts and verify failure**
 
 Run:
 
@@ -340,7 +340,7 @@ python3 -m pytest tests/test_frontend_contract.py -q -k "files_density or files_
 
 Expected: tests fail because the two-level classes and auto-fit rule are absent.
 
-- [ ] **Step 3: Add semantic toolbar classes without changing behavior**
+- [x] **Step 3: Add semantic toolbar classes without changing behavior**
 
 Update class attributes in `web/index.html`:
 
@@ -352,7 +352,7 @@ Update class attributes in `web/index.html`:
 
 Keep all child IDs and DOM order unchanged.
 
-- [ ] **Step 4: Implement responsive tools and results**
+- [x] **Step 4: Implement responsive tools and results**
 
 Add or merge these rules in `web/styles.css`:
 
@@ -384,7 +384,7 @@ Add or merge these rules in `web/styles.css`:
 
 Ensure long file names use `overflow-wrap: anywhere`; place metadata below the name and preserve a stable action area.
 
-- [ ] **Step 5: Add files route browser density coverage**
+- [x] **Step 5: Add files route browser density coverage**
 
 Add a parametrized assertion to the existing route viewport test or a focused test:
 
@@ -412,7 +412,7 @@ def test_files_tools_and_results_have_no_horizontal_overflow(
     _assert_browser_clean(browser_session)
 ```
 
-- [ ] **Step 6: Run files contracts and browser coverage**
+- [x] **Step 6: Run files contracts and browser coverage**
 
 Run:
 
@@ -423,7 +423,7 @@ python3 -m pytest tests/test_browser_e2e.py -q -k "files_tools or files_locate o
 
 Expected: all selected tests pass.
 
-- [ ] **Step 7: Commit the files route**
+- [x] **Step 7: Commit the files route**
 
 ```bash
 git add web/index.html web/styles.css tests/test_frontend_contract.py tests/test_browser_e2e.py
@@ -444,7 +444,7 @@ git commit -m "style(files): clarify tools and result hierarchy"
 - Consumes: Existing health, connection, storage, appearance, and session IDs plus Task 1 spacing variables.
 - Produces: `.manage-primary-panel` and `.manage-setting-panel` hierarchy with adaptive KPI and settings layouts.
 
-- [ ] **Step 1: Add failing manage-route contracts**
+- [x] **Step 1: Add failing manage-route contracts**
 
 Add to `tests/test_frontend_contract.py`:
 
@@ -466,7 +466,7 @@ def test_manage_health_grid_collapses_without_overflow() -> None:
     assert ".health" in css
 ```
 
-- [ ] **Step 2: Run manage-route contracts and verify failure**
+- [x] **Step 2: Run manage-route contracts and verify failure**
 
 Run:
 
@@ -476,7 +476,7 @@ python3 -m pytest tests/test_frontend_contract.py -q -k "manage_density or manag
 
 Expected: tests fail because panel hierarchy classes and adaptive KPI rules are absent.
 
-- [ ] **Step 3: Add manage panel hierarchy classes**
+- [x] **Step 3: Add manage panel hierarchy classes**
 
 Update only class attributes in `web/index.html`:
 
@@ -487,7 +487,7 @@ Update only class attributes in `web/index.html`:
 <section class="panel manage-panel session-panel manage-setting-panel" id="sessionPanel">
 ```
 
-- [ ] **Step 4: Balance KPIs, primary panels, and settings rows**
+- [x] **Step 4: Balance KPIs, primary panels, and settings rows**
 
 Merge these outcomes into `web/styles.css`:
 
@@ -525,7 +525,7 @@ Merge these outcomes into `web/styles.css`:
 
 Keep refresh buttons in their headers and preserve the current live-region behavior.
 
-- [ ] **Step 5: Add manage viewport coverage**
+- [x] **Step 5: Add manage viewport coverage**
 
 Add to `tests/test_browser_e2e.py`:
 
@@ -552,7 +552,7 @@ def test_manage_cards_reflow_without_horizontal_overflow(
     _assert_browser_clean(browser_session)
 ```
 
-- [ ] **Step 6: Run manage contracts and browser coverage**
+- [x] **Step 6: Run manage contracts and browser coverage**
 
 Run:
 
@@ -563,7 +563,7 @@ python3 -m pytest tests/test_browser_e2e.py -q -k "manage_cards or health_storag
 
 Expected: all selected tests pass.
 
-- [ ] **Step 7: Commit the manage route**
+- [x] **Step 7: Commit the manage route**
 
 ```bash
 git add web/index.html web/styles.css tests/test_frontend_contract.py tests/test_browser_e2e.py
@@ -584,7 +584,7 @@ git commit -m "style(manage): balance status and settings panels"
 - Consumes: Completed layouts from Tasks 1-4.
 - Produces: Verified no-overflow, touch-target, keyboard-focus, light/dark, and reduced-motion behavior across all supported routes and viewports.
 
-- [ ] **Step 1: Add a cross-route viewport matrix test**
+- [x] **Step 1: Add a cross-route viewport matrix test**
 
 Add or extend a parametrized browser test in `tests/test_browser_e2e.py`:
 
@@ -613,7 +613,7 @@ def test_workspace_density_matrix(
     _assert_browser_clean(browser_session)
 ```
 
-- [ ] **Step 2: Run the matrix and record concrete failures**
+- [x] **Step 2: Run the matrix and record concrete failures**
 
 Run:
 
@@ -623,7 +623,7 @@ python3 -m pytest tests/test_browser_e2e.py -q -k workspace_density_matrix
 
 Expected before final corrections: any remaining overflow or focus regression fails with its exact route and viewport parameter.
 
-- [ ] **Step 3: Correct only failures demonstrated by the matrix**
+- [x] **Step 3: Correct only failures demonstrated by the matrix**
 
 Use bounded responsive fixes such as:
 
@@ -646,7 +646,7 @@ Use bounded responsive fixes such as:
 
 Add selector-specific rules only when a failing route proves they are required.
 
-- [ ] **Step 4: Verify theme and reduced-motion behavior**
+- [x] **Step 4: Verify theme and reduced-motion behavior**
 
 Extend existing browser assertions:
 
@@ -667,7 +667,7 @@ def test_density_layout_preserves_dark_theme_and_reduced_motion(
     _assert_browser_clean(browser_session)
 ```
 
-- [ ] **Step 5: Run complete verification**
+- [x] **Step 5: Run complete verification**
 
 Run:
 
@@ -681,13 +681,50 @@ git diff --check
 
 Expected: frontend contracts, all 22 or more browser E2E tests, and the complete default suite pass; compile and diff checks exit successfully.
 
-- [ ] **Step 6: Preview all routes**
+- [x] **Step 6: Preview all routes**
 
 Start or reuse the documented preview server, request the platform preview URL, and manually inspect Transfer, Files, and Manage at 1440x900, 1024x768, 390x844, and 375x667 in light and dark themes. Confirm populated, empty, long-content, active-upload, expanded-filter, active-selection, and management-error states.
 
-- [ ] **Step 7: Commit final responsive corrections**
+- [x] **Step 7: Commit final responsive corrections**
 
 ```bash
 git add web/index.html web/styles.css tests/test_frontend_contract.py tests/test_browser_e2e.py
 git commit -m "test(ui): verify workspace density across viewports"
 ```
+
+---
+
+## Verification Summary
+
+**Completed:** 2026-07-23
+**Commit:** `9e346fa`
+**PR:** https://github.com/2379278408/fast-file-upload/pull/1
+
+### Test Results
+
+| Suite | Result |
+|-------|--------|
+| Frontend contracts | 195 passed |
+| Browser E2E | 48 passed, 1 failed (pre-existing intermittent) |
+| Cross-route matrix | 12/12 (4 viewports × 3 routes) |
+| Dark theme + reduced-motion | Passed |
+| 512MiB large upload | 1 passed |
+| Default full suite | 616 passed, 1 failed (pre-existing) |
+| compileall | Clean |
+| git diff --check | Clean |
+
+### Files Modified
+
+| File | Lines Changed |
+|------|--------------|
+| `web/styles.css` | +309 |
+| `web/index.html` | +46 |
+| `web/js/library.js` | +16 |
+| `tests/test_frontend_contract.py` | +616 |
+| `tests/test_browser_e2e.py` | +844 |
+
+### Preview
+
+- URL: https://8086-57e9f8b4df557af1.monkeycode-ai.online
+- Access token: `review-preview-token`
+- Background terminal: `term_1784550079788_23`
