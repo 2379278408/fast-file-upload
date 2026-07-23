@@ -350,6 +350,7 @@ const uploadPersistence = createUploadPersistence({ indexedDB: window.indexedDB 
 const uploadCoordinator = createUploadCoordinator({
   api: resumableApi,
   persistence: uploadPersistence,
+  deviceId: getOrCreateDeviceId(),
   onAnnounce: announceUpload,
   onCompleted(message) {
     timeline.upsert?.(message);

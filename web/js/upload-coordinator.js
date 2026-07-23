@@ -180,6 +180,7 @@ export function createUploadCoordinator({
   abortControllerFactory = () => new AbortController(),
   maxActive = MAX_ACTIVE_UPLOADS,
   chunkSize = null,
+  deviceId = null,
   onAnnounce = null,
   onCompleted = null,
 }) {
@@ -348,7 +349,6 @@ export function createUploadCoordinator({
       task.errorCode = null;
       task.errorMessage = null;
       touchTask(task);
-      raceWithDestroy(persistence.remove(task.uploadId)).catch(() => {});
       return;
     }
     task.status = status;
@@ -401,27 +401,62 @@ export function createUploadCoordinator({
     const remoteUploadId = response?.upload_id || response?.uploadId;
     if (!remoteUploadId) throw operationError('服务端未返回上传会话 ID');
     const previousUploadId = task.uploadId;
-    const previousSessionReady = task.sessionReady;
-    task.uploadId = remoteUploadId;
-    task.sessionReady = true;
-    task.prepareError = null;
-    task.sourceDeviceId = response.source_device_id || response.sourceDeviceId || task.sourceDeviceId;
-    applyServerState(task, response, { authoritative: true });
-    applyRemoteStatus(task, response);
-    touchTask(task);
-    try {
-      if (previousUploadId !== task.uploadId && persistence.migrate) {
-        await raceWithDestroy(persistence.migrate(previousUploadId, persistedTask(task)));
-      } else {
-        await persistStrict(task, token);
-      }
-    } catch (error) {
-      task.uploadId = previousUploadId;
-      task.sessionReady = previousSessionReady;
-      touchTask(task);
-      throw error;
+    const candidate = {
+      ...task,
+      confirmedParts: [...task.confirmedParts],
+      samples: [...task.samples],
+      controller: null,
+    };
+    candidate.uploadId = remoteUploadId;
+    candidate.clientRequestId = response.client_request_id || response.clientRequestId || candidate.clientRequestId;
+    candidate.name = response.original_name || response.name || candidate.name;
+    candidate.sizeBytes = response.size_bytes ?? response.sizeBytes ?? candidate.sizeBytes;
+    candidate.mimeType = response.mime_type || response.mimeType || candidate.mimeType;
+    candidate.sessionReady = true;
+    candidate.prepareError = null;
+    candidate.sourceDeviceId = response.source_device_id || response.sourceDeviceId || candidate.sourceDeviceId;
+    if (deviceId && candidate.sourceDeviceId) candidate.isSourceDevice = candidate.sourceDeviceId === deviceId;
+    applyServerState(candidate, response, { authoritative: true });
+    applyRemoteStatus(candidate, response);
+    touchTask(candidate);
+    if (previousUploadId !== candidate.uploadId && persistence.migrate) {
+      await raceWithDestroy(persistence.migrate(previousUploadId, persistedTask(candidate)));
+    } else {
+      if (!isCurrent(token)) throw coordinatorDestroyedError();
+      await raceWithDestroy(persistence.put(persistedTask(candidate)));
     }
     if (!isCurrent(token)) throw coordinatorDestroyedError();
+    const currentStatus = normalizedStatus(task.status);
+    const adoptedStatus = normalizedStatus(candidate.status);
+    Object.assign(task, {
+      uploadId: candidate.uploadId,
+      clientRequestId: candidate.clientRequestId,
+      name: candidate.name,
+      sizeBytes: candidate.sizeBytes,
+      mimeType: candidate.mimeType,
+      sessionReady: candidate.sessionReady,
+      prepareError: candidate.prepareError,
+      sourceDeviceId: candidate.sourceDeviceId,
+      isSourceDevice: candidate.isSourceDevice,
+      chunkSize: candidate.chunkSize,
+      confirmedParts: candidate.confirmedParts,
+      confirmedBytes: candidate.confirmedBytes,
+      serverSequence: candidate.serverSequence,
+      serverUpdatedAt: candidate.serverUpdatedAt,
+      serverVersion: candidate.serverVersion,
+    });
+    if (!TERMINAL_UPLOAD_STATUSES.has(currentStatus)) {
+      task.status = adoptedStatus;
+      task.inFlightBytes = candidate.inFlightBytes;
+      task.progressPercent = candidate.progressPercent;
+      task.speedBytesPerSecond = candidate.speedBytesPerSecond;
+      task.etaSeconds = candidate.etaSeconds;
+      task.samples = candidate.samples;
+      task.errorCode = candidate.errorCode;
+      task.errorMessage = candidate.errorMessage;
+    }
+    touchTask(task);
+    if (TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(task.status))) task.controller?.abort();
     return task;
   };
   const resolveSessionForCancel = async (task, token = generation) => {
@@ -537,6 +572,14 @@ export function createUploadCoordinator({
       if (action === 'cancel' && task.cancelSettledRemotely) {
         return finalizeSettledCancel(task, token);
       }
+      if (task.sessionAdoptionPromise) {
+        const adopted = action === 'cancel'
+          ? await raceWithDestroy(waitForCancelAware(task, task.sessionAdoptionPromise))
+          : await raceWithDestroy(task.sessionAdoptionPromise);
+        if (adopted === REMOTE_CANCEL_SETTLED || (action === 'cancel' && task.cancelSettledRemotely)) {
+          return finalizeSettledCancel(task, token);
+        }
+      }
       await persistStrict(task, token);
       if (action === 'cancel') {
         await resolveSessionForCancel(task, token);
@@ -621,22 +664,23 @@ export function createUploadCoordinator({
     return operation;
   };
   const scheduleAuthoritativeCancel = (task, data, token = generation) => {
-    adoptRemoteSession(task, data, token)
+    return adoptRemoteSession(task, data, token)
       .then(() => {
-        if (!isCurrent(token) || !task.cancelRequested || task.cancelSettledRemotely) return null;
-        return runControl(task, 'cancel', token);
+        if (!isCurrent(token)) throw coordinatorDestroyedError();
+        if (!task.cancelRequested || task.cancelSettledRemotely) return true;
+        return runControl(task, 'cancel', token).then(() => true);
       })
       .catch(error => {
-        if (!isCurrent(token) || error.name === 'CoordinatorDestroyedError') return;
+        if (!isCurrent(token) || error.name === 'CoordinatorDestroyedError') return false;
         if (task.cancelSettledRemotely) {
-          removeTaskPersistence(task, token).catch(() => {});
-          return;
+          return removeTaskPersistence(task, token).then(() => true).catch(() => false);
         }
         task.errorCode = 'cancel-failed';
         task.errorMessage = error.message;
         touchTask(task);
         persist(task, token);
         notify(token);
+        return false;
       });
   };
   const nextMissingPart = task => {
@@ -811,6 +855,8 @@ export function createUploadCoordinator({
       task.identity = await raceWithDestroy(sampleFileIdentity(task.file, cryptoObject));
       touchTask(task);
       if (!isCurrent(token)) return;
+      await persistStrict(task, token);
+      if (!isCurrent(token)) return;
       const createRequest = api.createUploadSession(createMetadataFor(task));
       const response = task.cancelRequested
         ? await raceWithDestroy(waitForCancelAware(task, createRequest))
@@ -890,7 +936,8 @@ export function createUploadCoordinator({
       confirmedParts: [], confirmedBytes: 0, inFlightBytes: 0, progressPercent: 0,
       speedBytesPerSecond: 0, etaSeconds: null,
       sourceDeviceId: data.source_device_id || data.sourceDeviceId || null,
-      isSourceDevice: false, errorCode: null, errorMessage: null,
+      isSourceDevice: Boolean(deviceId && (data.source_device_id || data.sourceDeviceId) === deviceId),
+      errorCode: null, errorMessage: null,
       createdAt: normalizeCreatedAt(data.created_at || data.createdAt, now()), samples: [], controller: null,
       worker: null, sessionReady: true,
       chunkSize: data.chunk_size_bytes ?? data.chunkSize ?? chunkSize,
@@ -1043,7 +1090,11 @@ export function createUploadCoordinator({
       applyRemoteStatus(task, remote);
       const remoteStatus = normalizedStatus(remote.status);
       if (!BATCH_CONTROL_STATUSES.resume.has(remoteStatus)) {
-        if (!TERMINAL_UPLOAD_STATUSES.has(remoteStatus)) await persist(task, token);
+        if (TERMINAL_UPLOAD_STATUSES.has(remoteStatus)) {
+          await removeTaskPersistence(task, token);
+        } else {
+          await persist(task, token);
+        }
         notify(token);
         if (TERMINAL_UPLOAD_STATUSES.has(remoteStatus)) throw operationError('上传任务已结束');
         throw operationError('服务端当前状态无法重新选择文件');
@@ -1076,6 +1127,7 @@ export function createUploadCoordinator({
       const remoteStatus = normalizedStatus(response.status);
       applyRemoteStatus(task, response);
       if (TERMINAL_UPLOAD_STATUSES.has(remoteStatus)) {
+        await removeTaskPersistence(task, token);
         notify(token);
         throw operationError('上传任务已结束');
       }
@@ -1154,11 +1206,6 @@ export function createUploadCoordinator({
         if (data) {
           remoteById.delete(data.upload_id || data.uploadId);
           if (matchesBaseline(task, baselines.get(task))) {
-            task.clientRequestId = data.client_request_id || data.clientRequestId || task.clientRequestId;
-            task.name = data.original_name || data.name || task.name;
-            task.sizeBytes = data.size_bytes ?? data.sizeBytes ?? task.sizeBytes;
-            task.mimeType = data.mime_type || data.mimeType || task.mimeType;
-            task.sourceDeviceId = data.source_device_id || data.sourceDeviceId || task.sourceDeviceId;
             if (task.cancelRequested) {
               if (task.cancelSettledRemotely) {
                 await removeTaskPersistence(task, token);
@@ -1173,31 +1220,47 @@ export function createUploadCoordinator({
               await runControl(task, 'cancel', token);
               continue;
             }
-            applyServerState(task, data, { authoritative: true });
-            applyRemoteStatus(task, data);
+            const remoteUploadId = data.upload_id || data.uploadId;
+            if (!task.sessionReady || (remoteUploadId && task.uploadId !== remoteUploadId)) {
+              await adoptRemoteSession(task, data, token);
+            } else {
+              task.clientRequestId = data.client_request_id || data.clientRequestId || task.clientRequestId;
+              task.name = data.original_name || data.name || task.name;
+              task.sizeBytes = data.size_bytes ?? data.sizeBytes ?? task.sizeBytes;
+              task.mimeType = data.mime_type || data.mimeType || task.mimeType;
+              task.sourceDeviceId = data.source_device_id || data.sourceDeviceId || task.sourceDeviceId;
+              applyServerState(task, data, { authoritative: true });
+              applyRemoteStatus(task, data);
+              if (deviceId && task.sourceDeviceId) task.isSourceDevice = task.sourceDeviceId === deviceId;
+            }
             await coordinateSourceFile(task, token);
           }
           if (!isCurrent(token)) throw coordinatorDestroyedError();
-          await persist(task, token);
+          if (TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(task.status))) {
+            await removeTaskPersistence(task, token);
+          } else {
+            await persist(task, token);
+          }
           continue;
         }
       }
 
-      remoteById.forEach(data => {
+      for (const data of remoteById.values()) {
         const existing = findTask(data.upload_id || data.uploadId)
           || findTask(data.client_request_id || data.clientRequestId);
         if (!existing || matchesBaseline(existing, baselines.get(existing))) {
-          coordinator.applyRemoteEvent({ event_type: 'upload.created', payload: data });
+          const applied = await coordinator.applyRemoteEvent({ event_type: 'upload.created', payload: data });
+          if (applied !== true) throw operationError('服务端上传状态同步失败');
         }
-      });
+      }
       if (!isCurrent(token)) throw coordinatorDestroyedError();
       for (let index = tasks.length - 1; index >= 0; index -= 1) {
         const task = tasks[index];
         if (!task.sessionReady || activeUploadIds.has(task.uploadId)
             || !matchesBaseline(task, baselines.get(task))) continue;
         task.controller?.abort();
+        await removeTaskPersistence(task, token);
         tasks.splice(index, 1);
-        await raceWithDestroy(persistence.remove(task.uploadId)).catch(() => {});
         if (!isCurrent(token)) throw coordinatorDestroyedError();
       }
       notify(token);
@@ -1215,39 +1278,64 @@ export function createUploadCoordinator({
         if (!task) {
           task = observerTask(payload);
           tasks.push(task);
-        } else if (!task.cancelRequested && !isFreshEvent(task, payload)) {
-          return true;
         }
         const remoteStatus = normalizedStatus(payload.status);
+        const cleanTerminal = () => removeTaskPersistence(task)
+          .then(() => { notify(); return true; })
+          .catch(() => false);
         if (TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(task.status))
             && !TERMINAL_UPLOAD_STATUSES.has(remoteStatus)) {
           return true;
         }
+        if (!task.cancelRequested && !task.sessionAdoptionPromise && !isFreshEvent(task, payload)) {
+          return TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(task.status)) ? cleanTerminal() : true;
+        }
         if (task.cancelRequested && TERMINAL_UPLOAD_STATUSES.has(remoteStatus)) {
           settleRemoteCancel(task);
-          if (remoteUploadId) task.uploadId = remoteUploadId;
-          if (remoteClientRequestId) task.clientRequestId = remoteClientRequestId;
-          applyServerState(task, payload);
           applyRemoteStatus(task, payload);
           task.liveRevision = eventRevision;
-          removeTaskPersistence(task).catch(() => {});
-          task.sessionAdoptionPromise
-            ?.finally(() => removeTaskPersistence(task).catch(() => {}))
-            .catch(() => {});
           notify();
-          return true;
+          const settle = async () => {
+            if (task.sessionAdoptionPromise) await task.sessionAdoptionPromise;
+            if (remoteUploadId) task.uploadId = remoteUploadId;
+            if (remoteClientRequestId) task.clientRequestId = remoteClientRequestId;
+            applyServerState(task, payload);
+            applyRemoteStatus(task, payload);
+            task.liveRevision = eventRevision;
+            await removeTaskPersistence(task);
+            notify();
+            return true;
+          };
+          return settle().catch(() => false);
         }
         if (task.cancelRequested && remoteUploadId) {
           task.liveRevision = eventRevision;
-          scheduleAuthoritativeCancel(task, payload);
           notify();
-          return true;
+          return scheduleAuthoritativeCancel(task, payload);
+        }
+        if (remoteUploadId && (!task.sessionReady || task.uploadId !== remoteUploadId)) {
+          const adoption = adoptRemoteSession(task, payload)
+            .then(async () => {
+              task.liveRevision = eventRevision;
+              if (isFreshEvent(task, payload)) {
+                applyServerState(task, payload);
+                applyRemoteStatus(task, payload);
+              }
+              if (TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(task.status))) {
+                await removeTaskPersistence(task);
+              }
+              notify();
+              return true;
+            })
+            .catch(() => false);
+          return adoption;
         }
         if (remoteUploadId) task.uploadId = remoteUploadId;
         if (remoteClientRequestId) task.clientRequestId = remoteClientRequestId;
         applyServerState(task, payload);
         applyRemoteStatus(task, payload);
         task.liveRevision = eventRevision;
+        if (TERMINAL_UPLOAD_STATUSES.has(normalizedStatus(task.status))) return cleanTerminal();
         notify();
         return true;
       };

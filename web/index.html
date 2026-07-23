@@ -93,30 +93,32 @@
                 <section class="route-page transfer-page" id="transferPage" data-route-page="transfer">
                     <h1 class="route-heading visually-hidden" data-route-heading="transfer" tabindex="-1">传输工作台</h1>
                     <div class="transfer-workspace">
-                        <header class="transfer-status" aria-label="传输状态">
-                            <div><span>当前设备</span><strong id="routeSource">本机</strong></div>
-                            <div class="route-link"><span>SHA-256</span></div>
-                            <div><span>目标设备</span><strong id="routeTarget">已连接设备</strong></div>
-                            <span id="connectionStatus" class="pill" aria-live="polite">未连接</span>
-                        </header>
+                        <div class="transfer-status-stack">
+                            <header class="transfer-status transfer-status-strip" aria-label="传输状态">
+                                <div><span>当前设备</span><strong id="routeSource">本机</strong></div>
+                                <div class="route-link"><span>SHA-256</span></div>
+                                <div><span>目标设备</span><strong id="routeTarget">已连接设备</strong></div>
+                                <span id="connectionStatus" class="pill" aria-live="polite">未连接</span>
+                            </header>
 
-                        <section class="upload-summary" id="uploadSummary" aria-label="上传任务" hidden>
-                            <p id="uploadSummaryText">0 个活动任务</p>
-                            <div class="upload-summary-actions">
-                                <button class="btn btn-soft" id="pauseAllUploads" type="button">全部暂停</button>
-                                <button class="btn btn-soft" id="resumeAllUploads" type="button">全部继续</button>
-                                <button class="btn btn-danger" id="cancelAllUploads" type="button">全部取消</button>
-                            </div>
-                        </section>
+                            <section class="upload-summary" id="uploadSummary" aria-label="上传任务" hidden>
+                                <p id="uploadSummaryText">0 个活动任务</p>
+                                <div class="upload-summary-actions">
+                                    <button class="btn btn-soft" id="pauseAllUploads" type="button">全部暂停</button>
+                                    <button class="btn btn-soft" id="resumeAllUploads" type="button">全部继续</button>
+                                    <button class="btn btn-danger" id="cancelAllUploads" type="button">全部取消</button>
+                                </div>
+                            </section>
+                        </div>
                         <div class="transfer-drop-overlay" id="transferDropOverlay" aria-hidden="true">释放文件以添加到传输时间线</div>
                         <div class="visually-hidden" id="uploadLiveRegion" aria-live="polite" aria-atomic="true"></div>
 
                         <!-- Timeline: recent activity -->
                         <section class="panel timeline-panel" id="timelinePanel">
                             <div class="panel-head">
-                                <div><h2>最近活动</h2><p>消息与文件时间线</p></div>
+                                <div><h2 id="timelineHeading">最近活动</h2><p>消息与文件时间线</p></div>
                             </div>
-                            <div class="timeline-container" id="timelineContainer" tabindex="-1">
+                            <div class="timeline-container timeline-scroll-region" id="timelineContainer" tabindex="0" aria-labelledby="timelineHeading">
                                 <div class="timeline-empty" id="timelineEmpty">
                                     <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
                                     <strong>暂无消息</strong>
@@ -171,7 +173,7 @@
                         <section id="libraryView" class="panel library-panel" tabindex="-1">
                             <div class="panel-head">
                                 <div><h2>最近文件</h2><p><span id="libraryCount">0</span> 个结果</p></div>
-                                <div class="library-tools">
+                                <div class="library-tools library-primary-tools">
                                     <div class="search-wrap">
                                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
                                         <input class="control" id="librarySearch" type="search" placeholder="搜索文件名">
@@ -209,7 +211,7 @@
                                 </div>
                             </div>
 
-                            <div class="control-row">
+                            <div class="control-row library-secondary-tools">
                                 <div class="view-switch" role="tablist" aria-label="文件视图切换">
                                     <button class="view-chip active" id="gridViewBtn" data-view="grid" type="button" role="tab" aria-selected="true" aria-controls="fileList" tabindex="0">卡片</button>
                                     <button class="view-chip" id="listViewBtn" data-view="list" type="button" role="tab" aria-selected="false" aria-controls="fileList" tabindex="-1">表格</button>
@@ -263,7 +265,7 @@
                     </div>
                     <div class="manage-grid">
                         <!-- Connection: status and latency -->
-                        <section class="panel manage-panel connection-panel" id="connectionPanel" aria-live="polite">
+                        <section class="panel manage-panel connection-panel manage-primary-panel" id="connectionPanel" aria-live="polite">
                             <div class="panel-head">
                                 <div><h2>连接状态</h2><p>查看当前设备与实时事件连接</p></div>
                                 <button class="icon-button" id="railRefresh" type="button" aria-label="刷新连接">
@@ -293,7 +295,7 @@
                         </section>
 
                         <!-- Operations: storage stats (summary only) -->
-                        <section class="panel manage-panel operations-panel" id="operationsPanel" aria-labelledby="operationsTitle">
+                        <section class="panel manage-panel operations-panel manage-primary-panel" id="operationsPanel" aria-labelledby="operationsTitle">
                             <div class="panel-head">
                                 <div><h2 id="operationsTitle">存储状态</h2><p>汇总文件占用与存储分布</p></div>
                                 <button class="icon-button" id="refreshOpsBtn" type="button" aria-label="刷新运营视图">
@@ -311,12 +313,12 @@
                             </div>
                         </section>
 
-                        <section class="panel manage-panel" id="appearancePanel">
+                        <section class="panel manage-panel manage-setting-panel" id="appearancePanel">
                             <div class="panel-head"><div><h2>外观</h2><p>切换工作台显示主题</p></div></div>
                             <div class="manage-panel-body"><button class="btn btn-soft" id="manageThemeToggle" type="button">切换深色模式</button></div>
                         </section>
 
-                        <section class="panel manage-panel session-panel" id="sessionPanel">
+                        <section class="panel manage-panel session-panel manage-setting-panel" id="sessionPanel">
                             <div class="panel-head"><div><h2>当前会话</h2><p>退出后需要访问令牌重新解锁</p></div></div>
                             <div class="manage-panel-body"><button class="btn btn-danger" id="logoutButton" type="button">退出当前会话</button></div>
                         </section>

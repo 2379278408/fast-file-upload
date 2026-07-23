@@ -84,6 +84,7 @@ def test_sparse_512mb_upload_completes_with_server_sha256(
     large_settings = replace(
         settings,
         max_upload_size=size,
+        upload_chunk_size_bytes=CHUNK_SIZE,
         allowed_extensions={".bin"},
     )
     client = authenticated_large_client(large_settings)

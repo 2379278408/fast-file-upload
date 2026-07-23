@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import os
 import re
 import socket
@@ -358,9 +359,59 @@ def _assert_browser_clean(session: BrowserSession) -> None:
 
 
 def _assert_no_horizontal_overflow(page: Page) -> None:
-    assert page.evaluate(
-        "() => document.documentElement.scrollWidth <= document.documentElement.clientWidth"
+    metrics = page.evaluate(
+        """
+        () => {
+          const root = document.documentElement;
+          const viewportWidth = root.clientWidth;
+          const offenders = [...document.querySelectorAll('body *')]
+            .map(element => {
+              const rect = element.getBoundingClientRect();
+              return {
+                element: element.id ? `#${element.id}` : element.className || element.tagName,
+                left: rect.left,
+                right: rect.right,
+                width: rect.width,
+              };
+            })
+            .filter(item => item.right > viewportWidth + 1 || item.left < -1)
+            .slice(0, 12);
+          return {
+            clientWidth: viewportWidth,
+            scrollWidth: root.scrollWidth,
+            offenders,
+          };
+        }
+        """
     )
+    assert metrics["scrollWidth"] <= metrics["clientWidth"], metrics
+
+
+def _assert_visible_table_descendants_stay_within_cells(table: Locator) -> None:
+    violations = table.locator("tbody tr").evaluate_all(
+        """
+        rows => rows.flatMap((row, rowIndex) => [...row.cells].flatMap((cell, cellIndex) => {
+          if (getComputedStyle(cell).display === 'none') return [];
+          const cellRect = cell.getBoundingClientRect();
+          return [...cell.querySelectorAll('*')].flatMap(element => {
+            const style = getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            if (style.display === 'none' || rect.width === 0 || rect.height === 0) return [];
+            if (rect.left >= cellRect.left - 1 && rect.right <= cellRect.right + 1) return [];
+            return [{
+              rowIndex,
+              cellIndex,
+              element: element.id || (typeof element.className === 'string' ? element.className : element.tagName),
+              cellLeft: cellRect.left,
+              cellRight: cellRect.right,
+              elementLeft: rect.left,
+              elementRight: rect.right,
+            }];
+          });
+        }))
+        """
+    )
+    assert violations == []
 
 
 def create_test_files(
@@ -649,6 +700,253 @@ def test_composer_enter_shift_enter_and_ime_composition(
     _assert_browser_clean(browser_session)
 
 
+def test_transfer_long_content_and_new_message_notice_do_not_overlap(
+    browser_session: BrowserSession,
+) -> None:
+    page = browser_session.page
+    page.set_viewport_size({"width": 390, "height": 844})
+    _open_locked_application(browser_session)
+    _unlock(page)
+    expect(page.locator("#connectionStatus")).to_have_text("已连接", timeout=10_000)
+
+    last_seed_id = ""
+    for index in range(12):
+        response = browser_session.context.request.post(
+            f"{browser_session.base_url}/api/messages",
+            data={
+                "body": "https://example.com/" + "long-segment-" * 30,
+                "client_request_id": f"density-message-{index}",
+            },
+        )
+        assert response.ok
+        last_seed_id = response.json()["id"]
+    expect(page.locator(f'[data-message-id="{last_seed_id}"]')).to_be_attached(
+        timeout=10_000
+    )
+
+    timeline = page.locator("#timelineContainer")
+    notice = page.locator("#newMessageButton")
+    assert notice.is_hidden()
+    assert timeline.evaluate(
+        "node => getComputedStyle(node).paddingBottom"
+    ) == "8px"
+    assert page.locator("#timelinePanel").evaluate(
+        "node => getComputedStyle(node).paddingBottom"
+    ) != "64px"
+    page.wait_for_function(
+        """
+        () => {
+          const timeline = document.getElementById('timelineContainer');
+          return timeline.scrollHeight - timeline.clientHeight > 48;
+        }
+        """
+    )
+    timeline.evaluate(
+        """
+        node => {
+          node.scrollTop = 0;
+          node.dispatchEvent(new Event('scroll'));
+        }
+        """
+    )
+    page.wait_for_function(
+        """
+        () => {
+          const timeline = document.getElementById('timelineContainer');
+          return timeline.scrollTop === 0 &&
+            timeline.scrollHeight - timeline.clientHeight > 48;
+        }
+        """
+    )
+    response = browser_session.context.request.post(
+        f"{browser_session.base_url}/api/messages",
+        data={"body": "new message", "client_request_id": "density-new-message"},
+    )
+    assert response.ok
+    new_message_id = response.json()["id"]
+    expect(page.locator(f'[data-message-id="{new_message_id}"]')).to_be_attached(
+        timeout=10_000
+    )
+
+    expect(notice).to_be_visible(timeout=10_000)
+    layout = page.locator("#timelinePanel").evaluate(
+        """
+        panel => {
+          const timeline = panel.querySelector('#timelineContainer');
+          const notice = panel.querySelector('#newMessageButton');
+          const timelineRect = timeline.getBoundingClientRect();
+          const noticeRect = notice.getBoundingClientRect();
+          const messageRects = Array.from(
+            timeline.querySelectorAll('.timeline-message')
+          ).map(message => message.getBoundingClientRect());
+          const overlaps = messageRects.some(rect => {
+            const visibleTop = Math.max(rect.top, timelineRect.top);
+            const visibleBottom = Math.min(rect.bottom, timelineRect.bottom);
+            return visibleTop < visibleBottom &&
+              rect.left < noticeRect.right && rect.right > noticeRect.left &&
+              visibleTop < noticeRect.bottom && visibleBottom > noticeRect.top;
+          });
+          return {
+            overlaps,
+            paddingBottom: Number.parseFloat(getComputedStyle(panel).paddingBottom),
+            noticeHeight: noticeRect.height,
+            noticePosition: getComputedStyle(notice).position,
+            centerDelta: Math.abs(
+              (noticeRect.left + noticeRect.right) / 2 -
+              (timelineRect.left + timelineRect.right) / 2
+            ),
+          };
+        }
+        """
+    )
+    assert layout["overlaps"] is False
+    assert layout["paddingBottom"] >= layout["noticeHeight"]
+    assert layout["noticePosition"] == "absolute"
+    assert layout["centerDelta"] <= 1
+    link_layout = page.locator(".timeline-message-body").first.evaluate(
+        """
+        body => {
+          const bodyRect = body.getBoundingClientRect();
+          const link = body.querySelector('a');
+          const linkRects = Array.from(link.getClientRects());
+          return {
+            bodyFits: body.scrollWidth <= body.clientWidth,
+            overflowWrap: getComputedStyle(body).overflowWrap,
+            linkLineCount: linkRects.length,
+            linkFits: linkRects.every(rect =>
+              rect.left >= bodyRect.left - 0.5 && rect.right <= bodyRect.right + 0.5
+            ),
+          };
+        }
+        """
+    )
+    assert link_layout["bodyFits"] is True
+    assert link_layout["overflowWrap"] == "anywhere"
+    assert link_layout["linkLineCount"] > 1
+    assert link_layout["linkFits"] is True
+
+    notice_before_hover = notice.bounding_box()
+    assert notice_before_hover is not None
+    notice.hover()
+    page.wait_for_function(
+        """
+        beforeY => {
+          const notice = document.getElementById('newMessageButton');
+          return Math.abs(notice.getBoundingClientRect().top - (beforeY - 1)) < 0.1;
+        }
+        """,
+        arg=notice_before_hover["y"],
+    )
+    notice_after_hover = notice.bounding_box()
+    assert notice_after_hover is not None
+    before_center_x = notice_before_hover["x"] + notice_before_hover["width"] / 2
+    after_center_x = notice_after_hover["x"] + notice_after_hover["width"] / 2
+    assert after_center_x == pytest.approx(before_center_x, abs=0.5)
+    assert notice_after_hover["y"] == pytest.approx(
+        notice_before_hover["y"] - 1, abs=0.2
+    )
+
+    notice.evaluate(
+        "node => { node.textContent = `${'9'.repeat(80)} 条新消息`; }"
+    )
+    notice_box = notice.bounding_box()
+    timeline_box = timeline.bounding_box()
+    assert notice_box is not None and timeline_box is not None
+    viewport_width = page.evaluate("document.documentElement.clientWidth")
+    assert notice_box["x"] >= -0.5
+    assert notice_box["x"] + notice_box["width"] <= viewport_width + 0.5
+    assert notice_box["x"] + notice_box["width"] / 2 == pytest.approx(
+        timeline_box["x"] + timeline_box["width"] / 2,
+        abs=0.5,
+    )
+    _assert_no_horizontal_overflow(page)
+    _assert_browser_clean(browser_session)
+
+
+def test_transfer_short_viewport_uses_unbounded_timeline_and_document_flow(
+    browser_session: BrowserSession,
+) -> None:
+    page = browser_session.page
+    page.set_viewport_size({"width": 375, "height": 667})
+    _open_locked_application(browser_session)
+    _unlock(page)
+
+    layout = page.locator("#transferPage").evaluate(
+        """
+        transferPage => {
+          const workspace = transferPage.querySelector('.transfer-workspace');
+          const timelinePanel = transferPage.querySelector('#timelinePanel');
+          const timeline = transferPage.querySelector('#timelineContainer');
+          const composer = transferPage.querySelector('#composerPanel');
+          return {
+            workspaceDisplay: getComputedStyle(workspace).display,
+            workspaceMinHeight: getComputedStyle(workspace).minHeight,
+            timelineMaxHeight: getComputedStyle(timeline).maxHeight,
+            timelineOverflowY: getComputedStyle(timeline).overflowY,
+            timelinePanelMinHeight: Number.parseFloat(
+              getComputedStyle(timelinePanel).minHeight
+            ),
+            composerPosition: getComputedStyle(composer).position,
+          };
+        }
+        """
+    )
+    assert layout == {
+        "workspaceDisplay": "block",
+        "workspaceMinHeight": "0px",
+        "timelineMaxHeight": "none",
+        "timelineOverflowY": "auto",
+        "timelinePanelMinHeight": 320,
+        "composerPosition": "static",
+    }
+    _assert_no_horizontal_overflow(page)
+    _assert_browser_clean(browser_session)
+
+
+def test_transfer_visible_upload_summary_stays_in_status_stack(
+    browser_session: BrowserSession,
+) -> None:
+    page = browser_session.page
+    page.set_viewport_size({"width": 390, "height": 844})
+    _open_locked_application(browser_session)
+    _unlock(page)
+
+    page.locator("#uploadSummary").evaluate("element => { element.hidden = false; }")
+    layout = page.locator("#transferPage").evaluate(
+        """
+        transferPage => {
+          const workspace = transferPage.querySelector('.transfer-workspace');
+          const stack = transferPage.querySelector('.transfer-status-stack');
+          const status = transferPage.querySelector('.transfer-status-strip');
+          const summary = transferPage.querySelector('#uploadSummary');
+          const timeline = transferPage.querySelector('#timelinePanel');
+          const stackRect = stack?.getBoundingClientRect();
+          const statusRect = status.getBoundingClientRect();
+          const summaryRect = summary.getBoundingClientRect();
+          const timelineRect = timeline.getBoundingClientRect();
+          return {
+            summaryParentClass: summary.parentElement.className,
+            stackDisplay: stack ? getComputedStyle(stack).display : null,
+            workspaceDisplay: getComputedStyle(workspace).display,
+            statusBeforeSummary: statusRect.bottom <= summaryRect.top,
+            summaryBeforeTimeline: summaryRect.bottom <= timelineRect.top,
+            timelineGap: stackRect ? timelineRect.top - stackRect.bottom : null,
+            timelineHeight: timelineRect.height,
+          };
+        }
+        """
+    )
+    assert layout["summaryParentClass"] == "transfer-status-stack"
+    assert layout["stackDisplay"] == "grid"
+    assert layout["workspaceDisplay"] == "grid"
+    assert layout["statusBeforeSummary"] is True
+    assert layout["summaryBeforeTimeline"] is True
+    assert 0 <= layout["timelineGap"] <= 16
+    assert layout["timelineHeight"] >= 220
+    _assert_no_horizontal_overflow(page)
+    _assert_browser_clean(browser_session)
+
+
 def test_tabs_skip_link_and_mobile_touch_targets(
     browser_session: BrowserSession,
 ) -> None:
@@ -833,9 +1131,9 @@ def test_three_route_navigation_history_focus_and_viewport_safety(
         composer_box = composer.bounding_box()
         mobile_nav_box = mobile_nav.bounding_box()
         assert composer_box is not None and mobile_nav_box is not None
-        assert composer.evaluate(
+        composer_position = composer.evaluate(
             "element => getComputedStyle(element).position"
-        ) == "fixed"
+        )
         assert timeline_metrics["height"] >= 120
         assert timeline_metrics["overflowY"] == "auto"
         assert timeline_metrics["top"] >= 0
@@ -843,10 +1141,37 @@ def test_three_route_navigation_history_focus_and_viewport_safety(
             "timeline": timeline_metrics,
             "composer": composer_box,
         }
-        assert composer_box["y"] >= 0
-        assert composer_box["y"] + composer_box["height"] <= mobile_nav_box["y"]
         if viewport == {"width": 390, "height": 568}:
+            compact_layout = page.locator("#transferPage").evaluate(
+                """
+                transferPage => {
+                  const workspace = transferPage.querySelector('.transfer-workspace');
+                  const panel = transferPage.querySelector('#timelinePanel');
+                  const timeline = transferPage.querySelector('#timelineContainer');
+                  const composer = transferPage.querySelector('#composerPanel');
+                  return {
+                    workspaceDisplay: getComputedStyle(workspace).display,
+                    workspaceMinHeight: getComputedStyle(workspace).minHeight,
+                    panelMinHeight: Number.parseFloat(getComputedStyle(panel).minHeight),
+                    timelineMaxHeight: getComputedStyle(timeline).maxHeight,
+                    composerPosition: getComputedStyle(composer).position,
+                  };
+                }
+                """
+            )
+            assert compact_layout == {
+                "workspaceDisplay": "block",
+                "workspaceMinHeight": "0px",
+                "panelMinHeight": 320,
+                "timelineMaxHeight": "none",
+                "composerPosition": "static",
+            }
             assert timeline_metrics["scrollHeight"] > timeline_metrics["clientHeight"]
+            assert composer_position == "static"
+        else:
+            assert composer_position == "fixed"
+            assert composer_box["y"] >= 0
+            assert composer_box["y"] + composer_box["height"] <= mobile_nav_box["y"]
 
     else:
         assert page.locator("#composerPanel").evaluate(
@@ -873,6 +1198,301 @@ def test_empty_files_action_returns_to_transfer_and_opens_picker(
     expect(page.locator("#transferPage")).to_be_visible()
     expect(page.locator('[data-route-heading="transfer"]')).to_be_focused()
     assert page.evaluate("location.hash") == "#transfer"
+    _assert_browser_clean(browser_session)
+
+
+@pytest.mark.parametrize(
+    "viewport",
+    [
+        pytest.param({"width": 1024, "height": 768}, id="desktop-1024x768"),
+        pytest.param({"width": 390, "height": 844}, id="mobile-390x844"),
+        pytest.param({"width": 375, "height": 667}, id="mobile-375x667"),
+    ],
+)
+def test_files_tools_and_results_have_no_horizontal_overflow(
+    browser_session: BrowserSession,
+    viewport: dict[str, int],
+) -> None:
+    page = browser_session.page
+    page.set_viewport_size(viewport)
+    _create_seed_session(browser_session, f"files-density-{viewport['width']}")
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    )
+    files = (
+        (f"task-3-{'unbrokenfilename' * 10}.txt", "text/plain", b"files density"),
+        (f"task-3-{'secondlongfilename' * 10}.md", "text/markdown", b"# density"),
+        (f"task-3-{'previewfilename' * 10}.png", "image/png", png),
+    )
+    for index, (name, mime_type, content) in enumerate(files):
+        upload = browser_session.context.request.post(
+            f"{browser_session.base_url}/api/upload",
+            multipart={
+                "client_request_id": f"files-density-{viewport['width']}-{index}",
+                "file": {
+                    "name": name,
+                    "mimeType": mime_type,
+                    "buffer": content,
+                },
+            },
+        )
+        assert upload.ok
+    browser_session.context.clear_cookies()
+
+    _open_locked_application(browser_session)
+    _unlock(page)
+    nav_selector = ".sidebar" if viewport["width"] > 720 else ".mobile-nav"
+    page.locator(f'{nav_selector} [data-route="files"]').click()
+    _assert_route_state(page, "files", nav_selector)
+    page.locator("#librarySearch").fill("task-3-")
+    page.locator("#filterToggleBtn").click()
+    expect(page.locator("#filterGrid")).not_to_have_class(re.compile(r".*collapsed.*"))
+
+    primary_box = page.locator(".library-primary-tools").bounding_box()
+    secondary_box = page.locator(".library-secondary-tools").bounding_box()
+    assert primary_box is not None and secondary_box is not None
+    assert primary_box["y"] + primary_box["height"] <= secondary_box["y"]
+    for selector in (
+        "#librarySearch",
+        "#filterToggleBtn",
+        "#gridViewBtn",
+        "#listViewBtn",
+    ):
+        box = page.locator(selector).bounding_box()
+        assert box is not None
+        assert box["width"] >= 43.99 and box["height"] >= 43.99, (selector, box)
+
+    grid_cards = page.locator("#fileList.grid-mode .file-card")
+    expect(grid_cards).to_have_count(3)
+    grid_metrics = grid_cards.evaluate_all(
+        """
+        cards => cards.map(card => {
+          const listRect = card.parentElement.getBoundingClientRect();
+          const cardRect = card.getBoundingClientRect();
+          const name = card.querySelector('.file-name');
+          return {
+            cardLeft: cardRect.left,
+            cardRight: cardRect.right,
+            cardTop: cardRect.top,
+            listLeft: listRect.left,
+            listRight: listRect.right,
+            nameClientWidth: name.clientWidth,
+            nameScrollWidth: name.scrollWidth,
+            overflowWrap: getComputedStyle(name).overflowWrap,
+          };
+        })
+        """
+    )
+    assert all(metric["cardLeft"] >= metric["listLeft"] - 1 for metric in grid_metrics)
+    assert all(metric["cardRight"] <= metric["listRight"] + 1 for metric in grid_metrics)
+    assert all(
+        metric["nameScrollWidth"] <= metric["nameClientWidth"] + 1
+        for metric in grid_metrics
+    )
+    assert all(metric["overflowWrap"] == "anywhere" for metric in grid_metrics)
+    grid_columns = {round(metric["cardLeft"]) for metric in grid_metrics}
+    if viewport["width"] > 720:
+        assert len(grid_columns) == 3
+    else:
+        assert len(grid_columns) == 1
+
+    preview_card = grid_cards.filter(has=page.locator(".media img"))
+    expect(preview_card).to_have_count(1)
+    preview_card.locator(".media").click()
+    preview_dialog = page.locator("#previewModal")
+    expect(preview_dialog).to_be_visible()
+    expect(page.locator("#previewTitle")).to_contain_text("previewfilename")
+    expect(page.locator("#previewImage")).to_be_visible()
+    page.locator("#closePreviewBtn").click()
+    expect(preview_dialog).to_be_hidden()
+
+    card_selection = grid_cards.first.locator(".select-line")
+    card_selection_box = card_selection.bounding_box()
+    card_checkbox_box = card_selection.locator("input").bounding_box()
+    assert card_selection_box is not None and card_checkbox_box is not None
+    assert card_selection_box["width"] >= 43.99
+    assert card_selection_box["height"] >= 43.99
+    assert card_checkbox_box["width"] <= 24 and card_checkbox_box["height"] <= 24
+    card_selection.click()
+    expect(grid_cards.first.locator(".select-line input")).to_be_checked()
+    card_selection.click()
+    expect(grid_cards.first.locator(".select-line input")).not_to_be_checked()
+    _assert_no_horizontal_overflow(page)
+
+    page.locator("#listViewBtn").click()
+    list_result = page.locator("#fileList.table-mode")
+    expect(list_result).to_be_visible()
+    list_metrics = list_result.locator("tbody tr").first.evaluate(
+        """
+        row => {
+          const listRect = row.closest('.file-list').getBoundingClientRect();
+          const rowRect = row.getBoundingClientRect();
+          const name = row.querySelector('.file-name strong');
+          const meta = row.querySelector('.file-name span');
+          const actions = row.querySelector('.row-actions');
+          return {
+            rowLeft: rowRect.left,
+            rowRight: rowRect.right,
+            listLeft: listRect.left,
+            listRight: listRect.right,
+            rowDisplay: getComputedStyle(row).display,
+            rowColumns: getComputedStyle(row).gridTemplateColumns,
+            nameClientWidth: name.clientWidth,
+            nameScrollWidth: name.scrollWidth,
+            nameHeight: name.getBoundingClientRect().height,
+            nameLineHeight: Number.parseFloat(getComputedStyle(name).lineHeight),
+            nameWhiteSpace: getComputedStyle(name).whiteSpace,
+            nameOverflowWrap: getComputedStyle(name).overflowWrap,
+            metaTop: meta.getBoundingClientRect().top,
+            nameBottom: name.getBoundingClientRect().bottom,
+            actionsWidth: actions.getBoundingClientRect().width,
+          };
+        }
+        """
+    )
+    assert list_metrics["rowLeft"] >= list_metrics["listLeft"] - 1
+    assert list_metrics["rowRight"] <= list_metrics["listRight"] + 1
+    assert list_metrics["nameScrollWidth"] <= list_metrics["nameClientWidth"] + 1
+
+    table_selection = list_result.locator(".table-select-target").first
+    table_selection_box = table_selection.bounding_box()
+    assert table_selection_box is not None
+    assert table_selection_box["width"] >= 43.99
+    assert table_selection_box["height"] >= 43.99
+    table_check = table_selection.locator(".check")
+    table_check_box = table_check.bounding_box()
+    assert table_check_box is not None
+    assert table_check_box["width"] <= 20.01 and table_check_box["height"] <= 20.01
+    table_selection.click()
+    expect(table_check).to_be_checked()
+
+    _assert_visible_table_descendants_stay_within_cells(list_result)
+
+    preview_row = list_result.locator('tbody tr:has([data-file-action="preview"])')
+    expect(preview_row).to_have_count(1)
+    preview_actions = preview_row.locator(".row-action")
+    expect(preview_actions).to_have_count(2)
+    for action_index in range(2):
+        action_box = preview_actions.nth(action_index).bounding_box()
+        assert action_box is not None
+        assert action_box["width"] >= 43.99 and action_box["height"] >= 43.99
+    if viewport["width"] <= 720:
+        table_head = list_result.locator("thead")
+        expect(table_head).to_have_count(1)
+        header_semantics = table_head.evaluate(
+            """
+            head => {
+              const rect = head.getBoundingClientRect();
+              const style = getComputedStyle(head);
+              const headers = [...head.querySelectorAll('th')];
+              return {
+                display: style.display,
+                position: style.position,
+                width: rect.width,
+                height: rect.height,
+                texts: headers.map(header => header.textContent.trim()),
+                scopes: headers.map(header => header.getAttribute('scope')),
+              };
+            }
+            """
+        )
+        assert header_semantics["display"] != "none"
+        assert header_semantics["position"] == "absolute"
+        assert header_semantics["width"] <= 1.01
+        assert header_semantics["height"] <= 1.01
+        assert header_semantics["texts"] == [
+            "选择",
+            "文件",
+            "大小",
+            "更新时间",
+            "状态",
+            "操作",
+        ]
+        assert header_semantics["scopes"] == ["col"] * 6
+        assert list_metrics["rowDisplay"] == "grid"
+        assert list_metrics["rowColumns"].split()[0] == "44px"
+        assert list_metrics["nameWhiteSpace"] == "normal"
+        assert list_metrics["nameOverflowWrap"] == "anywhere"
+        assert list_metrics["nameHeight"] > list_metrics["nameLineHeight"]
+        assert list_metrics["metaTop"] >= list_metrics["nameBottom"]
+        assert list_metrics["actionsWidth"] == pytest.approx(44, abs=1)
+    if viewport == {"width": 390, "height": 844}:
+        if not page.locator("html").evaluate("element => element.classList.contains('dark')"):
+            page.locator("#themeToggle").click()
+        expect(page.locator("html")).to_have_class(re.compile(r".*dark.*"))
+        dark_colors = preview_row.evaluate(
+            """
+            row => {
+              const probe = document.createElement('span');
+              probe.style.color = 'var(--surface)';
+              probe.style.backgroundColor = 'var(--fg)';
+              document.body.append(probe);
+              const result = {
+                background: getComputedStyle(row).backgroundColor,
+                color: getComputedStyle(row).color,
+                expectedBackground: getComputedStyle(probe).color,
+                expectedColor: getComputedStyle(probe).backgroundColor,
+              };
+              probe.remove();
+              return result;
+            }
+            """
+        )
+        assert dark_colors["background"] == dark_colors["expectedBackground"]
+        assert dark_colors["color"] == dark_colors["expectedColor"]
+    _assert_no_horizontal_overflow(page)
+    _assert_browser_clean(browser_session)
+
+
+@pytest.mark.parametrize("width", [721, 900, 901])
+def test_files_compact_table_keeps_visible_cells_separate(
+    browser_session: BrowserSession,
+    width: int,
+) -> None:
+    page = browser_session.page
+    page.set_viewport_size({"width": width, "height": 768})
+    _create_seed_session(browser_session, f"files-compact-{width}")
+    upload = browser_session.context.request.post(
+        f"{browser_session.base_url}/api/upload",
+        multipart={
+            "client_request_id": f"files-compact-{width}",
+            "file": {
+                "name": f"compact-{'unbrokenfilename' * 12}.txt",
+                "mimeType": "text/plain",
+                "buffer": b"compact table boundaries",
+            },
+        },
+    )
+    assert upload.ok
+    browser_session.context.clear_cookies()
+
+    _open_locked_application(browser_session)
+    _unlock(page)
+    page.locator('.sidebar [data-route="files"]').click()
+    _assert_route_state(page, "files", ".sidebar")
+    page.locator("#listViewBtn").click()
+    table = page.locator("#fileList.table-mode")
+    expect(table).to_be_visible()
+    expect(table.locator("tbody td:nth-child(3)")).to_be_hidden()
+    expect(table.locator("tbody td:nth-child(5)")).to_be_hidden()
+    date_cell = table.locator("tbody td:nth-child(4)")
+    expect(date_cell).to_be_visible()
+    date_style = date_cell.evaluate(
+        """
+        cell => ({
+          overflow: getComputedStyle(cell).overflow,
+          textOverflow: getComputedStyle(cell).textOverflow,
+          whiteSpace: getComputedStyle(cell).whiteSpace,
+        })
+        """
+    )
+    assert date_style == {
+        "overflow": "hidden",
+        "textOverflow": "ellipsis",
+        "whiteSpace": "nowrap",
+    }
+    _assert_visible_table_descendants_stay_within_cells(table)
+    _assert_no_horizontal_overflow(page)
     _assert_browser_clean(browser_session)
 
 
@@ -926,6 +1546,9 @@ def test_mobile_toast_stays_above_composer_without_intercepting_it(
     page.set_viewport_size({"width": 390, "height": 568})
     _open_locked_application(browser_session)
     _unlock(page)
+    composer = page.locator("#composerPanel")
+    attach = page.locator("#composerAttachBtn")
+    attach.scroll_into_view_if_needed()
     page.evaluate(
         """
         window.dispatchEvent(new CustomEvent('timeline-error', {
@@ -935,7 +1558,6 @@ def test_mobile_toast_stays_above_composer_without_intercepting_it(
     )
 
     toast = page.locator("#toast")
-    composer = page.locator("#composerPanel")
     expect(toast).to_be_visible()
     expect(composer).to_be_visible()
     page.wait_for_function(
@@ -945,11 +1567,11 @@ def test_mobile_toast_stays_above_composer_without_intercepting_it(
           const composer = document.querySelector('#composerPanel').getBoundingClientRect();
           return toast.bottom <= composer.top - 8;
         }
-        """
+    """
     )
     toast_box = toast.bounding_box()
     composer_box = composer.bounding_box()
-    attach_box = page.locator("#composerAttachBtn").bounding_box()
+    attach_box = attach.bounding_box()
     assert toast_box is not None and composer_box is not None and attach_box is not None
     assert toast_box["y"] + toast_box["height"] <= composer_box["y"] - 8
     assert page.evaluate(
@@ -997,6 +1619,159 @@ def test_health_storage_summary_is_loaded_only_in_manage(
     expect(page.locator(".health")).to_be_visible()
     expect(page.locator("#metricCount")).to_have_text("1")
     expect(page.locator("#metricSize")).not_to_have_text("0 B")
+    _assert_browser_clean(browser_session)
+
+
+@pytest.mark.parametrize(
+    ("viewport", "health_columns", "manage_columns", "use_dark_theme"),
+    [
+        pytest.param(
+            {"width": 1440, "height": 900}, 3, 2, True, id="desktop-1440-dark"
+        ),
+        pytest.param(
+            {"width": 1024, "height": 768}, 2, 2, False, id="tablet-1024-light"
+        ),
+        pytest.param(
+            {"width": 720, "height": 812}, 1, 1, False, id="mobile-720-light"
+        ),
+        pytest.param(
+            {"width": 390, "height": 844}, 1, 1, False, id="mobile-390-light"
+        ),
+        pytest.param(
+            {"width": 375, "height": 667}, 1, 1, False, id="mobile-375-light"
+        ),
+    ],
+)
+def test_manage_cards_reflow_without_horizontal_overflow(
+    browser_session: BrowserSession,
+    viewport: dict[str, int],
+    health_columns: int,
+    manage_columns: int,
+    use_dark_theme: bool,
+) -> None:
+    page = browser_session.page
+    page.set_viewport_size(viewport)
+    _open_locked_application(browser_session)
+    _unlock(page)
+    nav_selector = ".sidebar" if viewport["width"] > 720 else ".mobile-nav"
+    page.locator(f'{nav_selector} [data-route="manage"]').click()
+    page.locator("#connectionPanel").wait_for(state="visible")
+
+    if use_dark_theme:
+        page.locator("#manageThemeToggle").click()
+        expect(page.locator("html")).to_have_class(re.compile(r"\bdark\b"))
+    else:
+        expect(page.locator("html")).not_to_have_class(re.compile(r"\bdark\b"))
+
+    page.evaluate(
+        """
+        () => {
+          const longToken = 'status-storage-value-'.repeat(24);
+          document.querySelector('#connectionDetail').textContent = longToken;
+          document.querySelector('#connectionDevice').textContent = longToken;
+          document.querySelector('#connectionEvents').textContent = longToken;
+          document.querySelector('#storageSummary').textContent = longToken;
+        }
+        """
+    )
+
+    geometry = page.evaluate(
+        """
+        () => {
+          const columnCount = selector => {
+            const value = getComputedStyle(document.querySelector(selector))
+              .gridTemplateColumns;
+            if (!value || value === 'none' || value === 'auto') return 1;
+            return value.trim().split(/\\s+/).length;
+          };
+          const settingBodies = [...document.querySelectorAll(
+            '.manage-setting-panel .manage-panel-body'
+          )].map(element => {
+            const rect = element.getBoundingClientRect();
+            const style = getComputedStyle(element);
+            return {
+              height: rect.height,
+              minHeight: style.minHeight,
+              alignItems: style.alignItems,
+              justifyContent: style.justifyContent,
+            };
+          });
+          const primaryHeights = [...document.querySelectorAll('.manage-primary-panel')]
+            .map(element => element.getBoundingClientRect().height);
+          const settingHeights = [...document.querySelectorAll('.manage-setting-panel')]
+            .map(element => element.getBoundingClientRect().height);
+          return {
+            healthColumns: columnCount('.health'),
+            manageColumns: columnCount('.manage-grid'),
+            settingBodies,
+            primaryHeights,
+            settingHeights,
+          };
+        }
+        """
+    )
+    assert geometry["healthColumns"] == health_columns, geometry
+    assert geometry["manageColumns"] == manage_columns, geometry
+    assert all(
+        body["minHeight"] == "76px" for body in geometry["settingBodies"]
+    ), geometry
+    if viewport["width"] > 720:
+        assert all(
+            body["alignItems"] == "center"
+            and body["justifyContent"] == "flex-end"
+            for body in geometry["settingBodies"]
+        ), geometry
+        assert max(geometry["settingHeights"]) < min(geometry["primaryHeights"]), geometry
+    else:
+        assert all(
+            body["alignItems"] == "stretch" for body in geometry["settingBodies"]
+        ), geometry
+
+    control_boxes = page.locator(
+        "#railRefresh, #refreshOpsBtn, #manageThemeToggle, #logoutButton"
+    ).evaluate_all(
+        """
+        elements => elements.map(element => {
+          const rect = element.getBoundingClientRect();
+          return { id: element.id, width: rect.width, height: rect.height };
+        })
+        """
+    )
+    assert all(
+        box["width"] >= 44 and box["height"] >= 44 for box in control_boxes
+    ), control_boxes
+    if viewport["width"] <= 720:
+        for selector in ("#manageThemeToggle", "#logoutButton"):
+            button = page.locator(selector)
+            body = button.locator("xpath=parent::*")
+            button_box = button.bounding_box()
+            body_box = body.bounding_box()
+            assert button_box is not None and body_box is not None
+            body_padding = body.evaluate(
+                """
+                element => {
+                  const style = getComputedStyle(element);
+                  return Number.parseFloat(style.paddingLeft)
+                    + Number.parseFloat(style.paddingRight);
+                }
+                """
+            )
+            assert abs(button_box["width"] - (body_box["width"] - body_padding)) <= 1
+
+    for selector in (
+        "#connectionDetail",
+        "#connectionDevice",
+        "#connectionEvents",
+        "#storageSummary",
+    ):
+        overflow = page.locator(selector).evaluate(
+            "element => ({ clientWidth: element.clientWidth, scrollWidth: element.scrollWidth })"
+        )
+        assert overflow["scrollWidth"] <= overflow["clientWidth"] + 1, {
+            "selector": selector,
+            **overflow,
+        }
+    _assert_no_horizontal_overflow(page)
     _assert_browser_clean(browser_session)
 
 
@@ -1714,4 +2489,55 @@ def test_eleven_files_complete_after_showing_nine_uploading_and_two_queued(
         assert page.evaluate("window.__heldUploadPartCount()") == 0
         assert 1 <= concurrency["peak"] <= 9
         assert concurrency["active"] == 0
+    _assert_browser_clean(browser_session)
+
+
+@pytest.mark.parametrize(
+    "viewport",
+    [
+        pytest.param({"width": 1440, "height": 900}, id="1440x900"),
+        pytest.param({"width": 1024, "height": 768}, id="1024x768"),
+        pytest.param({"width": 390, "height": 844}, id="390x844"),
+        pytest.param({"width": 375, "height": 667}, id="375x667"),
+    ],
+)
+@pytest.mark.parametrize("route", ["transfer", "files", "manage"])
+def test_workspace_density_matrix(
+    browser_session: BrowserSession,
+    viewport: dict[str, int],
+    route: str,
+) -> None:
+    page = browser_session.page
+    page.set_viewport_size(viewport)
+    _open_locked_application(browser_session)
+    _unlock(page)
+    nav_selector = ".sidebar" if viewport["width"] > 720 else ".mobile-nav"
+    page.locator(f'{nav_selector} [data-route="{route}"]').click()
+    page.locator(f'[data-route-page="{route}"]').wait_for(state="visible")
+    _assert_no_horizontal_overflow(page)
+    assert page.locator(f'[data-route-heading="{route}"]').get_attribute("tabindex") == "-1"
+    _assert_browser_clean(browser_session)
+
+
+def test_density_layout_preserves_dark_theme_and_reduced_motion(
+    browser_session: BrowserSession,
+) -> None:
+    page = browser_session.page
+    _open_locked_application(browser_session)
+    _unlock(page)
+    page.emulate_media(reduced_motion="reduce")
+    page.locator("#themeToggle").click()
+    assert page.locator("html").evaluate("node => node.classList.contains('dark')")
+    scroll_behavior = page.locator("#timelineContainer").evaluate(
+        "node => getComputedStyle(node).scrollBehavior"
+    )
+    assert scroll_behavior == "auto"
+    transition_duration = page.locator("#timelineContainer").evaluate(
+        "node => getComputedStyle(node).transitionDuration"
+    )
+    assert float(transition_duration.rstrip("s")) <= 0.0001
+    animation_duration = page.locator("#timelineContainer").evaluate(
+        "node => getComputedStyle(node).animationDuration"
+    )
+    assert float(animation_duration.rstrip("s")) <= 0.0001
     _assert_browser_clean(browser_session)

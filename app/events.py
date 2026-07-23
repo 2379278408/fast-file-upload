@@ -254,6 +254,7 @@ class EventConnection:
         self.send_lock = asyncio.Lock()
         self._fetch_missing = fetch_missing
         self._pending_limit = 200
+        self._replay_overflow_target = 0
 
     async def send_replay(self, event: dict[str, object]) -> None:
         sequence = int(event["sequence"])
@@ -274,6 +275,10 @@ class EventConnection:
                 overflow = sorted(self.pending.keys())[: len(self.pending) - self._pending_limit]
                 for key in overflow:
                     del self.pending[key]
+                if self.replaying:
+                    self._replay_overflow_target = max(
+                        self._replay_overflow_target, sequence
+                    )
                 logger.warning("Pending overflow; dropped %d stale events", len(overflow))
             if not self.replaying:
                 await self._backfill_and_flush()
@@ -287,7 +292,16 @@ class EventConnection:
                 if sequence > self.last_sequence
             }
             self.replaying = False
-            await self._flush_pending()
+            if self._replay_overflow_target:
+                resync_target = max(
+                    self.last_sequence,
+                    self._replay_overflow_target,
+                    max(self.pending, default=0),
+                )
+                self._replay_overflow_target = 0
+                await self._require_resync(resync_target)
+            else:
+                await self._flush_pending()
             await self.websocket.send_json(
                 {"event_type": "ready", "sequence": self.last_sequence}
             )

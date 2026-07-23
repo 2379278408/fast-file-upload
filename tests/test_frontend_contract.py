@@ -49,6 +49,51 @@ def read_web(path: str) -> str:
     return (Path(__file__).resolve().parent.parent / "web" / path).read_text()
 
 
+def css_rule(source: str, selector: str) -> str:
+    def normalized(value: str) -> str:
+        return ",".join(" ".join(part.split()) for part in value.split(","))
+
+    target = normalized(selector)
+    rules = re.finditer(
+        r"(?<![^{}])\s*(?:/\*.*?\*/\s*)?([^@{}][^{}]*?)\s*\{([^{}]*)\}",
+        source,
+        flags=re.DOTALL,
+    )
+    matched_block: str | None = None
+    for match in rules:
+        if normalized(match.group(1)) == target:
+            matched_block = match.group(2)
+    if matched_block is not None:
+        return matched_block
+    raise AssertionError(f"missing CSS rule for {selector}")
+
+
+def css_declaration(block: str, name: str) -> str:
+    matches = list(
+        re.finditer(rf"(?:^|;)\s*{re.escape(name)}\s*:\s*([^;]+)", block)
+    )
+    assert matches, f"missing CSS declaration for {name} in {block.strip()!r}"
+    return matches[-1].group(1).strip()
+
+
+def test_css_rule_matches_exact_selectors_and_selector_lists() -> None:
+    source = """
+        .file-actions .btn { min-height: 40px; }
+        .btn { min-height: 46px; }
+        .btn { min-height: 48px; }
+        .copy,
+        .delete { min-height: 44px; }
+    """
+
+    assert css_declaration(css_rule(source, ".btn"), "min-height") == "48px"
+    assert css_declaration(css_rule(source, ".copy, .delete"), "min-height") == "44px"
+
+
+def test_css_declaration_uses_last_property_in_rule() -> None:
+    block = "min-height: 40px; min-height: 44px;"
+    assert css_declaration(block, "min-height") == "44px"
+
+
 class InlineStyleAttributeParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -651,35 +696,447 @@ def test_manage_mobile_grid_active_nav_and_reduced_motion_contract() -> None:
     assert "@media (prefers-reduced-motion: reduce)" in css
 
 
+def test_manage_density_distinguishes_primary_and_setting_panels() -> None:
+    html = read_web("index.html")
+    css = read_web("styles.css")
+    foundation = css[:css.index("@media (max-width: 1024px)")]
+
+    assert (
+        'class="panel manage-panel connection-panel manage-primary-panel" '
+        'id="connectionPanel"'
+    ) in html
+    assert (
+        'class="panel manage-panel operations-panel manage-primary-panel" '
+        'id="operationsPanel"'
+    ) in html
+    assert (
+        'class="panel manage-panel manage-setting-panel" id="appearancePanel"'
+        in html
+    )
+    assert (
+        'class="panel manage-panel session-panel manage-setting-panel" '
+        'id="sessionPanel"'
+    ) in html
+    assert css_declaration(
+        css_rule(foundation, ".manage-primary-panel"), "min-width"
+    ) == "0"
+    setting_body = css_rule(
+        foundation, ".manage-setting-panel .manage-panel-body"
+    )
+    assert css_declaration(setting_body, "display") == "flex"
+    assert css_declaration(setting_body, "align-items") == "center"
+    assert css_declaration(setting_body, "justify-content") == "flex-end"
+    assert css_declaration(setting_body, "min-height") == "76px"
+
+
+def test_manage_health_grid_collapses_at_exact_breakpoints() -> None:
+    css = read_web("styles.css")
+    foundation = css[:css.index("@media (max-width: 1024px)")]
+    tablet = css[
+        css.index("@media (max-width: 1024px)"):
+        css.index("@media (min-width: 721px) and (max-width: 1024px)")
+    ]
+    mobile = css[
+        css.index("@media (max-width: 720px)"):
+        css.index("@media (max-width: 430px)")
+    ]
+
+    health = css_rule(foundation, ".health")
+    manage_grid = css_rule(foundation, ".manage-grid")
+    assert css_declaration(health, "display") == "grid"
+    assert css_declaration(health, "grid-template-columns") == (
+        "repeat(3, minmax(0, 1fr))"
+    )
+    assert css_declaration(health, "gap") == "var(--space-2)"
+    assert css_declaration(manage_grid, "grid-template-columns") == (
+        "repeat(2, minmax(0, 1fr))"
+    )
+    assert css_declaration(manage_grid, "gap") == "var(--space-3)"
+    assert css_declaration(
+        css_rule(tablet, ".health"), "grid-template-columns"
+    ) == "repeat(2, minmax(0, 1fr))"
+    assert css_declaration(
+        css_rule(mobile, ".health, .manage-grid"), "grid-template-columns"
+    ) == "1fr"
+    assert css_declaration(
+        css_rule(mobile, ".manage-setting-panel .manage-panel-body"),
+        "align-items",
+    ) == "stretch"
+    assert css_declaration(
+        css_rule(mobile, ".manage-setting-panel .btn"), "width"
+    ) == "100%"
+
+
+def test_workspace_density_tokens_and_content_width_contract() -> None:
+    css = read_web("styles.css")
+    foundation = css[:css.index("@media (max-width: 1024px)")]
+    root = css_rule(foundation, ":root")
+    page = css_rule(foundation, ".page")
+    panel_head = css_rule(foundation, ".panel-head")
+
+    assert css_declaration(root, "--space-1") == "8px"
+    assert css_declaration(root, "--space-2") == "12px"
+    assert css_declaration(root, "--space-3") == "16px"
+    assert css_declaration(root, "--space-4") == "24px"
+    assert css_declaration(root, "--page-gutter") == "clamp(16px, 2.5vw, 32px)"
+    assert css_declaration(root, "--content-max") == "1440px"
+    assert css_declaration(page, "width") == "100%"
+    assert css_declaration(page, "max-width") == "var(--content-max)"
+    assert css_declaration(page, "margin-inline") == "auto"
+    assert css_declaration(page, "padding-inline") == "var(--page-gutter)"
+    assert css_declaration(panel_head, "gap") == "var(--space-3)"
+    assert css_declaration(panel_head, "padding") == "var(--space-3) 20px"
+
+
+def test_workspace_density_keeps_accessible_targets_and_compact_breakpoints() -> None:
+    css = read_web("styles.css")
+    tablet = css[
+        css.index("@media (max-width: 1024px)"):
+        css.index("@media (max-width: 900px)")
+    ]
+    mobile = css[
+        css.index("@media (max-width: 720px)"):
+        css.index("@media (max-width: 430px)")
+    ]
+    compact = css[
+        css.index("@media (max-width: 430px)"):
+        css.index(".session-overlay")
+    ]
+    reduced_motion = css[css.index("@media (prefers-reduced-motion: reduce)"):]
+    button = css_rule(css, ".btn")
+    reduced_motion_all = css_rule(
+        reduced_motion,
+        "*, *::before, *::after",
+    )
+
+    assert css_declaration(css_rule(tablet, ":root"), "--page-gutter") == "16px"
+    assert css_declaration(css_rule(mobile, ":root"), "--page-gutter") == "12px"
+    assert int(css_declaration(button, "min-height").removesuffix("px")) >= 44
+    assert css_declaration(css_rule(compact, ".page"), "padding-top") == "8px"
+    assert css_declaration(
+        css_rule(compact, ".composer-dock .panel-head"), "display"
+    ) == "none"
+    assert css_declaration(reduced_motion_all, "scroll-behavior") == "auto !important"
+    assert css_declaration(reduced_motion_all, "transition-duration") == "0.01ms !important"
+    assert css_declaration(reduced_motion_all, "animation-duration") == "0.01ms !important"
+    reduced_uploads = css_rule(
+        reduced_motion,
+        ".timeline-upload-card, .upload-card-progress",
+    )
+    assert css_declaration(reduced_uploads, "transition") == "none"
+
+
+def test_files_density_uses_two_level_tools_and_auto_fit_results() -> None:
+    html = read_web("index.html")
+    css = read_web("styles.css")
+    foundation = css[:css.index("@media (max-width: 1024px)")]
+
+    assert 'class="library-tools library-primary-tools"' in html
+    assert 'class="control-row library-secondary-tools"' in html
+    primary_tools = css_rule(foundation, ".library-primary-tools")
+    secondary_tools = css_rule(foundation, ".library-secondary-tools")
+    grid_results = css_rule(foundation, ".file-list.grid-mode")
+    list_results = css_rule(foundation, ".file-list.table-mode")
+    file_name = css_rule(foundation, ".file-name")
+    file_cell = css_rule(foundation, ".file-cell")
+    search_wrap = css_rule(foundation, ".search-wrap")
+
+    assert css_declaration(primary_tools, "display") == "grid"
+    assert css_declaration(primary_tools, "grid-template-columns") == (
+        "minmax(220px, 1fr) auto auto"
+    )
+    assert css_declaration(secondary_tools, "justify-content") == "space-between"
+    assert css_declaration(secondary_tools, "padding") == "0 20px var(--space-3)"
+    assert css_declaration(grid_results, "grid-template-columns") == (
+        "repeat(auto-fit, minmax(min(100%, 240px), 1fr))"
+    )
+    assert css_declaration(list_results, "overflow-x") == "visible"
+    assert css_declaration(file_name, "overflow-wrap") == "anywhere"
+    assert css_declaration(file_cell, "min-width") == "0"
+    assert re.search(r"^\s*\.library-tools\s*\{", foundation, re.MULTILINE) is None
+    assert re.search(r"(?:^|;)\s*flex\s*:", search_wrap) is None
+
+
+def test_files_compact_table_hides_low_priority_columns_and_bounds_date() -> None:
+    css = read_web("styles.css")
+    compact_start = css.index(
+        "@media (min-width: 721px) and (max-width: 1024px)"
+    )
+    compact = css[compact_start:css.index("@media (max-width: 900px)")]
+    hidden_columns = css_rule(
+        compact,
+        ".file-list.table-mode .file-table th:nth-child(3), "
+        ".file-list.table-mode .file-table td:nth-child(3), "
+        ".file-list.table-mode .file-table th:nth-child(5), "
+        ".file-list.table-mode .file-table td:nth-child(5)",
+    )
+    date_heading = css_rule(
+        compact, ".file-list.table-mode .file-table th:nth-child(4)"
+    )
+    date_cell = css_rule(
+        compact, ".file-list.table-mode .file-table td:nth-child(4)"
+    )
+
+    assert css_declaration(hidden_columns, "display") == "none"
+    assert css_declaration(date_heading, "width") == "160px"
+    assert css_declaration(date_cell, "overflow") == "hidden"
+    assert css_declaration(date_cell, "text-overflow") == "ellipsis"
+    assert css_declaration(date_cell, "white-space") == "nowrap"
+
+
+def test_files_selection_targets_are_at_least_44_square() -> None:
+    css = read_web("styles.css")
+    table_check_column = css_rule(css, ".file-table .col-check")
+    table_check = css_rule(css, ".file-table .check")
+    table_selection = css_rule(css, ".table-select-target")
+    card_selection = css_rule(css, ".select-line")
+
+    assert int(css_declaration(table_check_column, "width").removesuffix("px")) >= 72
+    assert int(css_declaration(table_selection, "width").removesuffix("px")) >= 44
+    assert int(css_declaration(table_selection, "height").removesuffix("px")) >= 44
+    assert int(css_declaration(table_check, "width").removesuffix("px")) <= 20
+    assert int(css_declaration(table_check, "height").removesuffix("px")) <= 20
+    assert int(css_declaration(card_selection, "min-width").removesuffix("px")) >= 44
+    assert int(css_declaration(card_selection, "min-height").removesuffix("px")) >= 44
+    for selector in (".file-actions .btn", ".view-chip"):
+        rule = css_rule(css, selector)
+        assert int(css_declaration(rule, "min-height").removesuffix("px")) >= 44
+
+
+def test_files_mobile_list_becomes_single_column_summary_cards() -> None:
+    css = read_web("styles.css")
+    mobile = css[
+        css.index("@media (max-width: 720px)"):
+        css.index("@media (max-width: 430px)")
+    ]
+
+    primary_tools = css_rule(mobile, ".library-primary-tools")
+    primary_search = css_rule(mobile, ".library-primary-tools .search-wrap")
+    secondary_tools = css_rule(mobile, ".library-secondary-tools")
+    list_results = css_rule(mobile, ".file-list.list-mode, .file-list.table-mode")
+    list_table = css_rule(
+        mobile,
+        ".file-list.table-mode .file-table, .file-list.table-mode .file-table tbody",
+    )
+    summary_card = css_rule(mobile, ".file-list.table-mode .file-table tr")
+    mobile_name = css_rule(mobile, ".file-list.table-mode .file-name strong")
+    action_area = css_rule(mobile, ".file-list.table-mode .row-actions")
+    dark_summary = css_rule(mobile, ".dark .file-list.table-mode .file-table tr")
+    table_head = css_rule(mobile, ".file-list.table-mode .file-table thead")
+
+    assert css_declaration(primary_tools, "grid-template-columns") == (
+        "minmax(0, 1fr) auto"
+    )
+    assert css_declaration(primary_search, "grid-column") == "1 / -1"
+    assert css_declaration(secondary_tools, "align-items") == "stretch"
+    assert css_declaration(secondary_tools, "flex-direction") == "column"
+    assert css_declaration(list_results, "display") == "grid"
+    assert css_declaration(list_results, "grid-template-columns") == "1fr"
+    assert css_declaration(list_table, "display") == "grid"
+    assert css_declaration(list_table, "grid-template-columns") == "1fr"
+    assert css_declaration(summary_card, "grid-template-columns") == (
+        "44px minmax(0, 1fr) auto"
+    )
+    assert css_declaration(mobile_name, "white-space") == "normal"
+    assert css_declaration(mobile_name, "overflow-wrap") == "anywhere"
+    assert css_declaration(action_area, "width") == "44px"
+    assert css_declaration(dark_summary, "background") == "var(--surface)"
+    assert css_declaration(dark_summary, "color") == "var(--fg)"
+    assert css_declaration(table_head, "position") == "absolute"
+    assert css_declaration(table_head, "width") == "1px"
+    assert css_declaration(table_head, "height") == "1px"
+    assert css_declaration(table_head, "overflow") == "hidden"
+    assert re.search(r"(?:^|;)\s*display\s*:", table_head) is None
+
+
+@pytest.mark.parametrize(
+    ("selector", "requires_min_width"),
+    (
+        (
+            ".timeline-copy-btn, .timeline-delete-btn, .timeline-undo-btn",
+            True,
+        ),
+    ),
+)
+def test_workspace_density_keeps_compact_interactive_targets_accessible(
+    selector: str,
+    requires_min_width: bool,
+) -> None:
+    rule = css_rule(read_web("styles.css"), selector)
+    assert int(css_declaration(rule, "min-height").removesuffix("px")) >= 44
+    if requires_min_width:
+        assert int(css_declaration(rule, "min-width").removesuffix("px")) >= 44
+
+
+def test_timeline_message_actions_have_horizontal_and_vertical_safe_space() -> None:
+    css = read_web("styles.css")
+    compact = css[
+        css.index("@media (max-width: 430px)"):
+        css.index(".session-overlay")
+    ]
+    message = css_rule(css, ".timeline-message")
+    body = css_rule(css, ".timeline-message-body")
+
+    assert css_declaration(message, "min-height") == "60px"
+    assert css_declaration(body, "padding-right") == "108px"
+    assert css_declaration(
+        css_rule(compact, ".timeline-message .timeline-message-actions"), "position"
+    ) == "static"
+    assert css_declaration(
+        css_rule(compact, ".timeline-message .timeline-message-body"), "padding-right"
+    ) == "0"
+
+
+def test_transfer_density_layout_reserves_timeline_notice_space() -> None:
+    html = read_web("index.html")
+    css = read_web("styles.css")
+    workspace_source = css[
+        css.index(".transfer-workspace {"):css.index(".transfer-status {")
+    ]
+    workspace = css_rule(workspace_source, ".transfer-workspace")
+    timeline_start = css.index(".timeline-container {", css.index(".composer-form {"))
+    timeline = css_rule(css[timeline_start:], ".timeline-container")
+
+    assert 'class="transfer-status transfer-status-strip"' in html
+    assert 'class="transfer-status-stack"' in html
+    assert (
+        'class="timeline-container timeline-scroll-region" '
+        'id="timelineContainer" tabindex="0" '
+        'aria-labelledby="timelineHeading"' in html
+    )
+    assert '<h2 id="timelineHeading">最近活动</h2>' in html
+    assert css_declaration(workspace, "--timeline-notice-space") == "64px"
+    assert css_declaration(workspace, "height") == "auto"
+    assert css_declaration(workspace, "max-height") == "none"
+    assert css_declaration(workspace, "grid-template-rows") == (
+        "auto minmax(320px, 1fr) auto"
+    )
+    assert css_declaration(timeline, "max-height") == "none"
+    assert css_declaration(timeline, "padding-bottom") == "8px"
+    visible_notice = css_rule(
+        css,
+        ".timeline-panel:has(.timeline-new-btn:not([hidden]))",
+    )
+    assert css_declaration(visible_notice, "padding-bottom") == (
+        "var(--timeline-notice-space)"
+    )
+    status_stack = css_rule(css, ".transfer-status-stack")
+    assert css_declaration(status_stack, "display") == "grid"
+    assert css_declaration(status_stack, "gap") == "var(--space-2)"
+    status_strip = css_rule(css, ".transfer-status-strip")
+    assert css_declaration(status_strip, "padding") == "var(--space-1)"
+    assert css_declaration(status_strip, "border") == "1px solid var(--border)"
+    composer_form = css_rule(css, ".composer-form")
+    drop_target = css_rule(css, ".composer-drop-target")
+    textarea = css_rule(css, ".composer-textarea")
+    assert css_declaration(composer_form, "padding") == "var(--space-2)"
+    assert css_declaration(drop_target, "gap") == "var(--space-2)"
+    assert css_declaration(drop_target, "padding") == "var(--space-2)"
+    assert css_declaration(drop_target, "border") == "0"
+    assert css_declaration(textarea, "min-height") == "64px"
+    assert css_declaration(textarea, "max-height") == "160px"
+    actions_start = css.index(".composer-actions {", css.index(".composer-textarea"))
+    actions_source = css[
+        actions_start:css.index(".composer-drop-hint", actions_start)
+    ]
+    assert css_declaration(css_rule(actions_source, ".composer-actions"), "gap") == (
+        "var(--space-1)"
+    )
+    wrapping = css_rule(
+        css,
+        ".timeline-message-body, .timeline-message-body a, .upload-card-name",
+    )
+    assert css_declaration(wrapping, "overflow-wrap") == "anywhere"
+    metrics = css_rule(css, ".upload-card-metrics")
+    assert css_declaration(metrics, "display") == "flex"
+    assert css_declaration(metrics, "flex-wrap") == "wrap"
+    assert css_declaration(metrics, "gap") == "4px var(--space-2)"
+    notice = css_rule(css, ".timeline-new-btn")
+    assert css_declaration(notice, "position") == "absolute"
+    assert css_declaration(notice, "inset-inline") == "0"
+    assert css_declaration(notice, "margin-inline") == "auto"
+    assert css_declaration(notice, "width") == "max-content"
+    assert css_declaration(notice, "max-width") == "calc(100% - var(--space-4))"
+    assert css_declaration(notice, "overflow") == "hidden"
+    assert css_declaration(notice, "text-overflow") == "ellipsis"
+    assert css_declaration(notice, "bottom") == (
+        "calc((var(--timeline-notice-space) - 44px) / 2)"
+    )
+    assert css_declaration(notice, "min-height") == "44px"
+    assert re.search(r"(?:^|;)\s*(?:left|transform)\s*:", notice) is None
+    assert "justify-self" not in notice
+
+
+def test_transfer_short_viewport_uses_document_flow_for_composer() -> None:
+    css = read_web("styles.css")
+    short_start = css.index("@media (max-height: 700px)")
+    short_viewport = css[short_start:css.index(".session-overlay", short_start)]
+
+    assert css_declaration(
+        css_rule(short_viewport, ".transfer-workspace"), "display"
+    ) == "block"
+    assert css_declaration(
+        css_rule(short_viewport, ".transfer-workspace"), "min-height"
+    ) == "0"
+    assert css_declaration(
+        css_rule(short_viewport, ".transfer-workspace"), "padding-bottom"
+    ) == "0"
+    assert css_declaration(
+        css_rule(short_viewport, ".composer-dock"), "position"
+    ) == "static"
+    assert css_declaration(
+        css_rule(short_viewport, ".composer-dock"), "max-height"
+    ) == "none"
+    assert css_declaration(
+        css_rule(short_viewport, ".transfer-workspace .timeline-panel"),
+        "min-height",
+    ) == "320px"
+
+
 def test_transfer_page_is_timeline_first_and_composer_is_docked() -> None:
     html = read_web("index.html")
     transfer = html[html.index('id="transferPage"'):html.index('id="filesPage"')]
     assert 'class="transfer-workspace"' in transfer
     assert transfer.index('id="timelinePanel"') < transfer.index('id="composerPanel"')
     assert 'class="panel transfer-panel composer-dock"' in transfer
-    assert 'class="transfer-status"' in transfer
+    assert 'class="transfer-status transfer-status-strip"' in transfer
 
 
-def test_transfer_timeline_has_bounded_internal_scroll_at_all_viewports() -> None:
+def test_transfer_timeline_uses_natural_height_and_mobile_internal_scroll() -> None:
     css = read_web("styles.css")
     workspace = css[css.index(".transfer-workspace {"):css.index(".transfer-status {")]
     timeline_panel_start = css.rindex(".timeline-panel {")
     timeline_panel = css[timeline_panel_start:css.index(".composer-form {", timeline_panel_start)]
     timeline_container = css[css.index(".timeline-container {"):css.index(".timeline-date-separator {")]
     mobile = css[css.index("@media (max-width: 720px)"):css.index("@media (max-width: 430px)")]
+    compact = css[
+        css.index("@media (max-width: 430px)"):
+        css.index("@media (max-height: 700px)")
+    ]
 
-    assert "height: clamp(" in workspace
-    assert "max-height: calc(100dvh" in workspace
-    assert "grid-template-rows: auto minmax(0, 1fr) auto" in workspace
+    assert "height: auto" in workspace
+    assert "max-height: none" in workspace
+    assert "grid-template-rows: auto minmax(320px, 1fr) auto" in workspace
     assert "overflow: hidden" in timeline_panel
     assert "min-height: 0" in timeline_container
-    assert "max-height: clamp(" in timeline_container
+    assert "max-height: none" in timeline_container
+    assert "padding-bottom: 8px" in timeline_container
     assert "overflow-y: auto" in timeline_container
     assert "height: auto" in mobile
     assert "min-height: max(" in mobile
     assert "max-height: none" in mobile
     assert "var(--mobile-fixed-offset)" in mobile
-    assert ".transfer-workspace .timeline-container" in mobile
+    assert "max-height" not in css_rule(
+        mobile, ".transfer-workspace .timeline-container"
+    )
+    assert css_declaration(
+        css_rule(mobile, ".transfer-workspace .timeline-panel"), "height"
+    ) == "clamp(220px, 36dvh, 360px)"
+    compact_timeline = re.search(
+        r"\.transfer-workspace\s+\.timeline-container\s*\{([^{}]*)\}",
+        compact,
+    )
+    assert compact_timeline is None or "max-height" not in compact_timeline.group(1)
     assert ".composer-dock .panel-head" in mobile
 
 
@@ -688,35 +1145,25 @@ def test_mobile_transfer_reserves_space_for_fixed_composer_dock() -> None:
     compact_start = css.index("@media (max-width: 430px)")
     compact = css[compact_start:]
 
-    def rule(source: str, selector: str) -> str:
-        match = re.search(rf"{re.escape(selector)}\s*\{{([^{{}}]*)\}}", source)
-        assert match, f"missing CSS rule for {selector}"
-        return match.group(1)
-
-    def declaration(block: str, name: str) -> str:
-        match = re.search(rf"(?:^|;)\s*{re.escape(name)}\s*:\s*([^;]+)", block)
-        assert match, f"missing CSS declaration for {name}"
-        return match.group(1).strip()
-
     mobile = css[css.index("@media (max-width: 720px)"):compact_start]
-    root_vars = rule(mobile, ":root")
-    workspace_rule = rule(mobile, ".transfer-workspace")
-    composer_rule = rule(mobile, ".composer-dock")
-    nav_rule = rule(mobile, ".mobile-nav")
+    root_vars = css_rule(mobile, ":root")
+    workspace_rule = css_rule(mobile, ".transfer-workspace")
+    composer_rule = css_rule(mobile, ".composer-dock")
+    nav_rule = css_rule(mobile, ".mobile-nav")
 
-    assert declaration(root_vars, "--mobile-composer-reserve")
-    assert "var(--mobile-timeline-min-height)" in declaration(
+    assert css_declaration(root_vars, "--mobile-composer-reserve")
+    assert "var(--mobile-timeline-min-height)" in css_declaration(
         root_vars, "--mobile-workspace-min-height"
     )
-    assert "var(--mobile-composer-reserve)" in declaration(workspace_rule, "padding-bottom")
-    assert "var(--mobile-workspace-min-height)" in declaration(workspace_rule, "min-height")
-    assert declaration(composer_rule, "position") == "fixed"
-    assert declaration(composer_rule, "bottom") == "var(--mobile-fixed-offset)"
-    assert declaration(composer_rule, "left") == "14px"
-    assert declaration(composer_rule, "right") == "14px"
-    assert declaration(nav_rule, "height") == "var(--mobile-nav-height)"
-    assert "env(safe-area-inset-bottom)" in declaration(nav_rule, "padding")
-    assert "--mobile-composer-reserve" in rule(compact, ":root")
+    assert "var(--mobile-composer-reserve)" in css_declaration(workspace_rule, "padding-bottom")
+    assert "var(--mobile-workspace-min-height)" in css_declaration(workspace_rule, "min-height")
+    assert css_declaration(composer_rule, "position") == "fixed"
+    assert css_declaration(composer_rule, "bottom") == "var(--mobile-fixed-offset)"
+    assert css_declaration(composer_rule, "left") == "14px"
+    assert css_declaration(composer_rule, "right") == "14px"
+    assert css_declaration(nav_rule, "height") == "var(--mobile-nav-height)"
+    assert "env(safe-area-inset-bottom)" in css_declaration(nav_rule, "padding")
+    assert "--mobile-composer-reserve" in css_rule(compact, ":root")
 
 
 def test_mobile_toast_offset_clears_fixed_composer() -> None:
@@ -1491,7 +1938,11 @@ def test_frontend_is_split_and_has_unlock_contract(client: TestClient) -> None:
     for element_id in ("unlockForm", "accessToken", "deviceName", "sessionExpired", "mainContent", "libraryView"):
         assert f'id="{element_id}"' in html
     assert re.search(r'<section[^>]*id="libraryView"[^>]*tabindex="-1"', html)
-    assert re.search(r'<div[^>]*id="timelineContainer"[^>]*tabindex="-1"', html)
+    assert re.search(
+        r'<div[^>]*id="timelineContainer"[^>]*tabindex="0"'
+        r'[^>]*aria-labelledby="timelineHeading"',
+        html,
+    )
 
 
 def test_static_assets_are_served(client: TestClient) -> None:
@@ -2087,7 +2538,7 @@ def test_timeline_html_elements_exist(client: TestClient) -> None:
     html = client.get("/").text
     for element_id in ("timelineContainer", "newMessageButton", "timelinePanel"):
         assert f'id="{element_id}"' in html
-    assert 'class="timeline-container"' in html
+    assert 'class="timeline-container timeline-scroll-region"' in html
     assert 'class="btn btn-primary timeline-new-btn"' in html
 
 
@@ -3477,6 +3928,79 @@ def test_terminal_event_settles_cancel_before_initial_create_response_returns() 
     assert json.loads(context.eval("JSON.stringify(rows)")) == []
 
 
+def test_reconcile_adopts_client_key_as_source_device_atomically() -> None:
+    context = create_js_context()
+    context.eval(r"""
+      globalThis.migrations = [];
+      globalThis.migrateResolve = null;
+      globalThis.handle = { queryPermission: () => Promise.resolve('prompt') };
+      globalThis.rows = [{
+        uploadId: 'adopt-client', clientRequestId: 'adopt-client', sessionReady: false,
+        cancelRequested: false, isSourceDevice: true, sourceDeviceId: null,
+        fileHandle: handle, file: null, identity: { name: 'adopt.bin', size: 8,
+          lastModified: 4, sampleSha256: 'sample' },
+        name: 'adopt.bin', sizeBytes: 8, mimeType: '', status: 'preparing',
+        confirmedParts: [], confirmedBytes: 0, createdAt: '2026-07-17T00:00:00Z',
+        chunkSize: 4,
+      }];
+      globalThis.api = {
+        listActiveUploads: () => Promise.resolve([{
+          upload_id: 'adopt-server', client_request_id: 'adopt-client',
+          source_device_id: 'device-local', original_name: 'adopt.bin', size_bytes: 8,
+          status: 'paused', confirmed_parts: [0], confirmed_bytes: 4,
+          chunk_size_bytes: 4, created_at: '2026-07-17T00:00:00Z',
+        }]),
+      };
+      globalThis.persistence = {
+        getAll: () => Promise.resolve(rows.slice()),
+        put(record) {
+          rows = rows.filter(row => row.uploadId !== record.uploadId);
+          rows.push(record);
+          return Promise.resolve();
+        },
+        migrate(previousUploadId, record) {
+          migrations.push([previousUploadId, record.uploadId]);
+          return new Promise(resolve => { migrateResolve = () => {
+            rows = rows.filter(row => row.uploadId !== previousUploadId && row.uploadId !== record.uploadId);
+            rows.push(record);
+            resolve();
+          }; });
+        },
+        remove(id) { rows = rows.filter(row => row.uploadId !== id); return Promise.resolve(); },
+        close: () => {},
+      };
+    """)
+    load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
+    context.eval(r"""
+      globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
+        api, persistence, deviceId: 'device-local', chunkSize: 4,
+      });
+      globalThis.startSettled = false;
+      coordinator.start().then(() => { startSettled = true; });
+    """)
+    drain_jobs(context)
+
+    assert json.loads(context.eval("JSON.stringify(migrations)")) == [
+        ["adopt-client", "adopt-server"]
+    ]
+    assert context.eval("startSettled") is False
+    assert context.eval("coordinator.getSnapshot()[0].uploadId") == "adopt-client"
+    assert context.eval("rows[0].uploadId") == "adopt-client"
+    context.eval("migrateResolve()")
+    drain_jobs(context)
+    assert context.eval("startSettled") is True
+    adopted = json.loads(context.eval(
+        "JSON.stringify(coordinator.getSnapshot().find(row => row.uploadId === 'adopt-server'))"
+    ))
+    assert adopted["isSourceDevice"] is True
+    assert adopted["sourceDeviceId"] == "device-local"
+    assert adopted["status"] == "paused"
+    assert context.eval("rows.length") == 1
+    assert context.eval("rows[0].uploadId") == "adopt-server"
+    assert context.eval("rows[0].sessionReady") is True
+    assert context.eval("rows[0].fileHandle === handle") is True
+
+
 def test_lost_create_response_event_adopts_session_and_finishes_cancel() -> None:
     context = create_js_context()
     context.eval(r"""
@@ -3488,6 +4012,7 @@ def test_lost_create_response_event_adopts_session_and_finishes_cancel() -> None
       globalThis.rows = [];
       globalThis.cancelError = null;
       globalThis.migrateResolve = null;
+      globalThis.eventApplied = false;
       globalThis.handle = { kind: 'file', name: 'event-recovery.bin' };
       globalThis.cryptoObject = {
         randomUUID: () => 'event-client',
@@ -3538,7 +4063,7 @@ def test_lost_create_response_event_adopts_session_and_finishes_cancel() -> None
     load_js_module(context, "./upload-coordinator.js", read_web("js/upload-coordinator.js"))
     context.eval(r"""
       globalThis.coordinator = __modules['./upload-coordinator.js'].createUploadCoordinator({
-        api, persistence, cryptoObject, chunkSize: 4, maxActive: 1,
+        api, persistence, cryptoObject, deviceId: 'device-local', chunkSize: 4, maxActive: 1,
       });
       coordinator.applyRemoteEvent({ event_type: 'upload.created', payload: {
         upload_id: 'blocking-observer', client_request_id: 'blocking-observer', status: 'paused',
@@ -3564,23 +4089,27 @@ def test_lost_create_response_event_adopts_session_and_finishes_cancel() -> None
     assert context.eval("uploadCalls") == 0
 
     context.eval(r"""
-      coordinator.applyRemoteEvent({ event_type: 'upload.created', payload: {
+      Promise.resolve(coordinator.applyRemoteEvent({ event_type: 'upload.created', payload: {
         upload_id: 'event-server', client_request_id: 'event-client', status: 'queued',
+        source_device_id: 'device-local',
         original_name: 'event-recovery.bin', size_bytes: 4, confirmed_parts: [],
         confirmed_bytes: 0, chunk_size_bytes: 4,
-      }});
+      }})).then(result => { eventApplied = result; });
     """)
     drain_jobs(context)
     context.eval("coordinator.prioritize('event-server')")
     drain_jobs(context)
     assert context.eval("uploadCalls") == 0
+    assert context.eval("eventApplied") is False
     context.eval("migrateResolve()")
     drain_jobs(context)
+    assert context.eval("eventApplied") is True
     assert json.loads(context.eval("JSON.stringify(migrations)")) == [
         ["event-client", "event-server"]
     ]
     assert json.loads(context.eval("JSON.stringify(cancelCalls)")) == ["event-server"]
     assert context.eval("coordinator.getSnapshot().find(row => row.uploadId === 'event-server').status") == "cancelled"
+    assert context.eval("coordinator.getSnapshot().find(row => row.uploadId === 'event-server').isSourceDevice") is True
     assert context.eval("coordinator.getSummary().hasPendingControl") is False
     assert json.loads(context.eval("JSON.stringify(rows)")) == []
     assert context.eval("uploadCalls") == 0
@@ -5512,9 +6041,14 @@ def test_library_render_consumes_real_file_message_dto(client: TestClient) -> No
       libraryController.load({});
     """)
     drain_jobs(context)
+    context.eval(r"""
+      globalThis.gridLibraryHtml = document.getElementById('fileList').innerHTML;
+      document.getElementById('listViewBtn').listeners.click[0]();
+    """)
     result = json.loads(context.eval(r"""
       JSON.stringify({
-        html: document.getElementById('fileList').innerHTML,
+        html: gridLibraryHtml,
+        tableHtml: document.getElementById('fileList').innerHTML,
         messages: libraryController.getFiles(),
         clickListeners: document.getElementById('fileList').listeners.click.length,
         changeListeners: document.getElementById('fileList').listeners.change.length,
@@ -5527,6 +6061,12 @@ def test_library_render_consumes_real_file_message_dto(client: TestClient) -> No
     assert 'data-file-action="copy"' in result["html"]
     assert 'data-file-action="delete"' in result["html"]
     assert 'data-file-action="locate"' in result["html"]
+    assert '<label class="table-select-target">' in result["tableHtml"]
+    assert 'class="check" type="checkbox"' in result["tableHtml"]
+    assert 'data-select-message=' in result["tableHtml"]
+    assert 'aria-label="选择 library.txt"' in result["tableHtml"]
+    assert result["tableHtml"].count('scope="col"') == 6
+    assert '<thead class="file-table-head">' in result["tableHtml"]
     assert result["clickListeners"] == result["changeListeners"] == 1
 
 

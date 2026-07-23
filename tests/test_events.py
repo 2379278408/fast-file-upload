@@ -737,3 +737,40 @@ def test_live_gap_after_retention_uses_commit_before_broadcast(
             "reset_cursor": False,
         },
     ]
+
+
+def test_replay_pending_overflow_requires_resync_before_ready() -> None:
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, object]] = []
+
+        async def send_json(self, event: dict[str, object]) -> None:
+            self.sent.append(event)
+
+    async def scenario() -> FakeWebSocket:
+        hub = EventHub()
+        websocket = FakeWebSocket()
+        connection = hub.connect(websocket, after=0)
+        for sequence in range(2, 207):
+            await connection.queue_live(
+                {
+                    "sequence": sequence,
+                    "event_type": "upload.progress",
+                    "entity_id": "busy-upload",
+                    "payload": {},
+                    "created_at": "2026-07-17T00:00:00+00:00",
+                }
+            )
+        await connection.finish_replay(1)
+        return websocket
+
+    websocket = asyncio.run(scenario())
+    assert websocket.sent == [
+        {
+            "event_type": "resync_required",
+            "sequence": 206,
+            "target_sequence": 206,
+            "reset_cursor": False,
+        },
+        {"event_type": "ready", "sequence": 206},
+    ]

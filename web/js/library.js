@@ -729,7 +729,7 @@ export function createLibrary({ root, api, timeline, onAttach = () => {}, onLoca
         : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M7 3h7l4 4v14H7z"/><path d="M14 3v5h5M10 13h5M10 17h5"/></svg>';
       return `
         <tr data-message-id="${escapeAttr(message.id)}" data-name="${escapeAttr(file.name)}" data-type="${file.is_previewable ? 'image' : 'document'}">
-          <td><input class="check" type="checkbox" data-select-message="${escapeAttr(message.id)}" ${isSelected ? 'checked' : ''} aria-label="选择 ${escapeAttr(file.name)}"></td>
+          <td><label class="table-select-target"><input class="check" type="checkbox" data-select-message="${escapeAttr(message.id)}" ${isSelected ? 'checked' : ''} aria-label="选择 ${escapeAttr(file.name)}"></label></td>
           <td>
             <div class="file-cell">
               <span class="file-icon">${icon}</span>
@@ -757,14 +757,14 @@ export function createLibrary({ root, api, timeline, onAttach = () => {}, onLoca
 
     return `
       <table class="file-table">
-        <thead>
+        <thead class="file-table-head">
           <tr>
-            <th class="col-check"><span class="visually-hidden">选择</span></th>
-            <th>文件</th>
-            <th>大小</th>
-            <th>更新时间</th>
-            <th>状态</th>
-            <th class="col-actions"><span class="visually-hidden">操作</span></th>
+            <th class="col-check" scope="col"><span class="visually-hidden">选择</span></th>
+            <th scope="col">文件</th>
+            <th scope="col">大小</th>
+            <th scope="col">更新时间</th>
+            <th scope="col">状态</th>
+            <th class="col-actions" scope="col"><span class="visually-hidden">操作</span></th>
           </tr>
         </thead>
         <tbody>${rows}</tbody>
