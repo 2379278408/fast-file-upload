@@ -1228,7 +1228,9 @@ def test_mobile_transfer_reserves_space_for_fixed_composer_dock() -> None:
     composer_rule = css_rule(mobile, ".composer-dock")
     nav_rule = css_rule(mobile, ".mobile-nav")
 
-    assert css_declaration(root_vars, "--mobile-composer-reserve")
+    assert css_declaration(root_vars, "--mobile-composer-reserve") == (
+        "calc(168px + env(safe-area-inset-bottom))"
+    )
     assert "var(--mobile-timeline-min-height)" in css_declaration(
         root_vars, "--mobile-workspace-min-height"
     )
@@ -1236,11 +1238,15 @@ def test_mobile_transfer_reserves_space_for_fixed_composer_dock() -> None:
     assert "var(--mobile-workspace-min-height)" in css_declaration(workspace_rule, "min-height")
     assert css_declaration(composer_rule, "position") == "fixed"
     assert css_declaration(composer_rule, "bottom") == "var(--mobile-fixed-offset)"
-    assert css_declaration(composer_rule, "left") == "14px"
-    assert css_declaration(composer_rule, "right") == "14px"
+    assert css_declaration(composer_rule, "left") == "10px"
+    assert css_declaration(composer_rule, "right") == "10px"
+    assert css_declaration(composer_rule, "overflow") == "visible"
     assert css_declaration(nav_rule, "height") == "var(--mobile-nav-height)"
     assert "env(safe-area-inset-bottom)" in css_declaration(nav_rule, "padding")
-    assert "--mobile-composer-reserve" in css_rule(compact, ":root")
+    assert (
+        "--mobile-composer-reserve: calc(152px + env(safe-area-inset-bottom))"
+        in css_rule(compact, ":root")
+    )
 
 
 def test_mobile_toast_offset_clears_fixed_composer() -> None:

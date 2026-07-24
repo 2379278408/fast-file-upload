@@ -1672,7 +1672,7 @@
                 --topbar-height: 60px;
                 --transfer-page-offset: 90px;
                 --page-gutter: 12px;
-                --mobile-composer-reserve: clamp(180px, 32dvh, 240px);
+                --mobile-composer-reserve: calc(168px + env(safe-area-inset-bottom));
                 --mobile-toast-offset: calc(var(--mobile-fixed-offset) + var(--mobile-composer-reserve) + 12px);
                 --mobile-workspace-min-height: calc(var(--mobile-composer-reserve) + var(--mobile-timeline-min-height) + 148px);
                 --mobile-timeline-shell-min-height: 220px;
@@ -1710,19 +1710,26 @@
             .timeline-panel .panel-head { display: none; }
             .composer-dock {
                 position: fixed;
-                left: 14px;
-                right: 14px;
+                left: 10px;
+                right: 10px;
                 bottom: var(--mobile-fixed-offset);
                 z-index: 19;
                 max-height: var(--mobile-composer-reserve);
+                overflow: visible;
                 scroll-margin-bottom: 0;
             }
             .composer-dock .panel-head { display: none; }
             .composer-dock .panel-head p,
             .composer-dock .mono-text { display: none; }
-            .composer-dock .composer-form { padding: 10px; display: flex; align-items: center; gap: 8px; }
-            .composer-dock .composer-drop-target { gap: 8px; padding: 0; }
+            .composer-dock .composer-form { padding: 8px; display: flex; align-items: center; gap: 8px; }
+            .composer-dock .composer-drop-target { flex: 1; min-width: 0; gap: 8px; padding: 0; }
             .composer-dock .composer-textarea { min-height: 44px; max-height: 44px; }
+            .composer-dock .composer-actions { flex: 0 0 auto; gap: 6px; }
+            .composer-dock #composerAttachBtn {
+                width: 44px;
+                padding: 0;
+                font-size: 0;
+            }
             .panel { border-radius: 12px; }
             .library-panel > .panel-head { align-items: flex-start; flex-direction: column; }
             .library-primary-tools { width: 100%; grid-template-columns: minmax(0, 1fr) auto; }
@@ -1846,7 +1853,7 @@
 
         @media (max-width: 430px) {
             :root {
-                --mobile-composer-reserve: clamp(156px, calc(100dvh - 412px), 166px);
+                --mobile-composer-reserve: calc(152px + env(safe-area-inset-bottom));
             }
             .page { padding-top: 8px; }
             .top-actions > .pill { display: none; }
@@ -2516,6 +2523,7 @@
         @media (max-width: 360px) {
             .page { padding: 12px 8px 32px; padding-bottom: 72px; }
             .composer-actions { flex-direction: column; }
+            .composer-dock .composer-actions { flex-direction: row; }
             .toolbar-grid { grid-template-columns: 1fr; }
             .ops-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .ops-columns { grid-template-columns: 1fr; }
