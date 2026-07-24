@@ -1672,7 +1672,7 @@
                 --topbar-height: 60px;
                 --transfer-page-offset: 90px;
                 --page-gutter: 12px;
-                --mobile-composer-reserve: calc(168px + env(safe-area-inset-bottom));
+                --mobile-composer-reserve: calc(244px + env(safe-area-inset-bottom));
                 --mobile-toast-offset: calc(var(--mobile-fixed-offset) + var(--mobile-composer-reserve) + 12px);
                 --mobile-workspace-min-height: calc(var(--mobile-composer-reserve) + var(--mobile-timeline-min-height) + 148px);
                 --mobile-timeline-shell-min-height: 220px;
@@ -1721,10 +1721,31 @@
             .composer-dock .panel-head { display: none; }
             .composer-dock .panel-head p,
             .composer-dock .mono-text { display: none; }
-            .composer-dock .composer-form { padding: 8px; display: flex; align-items: center; gap: 8px; }
-            .composer-dock .composer-drop-target { flex: 1; min-width: 0; gap: 8px; padding: 0; }
-            .composer-dock .composer-textarea { min-height: 44px; max-height: 44px; }
-            .composer-dock .composer-actions { flex: 0 0 auto; gap: 6px; }
+            .composer-dock .composer-form { padding: 10px; display: block; }
+            .composer-dock .composer-drop-target {
+                width: 100%;
+                min-width: 0;
+                display: flex;
+                flex-direction: column;
+                align-items: stretch;
+                gap: 8px;
+                padding: 0;
+            }
+            .composer-dock .composer-textarea {
+                width: 100%;
+                min-height: 48px;
+                max-height: min(128px, 22dvh);
+                padding: 12px 14px;
+            }
+            .composer-dock .composer-actions {
+                width: 100%;
+                flex: 0 0 auto;
+                justify-content: space-between;
+                gap: 8px;
+            }
+            .composer-dock .composer-actions .btn {
+                min-height: 44px;
+            }
             .composer-dock #composerAttachBtn {
                 width: 44px;
                 padding: 0;
@@ -1853,7 +1874,7 @@
 
         @media (max-width: 430px) {
             :root {
-                --mobile-composer-reserve: calc(152px + env(safe-area-inset-bottom));
+                --mobile-composer-reserve: calc(220px + env(safe-area-inset-bottom));
             }
             .page { padding-top: 8px; }
             .top-actions > .pill { display: none; }
@@ -1882,13 +1903,31 @@
                 min-height: 0;
                 padding-bottom: 0;
             }
-            .transfer-workspace > .timeline-panel,
-            .transfer-workspace > .composer-dock { margin-top: var(--space-2); }
+            .transfer-workspace > .timeline-panel { margin-top: var(--space-2); }
+            .transfer-workspace > .composer-dock {
+                margin-top: var(--space-2);
+                margin-bottom: var(--mobile-fixed-offset);
+            }
             .composer-dock { position: static; max-height: none; }
             .transfer-workspace .timeline-panel { min-height: 320px; }
         }
 
         @media (max-width: 720px) and (max-height: 700px) {
+            .transfer-workspace {
+                display: flex;
+                min-height: var(--mobile-workspace-min-height);
+                padding-bottom: var(--mobile-composer-reserve);
+            }
+            .composer-dock {
+                position: fixed;
+                bottom: var(--mobile-fixed-offset);
+                max-height: var(--mobile-composer-reserve);
+            }
+            .transfer-workspace .timeline-panel {
+                flex: 0 0 clamp(128px, calc(100dvh - 430px), 180px);
+                height: clamp(128px, calc(100dvh - 430px), 180px);
+                min-height: 128px;
+            }
             .toast {
                 top: calc(var(--topbar-height) + var(--space-2));
                 bottom: auto;

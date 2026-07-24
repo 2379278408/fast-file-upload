@@ -863,7 +863,7 @@ def test_transfer_long_content_and_new_message_notice_do_not_overlap(
     _assert_browser_clean(browser_session)
 
 
-def test_transfer_short_viewport_uses_unbounded_timeline_and_document_flow(
+def test_transfer_short_viewport_uses_fixed_mobile_composer_and_compact_timeline(
     browser_session: BrowserSession,
 ) -> None:
     page = browser_session.page
@@ -892,12 +892,12 @@ def test_transfer_short_viewport_uses_unbounded_timeline_and_document_flow(
         """
     )
     assert layout == {
-        "workspaceDisplay": "block",
-        "workspaceMinHeight": "0px",
+        "workspaceDisplay": "flex",
+        "workspaceMinHeight": "488px",
         "timelineMaxHeight": "none",
         "timelineOverflowY": "auto",
-        "timelinePanelMinHeight": 320,
-        "composerPosition": "static",
+        "timelinePanelMinHeight": 128,
+        "composerPosition": "fixed",
     }
     _assert_no_horizontal_overflow(page)
     _assert_browser_clean(browser_session)
@@ -1160,14 +1160,14 @@ def test_three_route_navigation_history_focus_and_viewport_safety(
                 """
             )
             assert compact_layout == {
-                "workspaceDisplay": "block",
-                "workspaceMinHeight": "0px",
-                "panelMinHeight": 320,
+                "workspaceDisplay": "flex",
+                "workspaceMinHeight": "488px",
+                "panelMinHeight": 128,
                 "timelineMaxHeight": "none",
-                "composerPosition": "static",
+                "composerPosition": "fixed",
             }
             assert timeline_metrics["scrollHeight"] > timeline_metrics["clientHeight"]
-            assert composer_position == "static"
+            assert composer_position == "fixed"
         else:
             assert composer_position == "fixed"
             assert composer_box["y"] >= 0

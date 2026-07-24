@@ -1069,7 +1069,9 @@ def test_transfer_density_layout_reserves_timeline_notice_space() -> None:
 def test_transfer_short_viewport_uses_document_flow_for_composer() -> None:
     css = read_web("styles.css")
     short_start = css.index("@media (max-height: 700px)")
-    short_viewport = css[short_start:css.index(".session-overlay", short_start)]
+    mobile_short_start = css.index("@media (max-width: 720px) and (max-height: 700px)")
+    short_viewport = css[short_start:mobile_short_start]
+    mobile_short_viewport = css[mobile_short_start:css.index(".session-overlay", mobile_short_start)]
 
     assert css_declaration(
         css_rule(short_viewport, ".transfer-workspace"), "display"
@@ -1090,6 +1092,12 @@ def test_transfer_short_viewport_uses_document_flow_for_composer() -> None:
         css_rule(short_viewport, ".transfer-workspace .timeline-panel"),
         "min-height",
     ) == "320px"
+    assert css_declaration(
+        css_rule(mobile_short_viewport, ".transfer-workspace"), "display"
+    ) == "flex"
+    assert css_declaration(
+        css_rule(mobile_short_viewport, ".composer-dock"), "position"
+    ) == "fixed"
 
 
 def test_transfer_page_is_timeline_first_and_composer_is_docked() -> None:
@@ -1229,7 +1237,7 @@ def test_mobile_transfer_reserves_space_for_fixed_composer_dock() -> None:
     nav_rule = css_rule(mobile, ".mobile-nav")
 
     assert css_declaration(root_vars, "--mobile-composer-reserve") == (
-        "calc(168px + env(safe-area-inset-bottom))"
+        "calc(244px + env(safe-area-inset-bottom))"
     )
     assert "var(--mobile-timeline-min-height)" in css_declaration(
         root_vars, "--mobile-workspace-min-height"
@@ -1243,10 +1251,49 @@ def test_mobile_transfer_reserves_space_for_fixed_composer_dock() -> None:
     assert css_declaration(composer_rule, "overflow") == "visible"
     assert css_declaration(nav_rule, "height") == "var(--mobile-nav-height)"
     assert "env(safe-area-inset-bottom)" in css_declaration(nav_rule, "padding")
-    assert (
-        "--mobile-composer-reserve: calc(152px + env(safe-area-inset-bottom))"
-        in css_rule(compact, ":root")
-    )
+    assert "--mobile-composer-reserve: calc(220px + env(safe-area-inset-bottom))" in css_rule(compact, ":root")
+
+
+def test_mobile_transfer_composer_uses_two_row_layout() -> None:
+    css = read_web("styles.css")
+    mobile = css[
+        css.index("@media (max-width: 720px)"):css.index("@media (max-width: 430px)")
+    ]
+
+    form_rule = css_rule(mobile, ".composer-dock .composer-form")
+    drop_target_rule = css_rule(mobile, ".composer-dock .composer-drop-target")
+    textarea_rule = css_rule(mobile, ".composer-dock .composer-textarea")
+    actions_rule = css_rule(mobile, ".composer-dock .composer-actions")
+
+    assert css_declaration(form_rule, "display") == "block"
+    assert css_declaration(drop_target_rule, "flex-direction") == "column"
+    assert css_declaration(drop_target_rule, "align-items") == "stretch"
+    assert css_declaration(textarea_rule, "min-height") == "48px"
+    assert css_declaration(textarea_rule, "max-height") == "min(128px, 22dvh)"
+    assert css_declaration(actions_rule, "justify-content") == "space-between"
+
+
+def test_short_viewport_static_composer_clears_mobile_navigation() -> None:
+    css = read_web("styles.css")
+    compact_height = css[
+        css.index("@media (max-height: 700px)"):
+        css.index("@media (max-width: 720px) and (max-height: 700px)")
+    ]
+
+    composer_rule = css_rule(compact_height, ".transfer-workspace > .composer-dock")
+    assert css_declaration(composer_rule, "margin-bottom") == "var(--mobile-fixed-offset)"
+
+    mobile_compact_height = css[css.index("@media (max-width: 720px) and (max-height: 700px)"):]
+    mobile_workspace_rule = css_rule(mobile_compact_height, ".transfer-workspace")
+    mobile_composer_rule = css_rule(mobile_compact_height, ".composer-dock")
+    mobile_timeline_rule = css_rule(mobile_compact_height, ".transfer-workspace .timeline-panel")
+    assert css_declaration(mobile_workspace_rule, "display") == "flex"
+    assert css_declaration(mobile_workspace_rule, "padding-bottom") == "var(--mobile-composer-reserve)"
+    assert css_declaration(mobile_composer_rule, "position") == "fixed"
+    assert css_declaration(mobile_composer_rule, "bottom") == "var(--mobile-fixed-offset)"
+    assert css_declaration(mobile_timeline_rule, "flex") == "0 0 clamp(128px, calc(100dvh - 430px), 180px)"
+    assert css_declaration(mobile_timeline_rule, "height") == "clamp(128px, calc(100dvh - 430px), 180px)"
+    assert css_declaration(mobile_timeline_rule, "min-height") == "128px"
 
 
 def test_mobile_toast_offset_clears_fixed_composer() -> None:
