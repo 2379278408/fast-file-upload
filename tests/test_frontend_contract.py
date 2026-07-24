@@ -1006,11 +1006,9 @@ def test_transfer_density_layout_reserves_timeline_notice_space() -> None:
     )
     assert '<h2 id="timelineHeading">最近活动</h2>' in html
     assert css_declaration(workspace, "--timeline-notice-space") == "64px"
-    assert css_declaration(workspace, "height") == "auto"
-    assert css_declaration(workspace, "max-height") == "none"
-    assert css_declaration(workspace, "grid-template-rows") == (
-        "auto minmax(320px, 1fr) auto"
-    )
+    assert css_declaration(workspace, "display") == "flex"
+    assert css_declaration(workspace, "flex-direction") == "column"
+    assert css_declaration(workspace, "height") == "calc(100dvh - var(--topbar-height))"
     assert css_declaration(timeline, "max-height") == "none"
     assert css_declaration(timeline, "padding-bottom") == "8px"
     visible_notice = css_rule(
@@ -1024,17 +1022,18 @@ def test_transfer_density_layout_reserves_timeline_notice_space() -> None:
     assert css_declaration(status_stack, "display") == "grid"
     assert css_declaration(status_stack, "gap") == "var(--space-2)"
     status_strip = css_rule(css, ".transfer-status-strip")
-    assert css_declaration(status_strip, "padding") == "var(--space-1)"
+    assert css_declaration(status_strip, "padding") == "6px 12px"
     assert css_declaration(status_strip, "border") == "1px solid var(--border)"
     composer_form = css_rule(css, ".composer-form")
     drop_target = css_rule(css, ".composer-drop-target")
     textarea = css_rule(css, ".composer-textarea")
-    assert css_declaration(composer_form, "padding") == "var(--space-2)"
-    assert css_declaration(drop_target, "gap") == "var(--space-2)"
-    assert css_declaration(drop_target, "padding") == "var(--space-2)"
+    assert css_declaration(composer_form, "display") == "flex"
+    assert css_declaration(composer_form, "gap") == "8px"
+    assert css_declaration(drop_target, "gap") == "8px"
+    assert css_declaration(drop_target, "padding") == "0"
     assert css_declaration(drop_target, "border") == "0"
-    assert css_declaration(textarea, "min-height") == "64px"
-    assert css_declaration(textarea, "max-height") == "160px"
+    assert css_declaration(textarea, "flex") == "1"
+    assert css_declaration(textarea, "max-height") == "44px"
     actions_start = css.index(".composer-actions {", css.index(".composer-textarea"))
     actions_source = css[
         actions_start:css.index(".composer-drop-hint", actions_start)
@@ -1114,15 +1113,16 @@ def test_transfer_timeline_uses_natural_height_and_mobile_internal_scroll() -> N
         css.index("@media (max-height: 700px)")
     ]
 
-    assert "height: auto" in workspace
-    assert "max-height: none" in workspace
-    assert "grid-template-rows: auto minmax(320px, 1fr) auto" in workspace
+    assert "display: flex" in workspace
+    assert "flex-direction: column" in workspace
+    assert "height: calc(100dvh" in workspace
     assert "overflow: hidden" in timeline_panel
+    assert "flex: 1" in timeline_panel
     assert "min-height: 0" in timeline_container
     assert "max-height: none" in timeline_container
     assert "padding-bottom: 8px" in timeline_container
     assert "overflow-y: auto" in timeline_container
-    assert "height: auto" in mobile
+    assert "height: calc(100dvh" in mobile
     assert "min-height: max(" in mobile
     assert "max-height: none" in mobile
     assert "var(--mobile-fixed-offset)" in mobile
@@ -1138,6 +1138,83 @@ def test_transfer_timeline_uses_natural_height_and_mobile_internal_scroll() -> N
     )
     assert compact_timeline is None or "max-height" not in compact_timeline.group(1)
     assert ".composer-dock .panel-head" in mobile
+
+
+def test_transfer_chat_layout_uses_flex_column_with_sticky_composer() -> None:
+    """验证聊天式布局：flex column 布局，底部固定输入栏"""
+    css = read_web("styles.css")
+    html = read_web("index.html")
+
+    # Extract base (non-media-query) section before first @media
+    foundation = css[:css.index("@media (max-width: 1024px)")]
+    workspace = css_rule(foundation, ".transfer-workspace")
+    composer = css_rule(foundation, ".composer-dock")
+    status_strip = css_rule(foundation, ".transfer-status-strip")
+    timeline_panel_head = css_rule(foundation, ".timeline-panel .panel-head")
+    composer_panel_head = css_rule(foundation, "#composerPanel .panel-head")
+
+    # Extract post-media section (after .session-overlay)
+    post_media_start = css.index(".session-overlay")
+    post_media = css[post_media_start:]
+    timeline_panel = css_rule(post_media, ".timeline-panel")
+    composer_form_start = css.index(".composer-form {", post_media_start)
+    composer_form_section = css[composer_form_start:]
+    composer_form = css_rule(composer_form_section, ".composer-form")
+    textarea = css_rule(composer_form_section, ".composer-textarea")
+    drop_target = css_rule(composer_form_section, ".composer-drop-target")
+
+    # 验证 transfer-workspace 使用 flex column 布局
+    assert css_declaration(workspace, "display") == "flex"
+    assert css_declaration(workspace, "flex-direction") == "column"
+    assert css_declaration(workspace, "height") == "calc(100dvh - var(--topbar-height))"
+
+    # 验证 timeline-panel 使用 flex: 1 填充剩余空间
+    assert css_declaration(timeline_panel, "flex") == "1"
+    assert css_declaration(timeline_panel, "min-height") == "0"
+    assert css_declaration(timeline_panel, "overflow") == "hidden"
+
+    # 验证 composer-dock 使用 flex-shrink: 0
+    assert css_declaration(composer, "flex-shrink") == "0"
+
+    # 验证 composer-form 使用水平布局
+    assert css_declaration(composer_form, "display") == "flex"
+    assert css_declaration(composer_form, "align-items") == "center"
+    assert css_declaration(composer_form, "gap") == "8px"
+
+    # 验证 composer-textarea 使用 flex: 1
+    assert css_declaration(textarea, "flex") == "1"
+
+    # 验证 status-strip 是紧凑小字
+    assert css_declaration(status_strip, "padding") == "6px 12px"
+    assert css_declaration(status_strip, "font-size") == "11px"
+
+    # 验证 timeline-panel 的 panel-head 被隐藏
+    assert css_declaration(timeline_panel_head, "display") == "none"
+
+    # 验证 composer-dock 的 panel-head 被隐藏
+    assert css_declaration(composer_panel_head, "display") == "none"
+
+    # 验证 composer-dock 底部为 0
+    assert css_declaration(composer, "bottom") == "0"
+
+    # 验证保留所有关键 ID
+    for element_id in (
+        "timelineContainer", "newMessageButton", "composerPanel",
+        "composerForm", "composerTextarea", "composerFileInput",
+        "composerAttachBtn", "composerDropTarget", "composerDropOverlay",
+        "composerDropHint", "uploadSummary", "connectionStatus",
+        "routeSource", "routeTarget",
+    ):
+        assert f'id="{element_id}"' in html
+
+    # 验证 composer-actions 只有两个按钮（附件 + 发送）
+    composer_section = html[html.index('id="composerPanel"'):html.index('id="composerDropHint"')]
+    assert 'id="composerAttachBtn"' in composer_section
+    assert 'type="submit"' in composer_section
+
+    # 验证 composer-drop-target 简化样式
+    assert css_declaration(drop_target, "display") == "flex"
+    assert css_declaration(drop_target, "background") == "transparent"
 
 
 def test_mobile_transfer_reserves_space_for_fixed_composer_dock() -> None:

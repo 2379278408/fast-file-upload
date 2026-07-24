@@ -937,8 +937,8 @@ def test_transfer_visible_upload_summary_stays_in_status_stack(
         """
     )
     assert layout["summaryParentClass"] == "transfer-status-stack"
-    assert layout["stackDisplay"] == "grid"
-    assert layout["workspaceDisplay"] == "grid"
+    assert layout["stackDisplay"] in ("grid", "flex")
+    assert layout["workspaceDisplay"] == "flex"
     assert layout["statusBeforeSummary"] is True
     assert layout["summaryBeforeTimeline"] is True
     assert 0 <= layout["timelineGap"] <= 16
